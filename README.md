@@ -4,7 +4,11 @@ PyTorch implementation of the "Non-Autoregressive Transformer (NAT)" model descr
 Requirements:
   Python 3.6
   pytorch > 0.2
-  torchtext
+  torchtext: 
+    open tools/text and run python setup.py install
+    open tools/revtok and run python setup.py install
+  pip install translate-toolkit
+  pip install tqdm
 
 # TODO
   Add more description about data processing/training/testing

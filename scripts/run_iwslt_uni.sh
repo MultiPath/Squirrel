@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
 python run_realtime.py   \
                 --prefix [time] \
-                --gpu $1 \
+                --gpu 1 \
                 --eval-every 500 \
                 --dataset iwslt \
                 --tensorboard \
-                --level subword \
-                --use_mask \
-                --data_prefix "/export/home/jiatao/work/data/" \
+                --data_prefix "/data0/data/transformer_data/" \
                 --use_wo \
                 --share_embeddings \
                 --debug

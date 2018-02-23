@@ -228,7 +228,7 @@ if args.max_len is not None:
 if args.batch_size == 1:  # speed-test: one sentence per batch.
     batch_size_fn = lambda new, count, sofar: count
 else:
-    batch_size_fn = dyn_batch_without_padding if args.model is Transformer else dyn_batch_with_padding
+    batch_size_fn = dyn_batch_without_padding
 
 train_real, dev_real = data.BucketIterator.splits(
     (train_data, dev_data), batch_sizes=(args.batch_size, args.batch_size), device=args.gpu,
@@ -259,7 +259,7 @@ args.__dict__.update(hparams)
 # show the arg:
 logger.info(args)
 
-hp_str = (f"{args.dataset}_subword_{'fast_' if args.model is FastTransformer else ''}"
+hp_str = (f"{args.dataset}_subword_"
         f"{args.d_model}_{args.d_hidden}_{args.n_layers}_{args.n_heads}_"
         f"{args.drop_ratio:.3f}_{args.warmup}_"
         f"{args.xe_until if hasattr(args, 'xe_until') else ''}_"

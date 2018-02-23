@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-python run_realtime.py   --prefix [time] --gpu 2
+python run_realtime.py   \
+                --prefix [time] \
+                --gpu $1 \
                 --eval-every 500 \
                 --dataset iwslt \
                 --tensorboard \

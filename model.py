@@ -460,11 +460,12 @@ class ConvCritic(nn.Module):
 
 class EncoderLayer(nn.Module):
 
-    def __init__(self, args):
+    def __init__(self, args, causal=False):
         super().__init__()
         self.selfattn = ResidualBlock(
             MultiHead2(
-                args.d_model, args.d_model, args.n_heads, args.drop_ratio,
+                args.d_model, args.d_model, args.n_heads,
+                args.drop_ratio, causal,
                 use_wo=args.use_wo),
             args.d_model, args.drop_ratio)
         self.feedforward = ResidualBlock(
@@ -529,14 +530,14 @@ class DecoderLayer(nn.Module):
 
 class Encoder(nn.Module):
 
-    def __init__(self, field, args):
+    def __init__(self, field, args, causal=False):
         super().__init__()
         if args.share_embeddings:
             self.out = nn.Linear(args.d_model, len(field.vocab))
         else:
             self.embed = nn.Embedding(len(field.vocab), args.d_model)
         self.layers = nn.ModuleList(
-            [EncoderLayer(args) for i in range(args.n_layers)])
+            [EncoderLayer(args, causal) for i in range(args.n_layers)])
         self.dropout = nn.Dropout(args.drop_ratio)
         self.field = field
         self.d_model = args.d_model
@@ -855,12 +856,11 @@ class Fertility(nn.Module):
             return logits, (new_indices, new_mask)
         return logits, fertilities, (new_indices, new_mask)
 
-
 class Transformer(nn.Module):
 
-    def __init__(self, src, trg, args):
+    def __init__(self, src, trg, args, causal_enc=False):
         super().__init__()
-        self.encoder = Encoder(src, args)
+        self.encoder = Encoder(src, args, causal=causal_enc)
         self.decoder = Decoder(trg, args)
         self.field = trg
         self.share_embeddings = args.share_embeddings

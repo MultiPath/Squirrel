@@ -196,11 +196,11 @@ def train_model(args, model, train, dev, teacher_model=None, save_path=None, max
         sources, source_masks,\
         encoding, batch_size = model.quick_prepare(batch, args.distillation)
         input_reorder, fertility_cost, decoder_inputs = None, None, inputs
-        batch_fer = batch.fer_dec if args.distillation else batch.fer
 
         #print(input_masks.size(), target_masks.size(), input_masks.sum())
 
         if type(model) is FastTransformer:
+            batch_fer = batch.fer_dec if args.distillation else batch.fer
             inputs, input_reorder, input_masks, fertility_cost = model.prepare_initial(encoding, sources, source_masks, input_masks, batch_fer)
 
 

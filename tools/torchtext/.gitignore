@@ -1,0 +1,11 @@
+build/
+dist/
+torchtext.egg-info/
+*.txt
+*.zip
+*/**/__pycache__
+*/**/*.pyc
+*/**/*~
+*~
+.cache
+.vector_cache

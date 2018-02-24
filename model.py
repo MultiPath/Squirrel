@@ -580,7 +580,6 @@ class Decoder(nn.Module):
         self.field = field
         self.length_ratio = args.length_ratio
         self.positional = positional
-        self.orderless = args.input_orderless
 
     def forward(self, x, encoding, mask_src=None, mask_trg=None, input_embeddings=False, feedback=None, positions=None):
 
@@ -590,8 +589,7 @@ class Decoder(nn.Module):
             elif x.ndimension() == 3:  # softmax relaxiation
                 x = x @ self.out.weight * math.sqrt(self.d_model)  # batch x len x embed_size
 
-        if not self.orderless:
-            x += positional_encodings_like(x)
+        x += positional_encodings_like(x)
         x = self.dropout(x)
 
         for l, (layer, enc) in enumerate(zip(self.layers, encoding[1:])):

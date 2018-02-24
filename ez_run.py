@@ -44,6 +44,7 @@ parser.add_argument('--data_group',  type=str, default=None,  help='dataset grou
 
 parser.add_argument('--load_vocab',   action='store_true', help='load a pre-computed vocabulary')
 parser.add_argument('--load_dataset', action='store_true', help='load a pre-processed dataset')
+parser.add_argument('--use_revtok',   action='store_true', help='use reversible tokenization')
 parser.add_argument('--remove_eos',   action='store_true', help='possibly remove <eos> tokens for FastTransformer')
 parser.add_argument('--test_set',     type=str, default=None,  help='which test set to use')
 parser.add_argument('--max_len',      type=int, default=None,  help='limit the train set sentences to this many tokens')

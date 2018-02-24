@@ -28,13 +28,13 @@ import sys
 from traceback import extract_tb
 from code import interact
 
-# check paths
-for d in ['models', 'runs', 'logs', 'self_play']:
+# check the path
+for d in ['models', 'runs', 'logs']:
     if not os.path.exists('./{}'.format(d)):
         os.mkdir('./{}'.format(d))
 
 # all the hyper-parameters
-parser = argparse.ArgumentParser(description='Train a Transformer / NAT.')
+parser = argparse.ArgumentParser(description='Train a Transformer-Like Model.')
 
 # dataset settings
 parser.add_argument('--data_prefix', type=str, default='/data0/data/transformer_data/')
@@ -44,7 +44,6 @@ parser.add_argument('--data_group',  type=str, default=None,  help='dataset grou
 
 parser.add_argument('--load_vocab',   action='store_true', help='load a pre-computed vocabulary')
 parser.add_argument('--load_dataset', action='store_true', help='load a pre-processed dataset')
-parser.add_argument('--use_revtok',   action='store_true', help='use reversible tokenization')
 parser.add_argument('--remove_eos',   action='store_true', help='possibly remove <eos> tokens for FastTransformer')
 parser.add_argument('--test_set',     type=str, default=None,  help='which test set to use')
 parser.add_argument('--max_len',      type=int, default=None,  help='limit the train set sentences to this many tokens')
@@ -54,17 +53,11 @@ parser.add_argument('--prefix', type=str, default='[time]',      help='prefix to
 parser.add_argument('--params', type=str, default='james-iwslt', help='pamarater sets: james-iwslt, t2t-base, etc')
 
 # model ablation settings
-parser.add_argument('--local',    dest='windows', action='store_const', const=[1, 3, 5, 7, -1], default=None, help='use local attention')
+parser.add_argument('--causal_enc', action='store_true', help='use unidirectional encoder (useful for real-time translation)')
 parser.add_argument('--causal',   action='store_true', help='use causal attention')
 parser.add_argument('--diag',     action='store_true', help='ignore diagonal attention when doing self-attention.')
 parser.add_argument('--use_wo',   action='store_true', help='use output weight matrix in multihead attention')
-
-parser.add_argument('--fertility',            action='store_true', help='use the latent fertility model. only useful for NAT')
-parser.add_argument('--hard_inputs',          action='store_true', help='use hard selection as inputs, instead of soft-attention over embeddings.')
-parser.add_argument('--use_alignment',        action='store_true', help='use the aligned fake data to initialize')
-parser.add_argument('--input_orderless',      action='store_true', help='for the inputs, remove the order information')
 parser.add_argument('--share_embeddings',     action='store_true', help='share embeddings between encoder and decoder')
-parser.add_argument('--supervise_fertility',  action='store_true', help='directly use the groud-truth alignment for reordering.')
 parser.add_argument('--positional_attention', action='store_true', help='incorporate positional information in key/value')
 
 # running setting
@@ -92,11 +85,6 @@ parser.add_argument('--alpha',         type=float, default=1, help='length norma
 parser.add_argument('--temperature',   type=float, default=1, help='smoothing temperature for noisy decodig')
 parser.add_argument('--rerank_by_bleu', action='store_true', help='use the teacher model for reranking')
 
-# self-playing
-parser.add_argument('--max_cache',    type=int, default=20,   help='save most recent max_cache sets of translations')
-parser.add_argument('--decode_every', type=int, default=2000, help='every 1k updates, train the teacher again')
-parser.add_argument('--train_every',  type=int, default=500,  help='train the teacher again for 250k steps')
-
 # model saving/reloading, output translations
 parser.add_argument('--load_from',     type=str, default=None, help='load from checkpoint')
 parser.add_argument('--resume',        action='store_true', help='when loading from the saved model, it resumes from that.')
@@ -106,19 +94,10 @@ parser.add_argument('--no_bpe',        action='store_true', help='output files w
 parser.add_argument('--no_write',      action='store_true', help='do not write the decoding into the decoding files.')
 parser.add_argument('--output_fer',    action='store_true', help='decoding and output fertilities')
 
-# other settings:
-
-parser.add_argument('--real_data', action='store_true', help='only used in the reverse kl setting')
-parser.add_argument('--beta1', type=float, default=0.5, help='balancing MLE and KL loss.')
-parser.add_argument('--beta2', type=float, default=0.01, help='balancing the GAN loss.')
-
 # debugging
 parser.add_argument('--debug',       action='store_true', help='debug mode: no saving or tensorboard')
 parser.add_argument('--tensorboard', action='store_true', help='use TensorBoard')
 
-# (maybe not useful any more) old params
-parser.add_argument('--old', action='store_true', help='this is used for solving conflicts of new codes')
-# ----------------------------------------------------------------------------------------------------------------- #
 
 args = parser.parse_args()
 if args.prefix == '[time]':
@@ -261,15 +240,12 @@ logger.info(args)
 
 hp_str = (f"{args.dataset}_subword_"
         f"{args.d_model}_{args.d_hidden}_{args.n_layers}_{args.n_heads}_"
-        f"{args.drop_ratio:.3f}_{args.warmup}_"
-        f"{args.xe_until if hasattr(args, 'xe_until') else ''}_"
-        f"{f'{args.xe_ratio:.3f}' if hasattr(args, 'xe_ratio') else ''}_"
-        f"{args.xe_every if hasattr(args, 'xe_every') else ''}")
+        f"{args.drop_ratio:.3f}_{args.warmup}_{'uni_' if args.causal_enc else ''}")
 logger.info(f'Starting with HPARAMS: {hp_str}')
 model_name = './models/' + args.prefix + hp_str
 
 # build the model
-model = Transformer(SRC, TRG, args, causal_enc=True)
+model = Transformer(SRC, TRG, args)
 logger.info(str(model))
 if args.load_from is not None:
     with torch.cuda.device(args.gpu):

@@ -858,9 +858,9 @@ class Fertility(nn.Module):
 
 class Transformer(nn.Module):
 
-    def __init__(self, src, trg, args, causal_enc=False):
+    def __init__(self, src, trg, args):
         super().__init__()
-        self.encoder = Encoder(src, args, causal=causal_enc)
+        self.encoder = Encoder(src, args, causal=args.causal_enc)
         self.decoder = Decoder(trg, args)
         self.field = trg
         self.share_embeddings = args.share_embeddings

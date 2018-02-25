@@ -2,31 +2,19 @@ import torch
 import numpy as np
 from torchtext import data
 from torchtext import datasets
-from torch.nn import functional as F
-from torch.autograd import Variable
 
 import revtok
 import logging
 import random
-import string
-import traceback
-import math
-import uuid
 import argparse
 import os
 import copy
-import time
 
-from train import train_model
+from ez_train import train_model
 from decode import decode_model
 from model import Transformer, FastTransformer, INF, TINY, softmax
 from utils import NormalField, NormalTranslationDataset, TripleTranslationDataset, ParallelDataset, merge_cache
-from xliffdata import XLIFFDataset
 from time import gmtime, strftime
-
-import sys
-from traceback import extract_tb
-from code import interact
 
 # check the path
 for d in ['models', 'runs', 'logs']:

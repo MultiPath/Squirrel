@@ -207,7 +207,7 @@ def train_model(args, model, train, dev, teacher_model=None, save_path=None, max
         # Maximum Likelihood Training
         if not args.finetuning:
             loss = model.cost(targets, target_masks, out=model(encoding, source_masks, inputs, input_masks))
-            if args.fertility:
+            if hasattr(args, 'fertility') and args.fertility:
                 loss += fertility_cost
 
         else:

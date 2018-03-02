@@ -654,7 +654,8 @@ class Decoder(nn.Module):
 
         T *= self.length_ratio
         outs = Variable(encoding[0].data.new(B, W, T + 1).long().fill_(
-            self.field.vocab.stoi['<init>']))
+            self.field.vocab.stoi['<pad>']))
+        outs[:, :, 0] = self.field.vocab.stoi['<init>']
 
         logps = Variable(encoding[0].data.new(B, W).float().fill_(0))  # scores
         hiddens = [Variable(encoding[0].data.new(B, W, T, C).zero_())  # decoder states: batch x beamsize x len x h
@@ -662,7 +663,7 @@ class Decoder(nn.Module):
         embedW = self.out.weight * math.sqrt(self.d_model)
         hiddens[0] = hiddens[0] + positional_encodings_like(hiddens[0])
         eos_yet = encoding[0].data.new(B, W).byte().zero_()  # batch x beamsize, all the sentences are not finished yet.
-        eos_mask = eos_yet.float().fill_(-INF)[:, :, None].expand(B, W, W)
+        eos_mask = eos_yet.float().fill_(INF)[:, :, None].expand(B, W, W)  # --- big bug, logps < 0
         eos_mask[:, :, 0] = 0  # batch x beam x beam
 
         for t in range(T):
@@ -676,8 +677,9 @@ class Decoder(nn.Module):
                         B, W, C)
 
             # topk2_logps: scores, topk2_inds: top word index at each beam, batch x beam x beam
-            topk2_logps, topk2_inds = log_softmax(
-                self.out(hiddens[-1][:, :, t])).topk(W, dim=-1)
+            topk2_logps = log_softmax(self.out(hiddens[-1][:, :, t]))
+            topk2_logps[:, :, self.field.vocab.stoi['<pad>']] = -INF
+            topk2_logps, topk2_inds = topk2_logps.topk(W, dim=-1)
 
             # mask out the sentences which are finished
             topk2_logps = topk2_logps * Variable(eos_yet[:, :, None].float() * eos_mask + 1 - eos_yet[:, :, None].float())
@@ -691,8 +693,9 @@ class Decoder(nn.Module):
             topk_beam_inds = topk_inds.div(W)
             topk_token_inds = topk2_inds.view(B, W * W).gather(1, topk_inds)
             eos_yet = eos_yet.gather(1, topk_beam_inds.data)
-
-            logps = logps * (1 - Variable(eos_yet.float()) * 1 / (t + 2)).pow(alpha)
+            
+            # logps = logps * (1 - Variable(eos_yet.float()) * 1 / (t + 2)).pow(alpha) # -- bug
+            logps = logps * (1 + Variable(eos_yet.float()) * 1 / (t + 1)).pow(alpha)
             outs = outs.gather(1, topk_beam_inds[:, :, None].expand_as(outs))
             outs[:, :, t + 1] = topk_token_inds
             topk_beam_inds = topk_beam_inds[:, :, None, None].expand_as(

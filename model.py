@@ -11,6 +11,7 @@ from utils import computeGLEU, masked_sort, unsorted
 INF = 1e10
 TINY = 1e-9
 
+# -- -- helper functions ----- #
 class GradReverse(Function):
     @staticmethod
     def forward(ctx, x):
@@ -48,24 +49,6 @@ def positional_encodings_like(x, t=None):   # hope to be differentiable
 
     return encodings
 
-class Linear(nn.Linear):
-
-    def forward(self, x):
-        size = x.size()
-        return super().forward(
-            x.contiguous().view(-1, size[-1])).view(*size[:-1], -1)
-
-class CosineLinear(Linear):
-
-    def forward(self, x, tau=0.05):
-        size = x.size()
-        x = x / (x.norm(dim=-1, keepdim=True).expand_as(x) + TINY)
-        x = x.contiguous().view(-1, size[-1])
-        weight = self.weight / (self.weight.norm(dim=-1, keepdim=True).expand_as(self.weight) + TINY)
-        value = F.linear(x, weight)
-        value = value.view(*size[:-1], -1) / tau
-        return value
-
 def linear_wn(in_features, out_features, dropout=0):
     """Weight-normalized Linear layer (input: N x T x C)"""
     m = Linear(in_features, out_features)
@@ -101,14 +84,10 @@ def demask(inputs, the_mask):
 
 # F.softmax has strange default behavior, normalizing over dim 0 for 3D inputs
 def softmax(x):
-    if x.dim() == 3:
-        return F.softmax(x.transpose(0, 2)).transpose(0, 2)
-    return F.softmax(x)
+    return F.softmax(x, dim=-1)
 
 def log_softmax(x):
-    if x.dim() == 3:
-        return F.log_softmax(x.transpose(0, 2)).transpose(0, 2)
-    return F.log_softmax(x)
+    return F.log_softmax(x, dim=-1)
 
 def logsumexp(x, dim=-1):
     x_max = x.max(dim, keepdim=True)[0]
@@ -118,6 +97,14 @@ def gumbel_softmax(input, beta=0.5, tau=1.0):
     noise = input.data.new(*input.size()).uniform_()
     noise.add_(TINY).log_().neg_().add_(TINY).log_().neg_()
     return softmax((input + beta * Variable(noise)) / tau)
+
+def argmax(x):  # return the one-hot vectors
+    shape = x.size()
+    _, ind = x.max(dim=-1)
+    x_hard = Variable(x.data.new(x.size()).zero_().view(-1, shape[-1]))
+    x_hard.scatter_(1, ind.view(-1, 1), 1)
+    x_hard = x_hard.view(*shape)
+    return x_hard
 
 # torch.matmul can't do (4, 3, 2) @ (4, 2) -> (4, 3)
 def matmul(x, y):
@@ -136,7 +123,7 @@ def pad_to_match(x, y):
         return torch.cat((x, extra), 1), y
     return x, torch.cat((y, extra), 1)
 
-# --- Top K search with PQ
+# --- Top K search with PQ (used in Non-Autoregressive NMT)
 def topK_search(logits, mask_src, N=100):
     # prepare data
     nlogP = -log_softmax(logits).data
@@ -189,6 +176,11 @@ def topK_search(logits, mask_src, N=100):
     return output, mask_src
 
 
+class Linear(nn.Linear):
+    def forward(self, x):
+        size = x.size()
+        return super().forward(
+            x.contiguous().view(-1, size[-1])).view(*size[:-1], -1)
 
 class LayerNorm(nn.Module):
 
@@ -214,19 +206,7 @@ class ResidualBlock(nn.Module):
 
     def forward(self, *x):
         return self.layernorm(x[self.pos] + self.dropout(self.layer(*x)))
-
-class ConvolutionBlock(nn.Module):
-
-    def __init__(self, layer, d_model, drop_ratio, pos=0, w=1):
-        super().__init__()
-        self.layer = layer
-        self.dropout = nn.Dropout(drop_ratio)
-        self.layernorm = LayerNorm(d_model)
-        self.pos = pos
-        self.kernel = nn.Conv1d(d_model, d_model, 2 * w + 1, 1, padding=w)
-
-    def forward(self, *x):
-        return self.layernorm(self.kernel(x[self.pos].transpose(2, 1)).transpose(2, 1) + self.dropout(self.layer(*x)))
+        ## optional: add layernorm inside
 
 class HighwayBlock(nn.Module):
 
@@ -243,45 +223,30 @@ class HighwayBlock(nn.Module):
 
 class Attention(nn.Module):
 
-    def __init__(self, d_key, drop_ratio, causal, diag=False, window=-1, noisy=False):
+    def __init__(self, d_key, drop_ratio, causal, noisy=False):
         super().__init__()
         self.scale = math.sqrt(d_key)
         self.dropout = nn.Dropout(drop_ratio)
         self.causal = causal
-        self.diag = diag
-        self.window = window
-        self.noisy = noisy
+        self.noisy  = noisy
+        self.p_attn = None
 
-    def forward(self, query, key, value=None, mask=None,
-                feedback=None, beta=0, tau=1, weights=None):
+    def forward(self, query, key, value=None, mask=None, beta=0, tau=1):
         dot_products = matmul(query, key.transpose(1, 2))   # batch x trg_len x trg_len
-
-        if weights is not None:
-            dot_products = dot_products + weights   # additive bias
 
         if query.dim() == 3 and self.causal and (query.size(1) == key.size(1)):
             tri = key.data.new(key.size(1), key.size(1)).fill_(1).triu(1) * INF
             dot_products.data.sub_(tri.unsqueeze(0))
 
-        if self.window > 0:
-            window_mask = key.data.new(key.size(1), key.size(1)).fill_(1)
-            window_mask = (window_mask.triu(self.window+1) + window_mask.tril(-self.window-1)) * INF
-            dot_products.data.sub_(window_mask.unsqueeze(0))
-
-        if self.diag:
-            inds = torch.arange(0, key.size(1)).long().view(1, 1, -1)
-            if key.is_cuda:
-                inds = inds.cuda(key.get_device())
-            dot_products.data.scatter_(1, inds.expand(dot_products.size(0), 1, inds.size(-1)), -INF)
-            # eye = key.data.new(key.size(1), key.size(1)).fill_(1).eye() * INF
-            # dot_products.data.sub_(eye.unsqueeze(0))
-
         if mask is not None:
-            # print(dot_products.data.size(), mask[:, None, :].size())
             if dot_products.dim() == 2:
-                dot_products.data -= ((1 - mask) * INF)
+                assert mask.dim() == 2, "only works on 2D masks"
+                dot_products -= ((1 - mask) * INF)
             else:
-                dot_products.data -= ((1 - mask[:, None, :]) * INF)
+                if mask.dim() == 2:
+                    dot_products -= ((1 - mask[:, None, :]) * INF)
+                else:
+                    dot_products -= ((1 - mask) * INF)
 
         if value is None:
             return dot_products
@@ -291,172 +256,49 @@ class Attention(nn.Module):
             probs = softmax(logits)
         else:
             probs = gumbel_softmax(logits, beta=beta, tau=tau)
+        self.p_attn = probs
 
-        if feedback is not None:
-            feedback.append(probs.contiguous())
-
+        # return the attention results
         return matmul(self.dropout(probs), value)
 
 class MultiHead2(nn.Module):
 
-    def __init__(self, d_key, d_value, n_heads, drop_ratio,
-                causal=False, diag=False, window=-1, noisy=False, use_wo=True):
+    def __init__(self, d_key, d_value, n_heads, drop_ratio=0.1, causal=False, noisy=False):
         super().__init__()
-        self.attention = Attention(d_key, drop_ratio, causal=causal, diag=diag, window=window, noisy=noisy)
-        self.wq = Linear(d_key, d_key, bias=use_wo)
-        self.wk = Linear(d_key, d_key, bias=use_wo)
-        self.wv = Linear(d_value, d_value, bias=use_wo)
-        if use_wo:
-            self.wo = Linear(d_value, d_key, bias=use_wo)
-        self.use_wo = use_wo
+        self.attention = Attention(d_key, drop_ratio, causal=causal, noisy=noisy)
+        self.wq = Linear(d_key,   d_key, bias=True)
+        self.wk = Linear(d_key,   d_key, bias=True)
+        self.wv = Linear(d_value, d_value, bias=True)
+        self.wo = Linear(d_value, d_key, bias=True)
         self.n_heads = n_heads
 
-    def forward(self, query, key, value, mask=None, feedback=None, weights=None, beta=0, tau=1):
+    def forward(self, query, key, value, mask=None, beta=0, tau=1):
         query, key, value = self.wq(query), self.wk(key), self.wv(value)   # B x T x D
         B, Tq, D = query.size()
         _, Tk, _ = key.size()
         N = self.n_heads
-        probs = []
 
-        query, key, value = (x.contiguous().view(B, -1, N, D//N).transpose(2, 1).contiguous().view(B*N, -1, D//N)
-                                for x in (query, key, value))
+        # reshape query-key-value for multi-head attention
+        query, key, value = (x.contiguous().view(B, -1, N, D//N).transpose(2, 1).contiguous().view(B*N, -1, D//N) for x in (query, key, value))
         if mask is not None:
             mask = mask[:, None, :].expand(B, N, Tk).contiguous().view(B*N, -1)
-        outputs = self.attention(query, key, value, mask, probs, beta, tau, weights)  # (B x n) x T x (D/n)
+
+        outputs = self.attention(query, key, value, mask, beta, tau)  # (B x n) x T x (D/n)
         outputs = outputs.contiguous().view(B, N, -1, D//N).transpose(2, 1).contiguous().view(B, -1, D)
-
-        if feedback is not None:
-            feedback.append(probs[0].view(B, N, Tq, Tk))
-
-        if self.use_wo:
-            return self.wo(outputs)
-        return outputs
-
-
-class MoEHead(nn.Module):
-
-    def __init__(self, d_key, d_value, n_heads, drop_ratio,
-                causal=False, diag=False, window=-1, noisy=False, use_wo=True):
-        super().__init__()
-        self.attention = Attention(d_key, drop_ratio, causal=causal, diag=diag, window=window, noisy=noisy)
-        self.wq = Linear(d_key, d_key, bias=use_wo)
-        self.wk = Linear(d_key, d_key, bias=use_wo)
-        self.wv = Linear(d_value, d_value, bias=use_wo)
-        self.wo = Linear(d_value, d_key, bias=use_wo)
-        self.gate = Linear(d_value // n_heads, 1)
-        self.use_wo = use_wo
-        self.n_heads = n_heads
-
-    def forward(self, query, key, inputs, mask=None, feedback=None, weights=None, beta=0, tau=1):
-        query, key, value = self.wq(query), self.wk(key), self.wv(inputs)   # B x T x D
-        B, Tq, D = query.size()
-        _, Tk, _ = key.size()
-        N = self.n_heads
-        probs = []
-
-        query, key, value = (x.contiguous().view(B, -1, N, D//N).transpose(2, 1).contiguous().view(B*N, -1, D//N)
-                                for x in (query, key, value))
-        if mask is not None:
-            mask = mask[:, None, :].expand(B, N, Tk).contiguous().view(B*N, -1)
-        probs = self.attention(query, key, None, mask, probs, beta, tau, weights)  # (B x N) x Tq x Tk
-        mix = matmul(self.attention.dropout(probs), value).contiguous().view(B, N, -1, D//N).transpose(2, 1).contiguous() # B x Tq x N x D//N
-        mix = softmax(self.gate(mix))  # B x Tq x N
-        probs = (probs.contiguous().view(B, N, Tq, Tk).transpose(2, 1) * mix).sum(-2)  # B x Tq x Tk
-
-        outputs = matmul(probs, inputs) # B x Tq x D
         return self.wo(outputs)
 
 
-class ReorderHead(nn.Module):
-
-    def __init__(self, d_key, n_heads, drop_ratio,
-                causal=False, diag=False, window=-1, noisy=False,
-                use_wo=True):
-        super().__init__()
-        self.attention = Attention(d_key, drop_ratio, causal=causal, diag=diag, window=window, noisy=noisy)
-        self.wq = Linear(d_key, d_key, bias=use_wo)
-        self.wk = Linear(d_key, d_key, bias=use_wo)
-        self.n_heads = n_heads
-
-    def forward(self, query, key, positions=None, mask=None, feedback=None, beta=0, tau=1):
-        # positions: bs x len
-        #return positions
-        B, D = query.size()[0], query.size()[-1]
-        T = key.size()[1]
-        N = self.n_heads
-
-        query, key = self.wq(query), self.wk(key)
-        query, key = (x.contiguous().view(B, -1, N, D//N).transpose(2, 1).contiguous().view(B*N, -1, D//N) for x in (query, key))
-        mask = mask[:, None, :].expand(B, N, T).contiguous().view(B*N, -1)
-        probs = self.attention(query, key, None, mask, None, beta, tau).transpose(2, 1)  # (B x n) x T x T, remember to transpose
-        return probs
-
 class FeedForward(nn.Module):
 
-    def __init__(self, d_model, d_hidden):
+    def __init__(self, d_model, d_hidden, drop_ratio=0.1):
         super().__init__()
         self.linear1 = Linear(d_model, d_hidden)
         self.linear2 = Linear(d_hidden, d_model)
+        self.dropout = nn.Dropout(drop_ratio)
 
     def forward(self, x):
-        return self.linear2(F.relu(self.linear1(x)))
+        return self.linear2(self.dropout(F.relu(self.linear1(x))))  # adding dropout in feedforward layer
 
-class LSTMCritic(nn.Module):
-
-    def __init__(self, args):
-        super().__init__()
-
-        self.out = nn.Linear(args.d_model, args.trg_vocab, bias=False)
-        self.bilstm = nn.LSTM(args.d_model, args.d_model, batch_first=True, bidirectional=True)
-        self.mlp = nn.Sequential(
-            nn.Linear(2 * args.d_model, args.d_model), nn.ReLU(),
-            nn.Linear(args.d_model, 1), nn.Sigmoid())
-
-    def forward(self, trg, mask):
-        # trg: batch x len x d_model
-        # mask: batch x len
-        batchsize = trg.size(0)
-        trgs = grad_reverse(trg)
-        lens = mask.sum(-1).long()
-        lens, indices = torch.sort(lens, dim=0, descending=True)
-        if trg.is_cuda:
-            with torch.cuda.device_of(trg):
-                lens = lens.tolist()
-
-        trgs = pack_padded_sequence(trgs[indices, :, :], lens, batch_first=True)
-
-        _, (out, _) = self.bilstm(trgs)
-        out = out.permute(1, 0, 2).contiguous().view(batchsize, -1)
-        return self.mlp(out)
-
-class ConvCritic(nn.Module):
-
-    def __init__(self, args):
-        """
-        accept a sequence of word-embeddings and classification on that
-        """
-
-        super(ConvCritic, self).__init__()
-        self.args = args
-
-        D = args.d_model
-        Co = args.kernel_num
-        Ks = args.kernel_sizes  # 3,4,5
-
-        self.out = nn.Linear(args.d_model, args.trg_vocab, bias=False)
-        self.convs1 = nn.ModuleList([nn.Conv1d(D, Co, K) for K in Ks])
-        self.mlp = nn.Sequential(
-            nn.Linear(len(Ks)*Co, args.d_model), nn.ReLU(),
-            nn.Linear(args.d_model, 1), nn.Sigmoid())
-
-    def forward(self, x, mask):
-        # Turn (batch_size x seq_len x input_size) into (batch_size x input_size x seq_len) for CNN
-        x = grad_reverse(x)
-        x = x.transpose(2, 1)
-        x = [F.relu(conv(x)) for conv in self.convs1]  # batch x output_size x seq_len
-        x = [F.max_pool1d(i, i.size(2)).squeeze(2) for i in x]  # batch x output_size
-        x = torch.cat(x, 1)
-        return self.mlp(x) # (N,C)
 
 class EncoderLayer(nn.Module):
 
@@ -465,20 +307,19 @@ class EncoderLayer(nn.Module):
         self.selfattn = ResidualBlock(
             MultiHead2(
                 args.d_model, args.d_model, args.n_heads,
-                args.drop_ratio, causal,
-                use_wo=args.use_wo),
+                args.drop_ratio, causal),
             args.d_model, args.drop_ratio)
         self.feedforward = ResidualBlock(
-            FeedForward(args.d_model, args.d_hidden),
+            FeedForward(args.d_model, args.d_hidden, args.drop_ratio),
             args.d_model, args.drop_ratio)
 
     def forward(self, x, mask=None):
         return self.feedforward(self.selfattn(x, x, x, mask))
 
+
 class DecoderLayer(nn.Module):
 
-    def __init__(self, args, causal=True, diag=False, highway=False,
-                window=-1, positional=False, noisy=False):
+    def __init__(self, args, causal=True, positional=False, noisy=False):
         super().__init__()
         self.positional = positional
         self.selfattn = ResidualBlock(
@@ -487,46 +328,30 @@ class DecoderLayer(nn.Module):
                     use_wo=args.use_wo),
             args.d_model, args.drop_ratio)
 
-        self.attention = ResidualBlock(
+        self.crossattn = ResidualBlock(
             MultiHead2(args.d_model, args.d_model, args.n_heads,
-                    args.drop_ratio, noisy=noisy, use_wo=args.use_wo),  # only noisy when doing cross-attention
+                    args.drop_ratio, noisy=noisy),  # only noisy when doing cross-attention
             args.d_model, args.drop_ratio)
 
         if positional:
             self.pos_selfattn = ResidualBlock(
-            MultiHead2(args.d_model, args.d_model, args.n_heads,   # first try 1 positional head
-                    args.drop_ratio, causal, diag, window,
-                    use_wo=args.use_wo),
+            MultiHead2(args.d_model, args.d_model, args.n_heads,   # positional attention (optional)
+                    args.drop_ratio, causal),
             args.d_model, args.drop_ratio, pos=2)
 
-
         self.feedforward = ResidualBlock(
-            FeedForward(args.d_model, args.d_hidden),
+            FeedForward(args.d_model, args.d_hidden, args.drop_ratio),
             args.d_model, args.drop_ratio)
 
-    def forward(self, x, encoding, p=None, mask_src=None, mask_trg=None, feedback=None):
+    def forward(self, x, encoding, p=None, mask_src=None, mask_trg=None):
 
-        feedback_src = []
-        feedback_trg = []
         x = self.selfattn(x, x, x, mask_trg, feedback_trg)   #
-
         if self.positional:
             pos_encoding, weights = positional_encodings_like(x), None
-            x = self.pos_selfattn(pos_encoding, pos_encoding, x, mask_trg, None, weights)  # positional attention
-        x = self.feedforward(self.attention(x, encoding, encoding, mask_src, feedback_src))
-
-        if feedback is not None:
-
-            if 'source' not in feedback:
-                feedback['source'] = feedback_src
-            else:
-                feedback['source'] += feedback_src
-
-            if 'target' not in feedback:
-                feedback['target'] = feedback_trg
-            else:
-                feedback['target'] += feedback_trg
+            x = self.pos_selfattn(pos_encoding, pos_encoding, x, mask_trg)  # positional attention
+        x = self.feedforward(self.crossattn(x, encoding, encoding, mask_src))
         return x
+
 
 class Encoder(nn.Module):
 
@@ -536,6 +361,7 @@ class Encoder(nn.Module):
             self.out = nn.Linear(args.d_model, len(field.vocab))
         else:
             self.embed = nn.Embedding(len(field.vocab), args.d_model)
+
         self.layers = nn.ModuleList(
             [EncoderLayer(args, causal) for i in range(args.n_layers)])
         self.dropout = nn.Dropout(args.drop_ratio)
@@ -548,7 +374,8 @@ class Encoder(nn.Module):
             x = F.embedding(x, self.out.weight * math.sqrt(self.d_model))
         else:
             x = self.embed(x)
-        x += positional_encodings_like(x)
+
+        x += positional_encodings_like(x)  # add positional encoding.
         encoding = [x]
 
         x = self.dropout(x)
@@ -557,20 +384,16 @@ class Encoder(nn.Module):
             encoding.append(x)
         return encoding
 
+
 class Decoder(nn.Module):
 
     def __init__(self, field, args, causal=True,
-                positional=False, diag=False,
-                highway=False, windows=None,
-                noisy=False, cosine_output=False):
+                positional=False, noisy=False):
 
         super().__init__()
 
-        if windows is None:
-            windows = [-1 for _ in range(args.n_layers)]
-
         self.layers = nn.ModuleList(
-            [DecoderLayer(args, causal, diag, highway, windows[i], positional, noisy)
+            [DecoderLayer(args, causal, positional, noisy)
             for i in range(args.n_layers)])
 
         self.out = nn.Linear(args.d_model, len(field.vocab))
@@ -581,7 +404,7 @@ class Decoder(nn.Module):
         self.length_ratio = args.length_ratio
         self.positional = positional
 
-    def forward(self, x, encoding, mask_src=None, mask_trg=None, input_embeddings=False, feedback=None, positions=None):
+    def forward(self, x, encoding, mask_src=None, mask_trg=None, input_embeddings=False):
 
         if not input_embeddings:  # compute input embeddings
             if x.ndimension() == 2:
@@ -593,10 +416,10 @@ class Decoder(nn.Module):
         x = self.dropout(x)
 
         for l, (layer, enc) in enumerate(zip(self.layers, encoding[1:])):
-            x = layer(x, enc, mask_src=mask_src, mask_trg=mask_trg, feedback=feedback)
+            x = layer(x, enc, mask_src=mask_src, mask_trg=mask_trg)
         return x
 
-    def greedy(self, encoding, mask_src=None, mask_trg=None, feedback=None):
+    def greedy(self, encoding, mask_src=None, mask_trg=None):
 
         encoding = encoding[1:]
         B, T, C = encoding[0].size()  # batch-size, decoding-length, size
@@ -611,22 +434,16 @@ class Decoder(nn.Module):
 
         eos_yet = encoding[0].data.new(B).byte().zero_()
 
-        attentions = []
-
         for t in range(T):
-            torch.cuda.nvtx.mark(f'greedy:{t}')
+
             hiddens[0][:, t] = self.dropout(
                 hiddens[0][:, t] + F.embedding(outs[:, t], embedW))
 
-            inter_attention = []
             for l in range(len(self.layers)):
                 x = hiddens[l][:, :t+1]
                 x = self.layers[l].selfattn(hiddens[l][:, t:t+1], x, x)   # we need to make the dimension 3D
                 hiddens[l + 1][:, t] = self.layers[l].feedforward(
-                    self.layers[l].attention(x, encoding[l], encoding[l], mask_src, inter_attention))[:, 0]
-
-            inter_attention = torch.cat(inter_attention, 1)
-            attentions.append(inter_attention)
+                    self.layers[l].crossattn(x, encoding[l], encoding[l], mask_src))[:, 0]
 
             _, preds = self.out(hiddens[-1][:, t]).max(-1)
             preds[eos_yet] = self.field.vocab.stoi['<pad>']
@@ -635,9 +452,6 @@ class Decoder(nn.Module):
             outs[:, t + 1] = preds
             if eos_yet.all():
                 break
-
-        if feedback is not None:
-            feedback['source'] = torch.cat(attentions, 2)
 
         return outs[:, 1:t+2]
 
@@ -707,155 +521,6 @@ class Decoder(nn.Module):
                 return outs[:, 0, 1:]
         return outs[:, 0, 1:]
 
-class ReOrderer(nn.Module):
-
-    def __init__(self, args):
-        super().__init__()
-        self.wq = Linear(args.d_model, args.d_model, bias=True)
-        self.wk = Linear(args.d_model, args.d_model, bias=True)
-        self.gate = Linear(args.d_model, 1, bias=True)
-        self.scale = math.sqrt(args.d_model)
-        self.diag = False
-
-    @staticmethod
-    def linear_attention(mask_src, mask_trg):  # get a linear-attention
-        max_src_len = mask_src.size(1)
-        max_trg_len = mask_trg.size(1)
-        src_lens = mask_src.sum(-1).float()  # batchsize
-        trg_lens = mask_trg.sum(-1).float()  # batchsize
-        steps = src_lens / trg_lens          # batchsize
-        index_t = torch.arange(0, max_trg_len)  # max_trg_len
-        if mask_trg.is_cuda:
-            index_t = index_t.cuda(mask_trg.get_device())
-        index_t = steps[:, None] @ index_t[None, :]  # batch x max_trg_len
-        index_s = torch.arange(0, max_src_len)  # max_src_len
-        if mask_trg.is_cuda:
-            index_s = index_s.cuda(mask_trg.get_device())
-        indexxx = (index_s[None, None, :] - index_t[:, :, None]) ** 2  # batch x max_trg x max_src
-        indexxx = softmax(Variable(-indexxx / 0.3 - INF * (1 - mask_src[:, None, :])))  # batch x max_trg x max_src
-        return indexxx
-
-    def forward(self, key, mask_src, mask_trg):
-
-        l_att = self.linear_attention(mask_src, mask_trg)
-
-        query = matmul(l_att, key)
-        gates = F.sigmoid(self.gate(query).expand(query.size(0),
-            mask_trg.size(1), mask_src.size(1)))
-
-        query, key = self.wq(query), self.wk(key)  # key: batch x src x d, query: batch x trg x d
-        dot_products = matmul(query, key.transpose(1, 2))  # batch x trg x src
-        if mask_src.ndimension() == 2:
-            dot_products.data -= (1 - mask_src[:, None, :]) * INF
-        else:
-            dot_products.data -= (1 - mask_src) * INF
-        logits = dot_products / self.scale
-        probs = softmax(logits)  # batch x trg x src
-        probs = (1 - gates) * probs + gates * l_att
-        return probs
-
-class Fertility(nn.Module):
-
-    def __init__(self, args, L=50):
-        super().__init__()
-        self.wf = Linear(args.d_model, L, bias=True)
-        self.max_ratio = 2
-        self.L = L
-        self.f0 = torch.arange(0, self.L).float()
-        self.saved_fertilities = None
-
-    @staticmethod
-    def transform(fertilities, mask):
-        # all the computation in the data space. no gradient can be tracked
-
-        fertilities = fertilities.data
-        fertilities *= mask.long()   # make sure there is no wired repeating
-
-        # check all Zero
-        m = fertilities.max()
-        L = fertilities.sum(dim=1).max()
-
-        # if m == 0:  # 'WARNING: at least one fertility is required'
-        #     fertilities[:, 0] = 1
-        #     m = 1
-        #    L = 1
-
-        source_indices = torch.arange(0, fertilities.size(1))[None, :].expand_as(fertilities)
-        if fertilities.is_cuda:
-            source_indices = source_indices.cuda(fertilities.get_device())
-
-        zero_mask_zero = (fertilities == 0)
-        source_indices = source_indices * mask - (1-mask)
-        source_indices.masked_fill_(zero_mask_zero, -1)
-
-        source_indices = torch.cat((source_indices,
-                                    source_indices.new(source_indices.size(0),
-                                        1).fill_(-1)), 1).long()
-        target_indices = fertilities.new(source_indices.size(0), L + m).fill_(-1)
-        start_indices  = torch.cat((fertilities.new(fertilities.size(0), 1).zero_(), fertilities.cumsum(1)), 1)
-
-        zero_fertility_mask = torch.cat((zero_mask_zero, fertilities.new(fertilities.size(0), 1).byte().zero_()), 1)
-        start_indices.masked_fill_(zero_fertility_mask, L)
-
-        for offset in range(m-1, -1, -1):
-            target_indices.scatter_(1, start_indices+offset, source_indices)
-        target_indices = target_indices[:, :-m].long()  # in the end the selected indices
-        new_mask = (target_indices != -1).float()
-
-        assert (new_mask.sum() - fertilities.sum() == 0), '??'
-        new_indices = target_indices * new_mask.long()
-        return Variable(new_indices), Variable(fertilities), new_mask
-
-    def forward(self, encoding, mask_src=None, mask_trg=None, mode=None, N=1, tau=1, return_samples=False):
-
-        logits = self.wf(encoding)
-        if mode is None:
-            return logits
-
-        if mode == 'sharp':
-            inxxx = torch.arange(0, self.L).float()
-            if encoding.is_cuda:
-                inxxx = inxxx.cuda(encoding.get_device())
-            inxxx = Variable(inxxx)
-            fertilities = (softmax(logits / 0.5) * inxxx[None, None, :]).sum(-1)  # batch x len
-            return fertilities
-
-        elif mode == 'argmax':
-            fertilities = logits.max(-1)[1]  # batch_size x max_src
-
-        elif mode == 'mean':
-            f0 = self.f0
-            if encoding.is_cuda:
-                f0 = f0.cuda(encoding.get_device())
-            f0 = Variable(f0)
-            fertilities = (softmax(logits) * f0[None, None, :]).sum(-1).round().clamp(0, self.L-1).long()
-
-        elif (mode == 'reinforce') or (mode == 'sample'):
-            fertilities = softmax(logits / tau).contiguous().view(-1, self.L).multinomial(N,  True) # (B x Ts) x N
-            self.saved_fertilities = fertilities
-            B, T, _ = encoding.size()
-            if N == 1:
-                fertilities = fertilities.contiguous().view(B, T)
-            else:
-                fertilities = fertilities.contiguous().view(B, T, N)
-                fertilities = fertilities.transpose(2, 1).contiguous().view(B * N, T)  # (B x N) x Ts
-                mask_src = mask_src[:, None, :].expand(B, N, T).contiguous().view(B * N, T)
-
-        elif mode == 'search':
-            fertilities, mask_src = topK_search(logits, mask_src, N)
-
-        else:
-            raise NotImplementedError
-
-        # in case overflow
-        cumsum = fertilities.cumsum(dim=1).float()
-        overflow = cumsum < (self.max_ratio * mask_src.size(1))
-        fertilities = fertilities * overflow.long()
-        new_indices, fertilities, new_mask = self.transform(fertilities, mask_src)
-
-        if not return_samples:
-            return logits, (new_indices, new_mask)
-        return logits, fertilities, (new_indices, new_mask)
 
 class Transformer(nn.Module):
 
@@ -865,101 +530,44 @@ class Transformer(nn.Module):
         self.decoder = Decoder(trg, args)
         self.field = trg
         self.share_embeddings = args.share_embeddings
+        self.args = args
         if args.share_embeddings:
             self.encoder.out.weight = self.decoder.out.weight
-
-    def denum(self, data, target=True):
-        field = self.decoder.field if target else self.encoder.field
-        return field.reverse(data.unsqueeze(0))[0]
-
-    def apply_mask(self, inputs, mask, p=1):
-        _mask = Variable(mask.long())
-        outputs = inputs * _mask + (1 + (-1) * _mask) * p
-        return outputs
-
-    def apply_mask_cost(self, loss, mask, batched=False):
-        loss.data *= mask
-        cost = loss.sum() / (mask.sum() + TINY)
-
-        if not batched:
-            return cost
-
-        loss = loss.sum(1, keepdim=True) / (TINY + Variable(mask).sum(1, keepdim=True))
-        return cost, loss
 
     def output_decoding(self, outputs):
         field, text = outputs
         if field is 'src':
-            return self.encoder.field.reverse(text.data)
+            return self.encoder.field.reverse(text.data, self.args.char)
         else:
-            return self.decoder.field.reverse(text.data)
-
-    def prepare_sources(self, batch, masks=None):
-        masks = self.prepare_masks(batch.src) if masks is None else masks
-        return batch.src, masks
-
-    def prepare_inputs(self, batch, inputs=None, distillation=False, masks=None):
-        if inputs is None:   # use batch
-            if distillation:
-                inputs = batch.dec
-            else:
-                inputs = batch.trg
-
-            decoder_inputs = inputs[:, :-1].contiguous()   # 2D nputes
-            decoder_masks = self.prepare_masks(inputs[:, 1:]) if masks is None else masks
-
-        else:  # use student outputs -- manually panding <init>
-            if inputs.ndimension() == 2:  # input word indices
-                decoder_inputs = Variable(inputs.data.new(inputs.size(0), 1).fill_(self.field.vocab.stoi['<init>']))
-                if inputs.size(1) > 1:
-                    decoder_inputs = torch.cat((decoder_inputs, inputs[:, :-1]), dim=1)
-            else:                         # input one-hot/softmax
-                decoder_inputs = Variable(inputs.data.new(inputs.size(0), 1, inputs.size(2))).fill_(0)
-                decoder_inputs[:, self.field.vocab.stoi['<init>']] = 1
-                if inputs.size(1) > 1:
-                    decoder_inputs = torch.cat((decoder_inputs, inputs[:, :-1, :]))
-
-            decoder_masks = self.prepare_masks(inputs) if masks is None else masks
-        return decoder_inputs, decoder_masks
-
-    def prepare_targets(self, batch, targets=None, distillation=False, masks=None):
-        if targets is None:
-            if distillation:
-                targets = batch.dec[:, 1:].contiguous()
-            else:
-                targets = batch.trg[:, 1:].contiguous()
-        masks = self.prepare_masks(targets) if masks is None else masks
-        return targets, masks
+            return self.decoder.field.reverse(text.data, self.args.char)
 
     def prepare_masks(self, inputs):
-        if inputs.ndimension() == 2:
-            masks = (inputs.data != self.field.vocab.stoi['<pad>']).float()
-        else:
-            masks = (inputs.data[:, :, self.field.vocab.stoi['<pad>']] != 1).float()
+        if inputs.ndimension() == 2:  # index inputs
+            masks = (inputs != self.field.vocab.stoi['<pad>']).float()
+        else:                         # one-hot vector inputs
+            masks = (inputs[:, :, self.field.vocab.stoi['<pad>']] != 1).float()
         return masks
 
     def encoding(self, encoder_inputs, encoder_masks):
         return self.encoder(encoder_inputs, encoder_masks)
 
-    def quick_prepare(self, batch, distillation=False, inputs=None, targets=None,
-                        input_masks=None, target_masks=None, source_masks=None):
-        inputs,  input_masks   = self.prepare_inputs(batch, inputs, distillation, input_masks)     # prepare decoder-inputs
-        targets, target_masks  = self.prepare_targets(batch, targets, distillation, target_masks)  # prepare decoder-targets
-        sources, source_masks  = self.prepare_sources(batch, source_masks)
-        encoding = self.encoding(sources, source_masks)
-        return inputs, input_masks, targets, target_masks, sources, source_masks, encoding, inputs.size(0)
+    def prepare_data(self, batch):
+        source_inputs, source_outputs = batch.src[:, :-1].contiguous(), batch.src[:, 1:].contiguous()
+        target_inputs, target_outputs = batch.trg[:, :-1].contiguous(), batch.trg[:, 1:].contiguous()
+        source_masks, target_masks = self.prepare_masks(source_outputs), self.prepare_masks(target_outputs)
+        return source_inputs, source_outputs, source_masks, target_inputs, target_outputs, target_masks
 
-    def forward(self, encoding, encoder_masks, decoder_inputs, decoder_masks,
-                decoding=False, beam=1, alpha=0.6, return_probs=False, positions=None, feedback=None):
+    def forward(self, encoding_outputs, encoder_masks, decoder_inputs, decoder_masks,
+                decoding=False, beam=1, alpha=0.6, return_probs=False):
 
         if (return_probs and decoding) or (not decoding):
-            out = self.decoder(decoder_inputs, encoding, encoder_masks, decoder_masks)
+            out = self.decoder(decoder_inputs, encoding_outputs, encoder_masks, decoder_masks)
 
         if decoding:
             if beam == 1:  # greedy decoding
-                output = self.decoder.greedy(encoding, encoder_masks, decoder_masks, feedback=feedback)
+                output = self.decoder.greedy(encoding_outputs, encoder_masks, decoder_masks)
             else:
-                output = self.decoder.beam_search(encoding, encoder_masks, decoder_masks, beam, alpha)
+                output = self.decoder.beam_search(encoding_outputs, encoder_masks, decoder_masks, beam, alpha)
 
             if return_probs:
                 return output, out, softmax(self.decoder.out(out))
@@ -969,136 +577,36 @@ class Transformer(nn.Module):
             return out, softmax(self.decoder.out(out))
         return out
 
-    def cost(self, decoder_targets, decoder_masks, out=None):
+    def apply_mask(self, inputs, mask, p=1):
+        outputs = inputs * mask + (1 + (-1) * mask) * p
+        return outputs
+
+    def apply_mask_cost(self, loss, mask, return_batch_loss=False):
+        cost = (loss * mask).sum()) / (mask.sum() + TINY)
+        if not return_batch_loss:
+            return cost
+
+        loss = loss.sum(1, keepdim=True) / (TINY + mask.sum(1, keepdim=True))
+        return cost, loss
+
+    def cost(self, decoder_targets, decoder_masks, out):
         # get loss in a sequence-format to save computational time.
-        decoder_targets, out = mask(decoder_targets, out, decoder_masks.byte())
+
+        input_masks = decoder_masks.byte()
+        decoder_targets = decoder_targets[input_masks]
+        out = out[input_masks.unsqueeze(-1).expand_as(out)].view(-1, out.size(-1))
+
         logits = self.decoder.out(out)
         loss = F.cross_entropy(logits, decoder_targets)
         return loss
 
-    def batched_cost(self, decoder_targets, decoder_masks, probs, batched=False):
+    def batched_cost(self, decoder_targets, decoder_masks, probs, return_batch_loss=False):
         # get loss in a batch-mode
 
         if decoder_targets.ndimension() == 2:  # batch x length
             loss = -torch.log(probs + TINY).gather(2, decoder_targets[:, :, None])[:, :, 0]  # batch x length
         else:
             loss = -(torch.log(probs + TINY) * decoder_targets).sum(-1)
-        return self.apply_mask_cost(loss, decoder_masks, batched)
+        return self.apply_mask_cost(loss, decoder_masks, return_batch_loss)
 
-
-class FastTransformer(Transformer):
-
-    def __init__(self, src, trg, args):
-        super(Transformer, self).__init__()
-        self.encoder = Encoder(src, args)
-        self.decoder = Decoder(trg, args,
-                                causal=False,
-                                positional=args.positional_attention,
-                                diag=args.diag,
-                                windows=args.windows)
-
-        self.field = trg
-        self.fertility = args.fertility
-        self.alignment = None
-        self.hard_inputs = args.hard_inputs
-
-        if self.fertility:
-            self.reorderer = ReOrderer(args)
-            self.predictor = Fertility(args)
-            if not args.old:
-                self.offsetor = Fertility(args, L=51)
-
-
-    def predict_offset(self, outs, masks, truth=None):
-        abs_pos = torch.arange(0, masks.size(1))[None,:].expand_as(masks)  # batch x len
-        if outs.is_cuda:
-            abs_pos = abs_pos.cuda(outs.get_device())
-        abs_pos = Variable(abs_pos)
-
-        # only predicts
-        positions = self.offsetor(outs, mode='sharp') + abs_pos - 25
-        positions.data += ((1 - masks) * INF)
-
-        if truth is None:
-            return positions
-
-        logits = self.offsetor(outs)   # batch x len x 5
-        truth = (truth - abs_pos.long() + 25).clamp(0, 50)
-        truth, logits = mask(truth, logits, masks.byte())
-        loss = F.cross_entropy(logits, truth)
-        return loss, positions
-
-    def prepare_initial(self, encoding, source=None, mask_src=None, mask_trg=None,
-                        post_fer=None, mode='argmax', N=1, tau=1):
-
-        # prepare input embeddings
-        source_embeddings = encoding[0]
-        if self.alignment is None:
-            input_embed = source_embeddings # batch x max_src x size
-        else:
-            input_embed = F.embedding(self.alignment[source.data.view(-1)].view(*source.data.size()),
-                            self.decoder.out.weight * math.sqrt(self.decoder.d_model))  # i am using alignment
-
-        loss = None
-        if not self.fertility:
-            attention = ReOrderer.linear_attention(mask_src, mask_trg)  # batch x max_trg x max_src
-            reordering = attention.max(-1)[1]  # batch x max_trg
-
-        else:
-            if (post_fer is not None) and (post_fer.size(1) < mask_src.size(1)):
-                post_fer = torch.cat((post_fer, Variable(post_fer.data.new(post_fer.size(0),
-                                            mask_src.size(1)-post_fer.size(1)).zero_())), 1)
-
-            if post_fer is not None:
-                logits_fer = self.predictor(encoding[-1], mask_src)
-                reordering, _, mask_trg = self.predictor.transform(post_fer, mask_src)
-                fer_targets, logits_fer = mask(post_fer, logits_fer, mask_src.byte())
-                loss = F.cross_entropy(logits_fer, fer_targets.clamp(0, self.predictor.L-1))
-
-            else:
-                logits_fer, pred_fer, (reordering, mask_trg) = \
-                    self.predictor(encoding[-1], mask_src, mode=mode, N=N, tau=tau, return_samples=True)
-
-        if N > 1:
-            B, T, D = source_embeddings.size()
-            source = source[:, None, :].expand(B, N, T).contiguous().view(B * N, T)
-            input_embed = input_embed[:, None, :, :].expand(B, N, T, D).contiguous().view(B * N, T, D)
-
-        # check source indices here:
-        source_reordering = self.apply_mask(source.gather(1, reordering), mask_trg)
-
-        if (not self.hard_inputs) and (not self.fertility):
-            input_embed = matmul(attention, input_embed) # batch x max_trg x size
-        else:
-            input_embed = input_embed.gather(1, reordering[:, :, None].expand(*reordering.size(), input_embed.size(2)))
-
-        if post_fer is None:
-            return input_embed, source_reordering, mask_trg, loss, pred_fer
-        return input_embed, source_reordering, mask_trg, loss
-
-
-    def forward(self, encoding, encoder_masks, decoder_inputs, decoder_masks,
-                decoding=False, beam=1, alpha=0.6,
-                return_probs=False, positions=None, feedback=None):
-
-        # decoder_inputs must be embeddings
-        out = self.decoder(decoder_inputs, encoding, encoder_masks, decoder_masks,
-                            input_embeddings=True, positions=positions, feedback=feedback)
-        if not decoding:
-            if not return_probs:
-                return out
-            return out, softmax(self.decoder.out(out))
-
-        logits = self.decoder.out(out)
-
-        if beam == 1:
-            output = self.apply_mask(logits.max(-1)[1], decoder_masks)
-        else:
-            output, decoder_masks = topK_search(logits, decoder_masks, N=beam)
-            output = self.apply_mask(output, decoder_masks)
-
-        if not return_probs:
-            return output
-        else:
-            return output, out, softmax(logits)
 

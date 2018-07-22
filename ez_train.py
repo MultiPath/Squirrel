@@ -1,19 +1,15 @@
 import torch
 import numpy as np
 import math
+import time
 
+from collections import defaultdict
 from torch.autograd import Variable
 from tqdm import tqdm, trange
-from model import Transformer, FastTransformer
+from model import Transformer
 from utils import Metrics, Best, computeGLEU, computeBLEU
 
-# helper functions
-def register_nan_checks(m):
-    def check_grad(module, grad_input, grad_output):
-        if any(np.any(np.isnan(gi.data.cpu().numpy())) for gi in grad_input if gi is not None):
-            print('NaN gradient in ' + type(module).__name__)
-            1/0
-    m.apply(lambda module: module.register_backward_hook(check_grad))
+# -- helper functions
 
 def export(x):
     try:
@@ -22,71 +18,59 @@ def export(x):
     except Exception:
         return 0
 
-def devol(batch):
-    new_batch = copy.copy(batch)
-    new_batch.src = Variable(batch.src.data, volatile=True)
-    return new_batch
+def debpe(x):
+    return x.replace('@@ ', '').split()
 
-tokenizer = lambda x: x.replace('@@ ', '').split()
-
-def valid_model(args, model, dev, dev_metrics=None, distillation=False, print_out=False):
-    print_seqs = ['[sources]', '[targets]', '[decoded]', '[fertili]', '[origind]']
-    trg_outputs, dec_outputs = [], []
-    outputs = {}
+def valid_model(args, model, dev, print_out=False):
+    print_seqs = ['[sources]', '[targets]', '[decoded]']
+    outputs = {'src': [], 'trg': [], 'dec': [], 'gleu': []}
 
     model.eval()
 
     for j, dev_batch in enumerate(dev):
-        inputs, input_masks, \
-        targets, target_masks, \
-        sources, source_masks, \
-        encoding, batch_size = model.quick_prepare(dev_batch, distillation)
+        with torch.no_grad():
 
-        decoder_inputs, input_reorder, fertility_cost = inputs, None, None
-        if type(model) is FastTransformer:
-            decoder_inputs, input_reorder, decoder_masks, fertility_cost, pred_fertility = \
-                model.prepare_initial(encoding, sources, source_masks, input_masks, None, mode='argmax')
-        else:
-            decoder_masks = input_masks
+            # prepare the data
+            source_inputs, source_outputs, source_masks, \
+            target_inputs, target_outputs, target_masks = model.prepare_data(dev_batch)
 
-        decoding, out, probs = model(encoding, source_masks, decoder_inputs, decoder_masks, decoding=True, return_probs=True)
-        dev_outputs = [('src', sources), ('trg', targets), ('trg', decoding)]
-        if type(model) is FastTransformer:
-            dev_outputs += [('src', input_reorder)]
-        dev_outputs = [model.output_decoding(d) for d in  dev_outputs]
-        gleu = computeGLEU(dev_outputs[2], dev_outputs[1], corpus=False, tokenizer=tokenizer)
+            # encoding
+            encoding_outputs = model.encoding(source_inputs, source_masks)
 
-        if print_out:
-            for k, d in enumerate(dev_outputs):
-                args.logger.info("{}: {}".format(print_seqs[k], d[0]))
-            args.logger.info('------------------------------------------------------------------')
+            # decoding
+            decoding_outputs, out, probs = model(encoding_outputs, source_masks, target_inputs, target_masks, 
+                                                decoding=True, return_probs=True)
+            
+            # reverse to string-sequence
+            dev_outputs = [('src', source_outputs), ('trg', target_outputs), ('trg', decoding_outputs)]
+            dev_outputs = [model.output_decoding(d) for d in dev_outputs]
+            
+            # compute sentence-level GLEU score 
+            gleu = computeGLEU(dev_outputs[2], dev_outputs[1], corpus=False, tokenizer=debpe)
+            
+            # save to the outputs
+            outputs['src'] += dev_outputs[0]
+            outputs['trg'] += dev_outputs[1]
+            outputs['dec'] += dev_outputs[2]
+            outputs['gleu'].append(gleu)
 
-        trg_outputs += dev_outputs[1]
-        dec_outputs += dev_outputs[2]
 
-        if dev_metrics is not None:
-            values = [0, gleu]
-            if fertility_cost is not None:
-                values += [fertility_cost]
-            dev_metrics.accumulate(batch_size, *values)
+            if print_out:
+                for k, d in enumerate(dev_outputs):
+                    args.logger.info("{}: {}".format(print_seqs[k], d[0]))
+                args.logger.info('------------------------------------------------------------------')
 
-    corpus_gleu = computeGLEU(dec_outputs, trg_outputs, corpus=True, tokenizer=tokenizer)
-    corpus_bleu = computeBLEU(dec_outputs, trg_outputs, corpus=True, tokenizer=tokenizer)
-    outputs['corpus_gleu'] = corpus_gleu
-    outputs['corpus_bleu'] = corpus_bleu
-    if dev_metrics is not None:
-        args.logger.info(dev_metrics)
-
-    args.logger.info("The dev-set corpus GLEU = {}".format(corpus_gleu))
-    args.logger.info("The dev-set corpus BLEU = {}".format(corpus_bleu))
+    outputs['corpus_bleu'] = computeBLEU(outputs['dec'], outputs['trg'], corpus=True, tokenizer=debpe)
+    args.logger.info("The dev-set corpus BLEU = {}".format(outputs['corpus_bleu']))
     return outputs
 
 
 def train_model(args, model, train, dev, save_path=None, maxsteps=None):
 
+    # record by tensorbard.
     if args.tensorboard and (not args.debug):
         from tensorboardX import SummaryWriter
-        writer = SummaryWriter('./runs/{}'.format(args.prefix+args.hp_str))
+        writer = SummaryWriter('{}/runs/{}'.format(args.workspace_prefix, args.prefix+args.hp_str))
 
     # optimizer
     if args.optimizer == 'Adam':
@@ -97,7 +81,7 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
     # if resume training
     if (args.load_from is not None) and (args.resume):
         with torch.cuda.device(args.gpu):   # very important.
-            offset, opt_states = torch.load('./models/' + args.load_from + '.pt.states',
+            offset, opt_states = torch.load(args.workspace_prefix + '/models/' + args.load_from + '.pt.states',
                                             map_location=lambda storage, loc: storage.cuda())
             opt.load_state_dict(opt_states)
     else:
@@ -107,14 +91,14 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
     if save_path is None:
         save_path = args.model_name
 
-    best = Best(max, 'corpus_bleu', 'corpus_gleu', 'gleu', 'loss', 'i', model=model, opt=opt, path=save_path, gpu=args.gpu)
-    train_metrics = Metrics('train', 'loss', 'real', 'fake')
-    dev_metrics = Metrics('dev', 'loss', 'gleu', 'real_loss', 'fake_loss', 'distance', 'alter_loss', 'distance2', 'fertility_loss', 'corpus_gleu')
+    iters = offset
+    best = Best(max, 'corpus_bleu', 'sentence_gleu', 'i', model=model, opt=opt, path=save_path, gpu=args.gpu)
     progressbar = tqdm(total=args.eval_every, desc='start training.')
 
-    for iters, batch in enumerate(train):
+    # statistics
+    total_tokens = 0
 
-        iters += offset
+    while True:
 
         # --- saving --- #
         if iters % args.save_every == 0:
@@ -126,26 +110,16 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
         # --- validation --- #
         if iters % args.eval_every == 0:
             progressbar.close()
-            dev_metrics.reset()
 
-            if args.distillation:
-                outputs_course = valid_model(args, model, dev, dev_metrics, distillation=True)
-
-            outputs_data = valid_model(args, model, dev, None if args.distillation else dev_metrics, print_out=True)
+            outputs_data = valid_model(args, model, dev, print_out=True)
             if args.tensorboard and (not args.debug):
-                writer.add_scalar('dev/GLEU_sentence_', dev_metrics.gleu, iters)
-                writer.add_scalar('dev/Loss', dev_metrics.loss, iters)
-                writer.add_scalar('dev/GLEU_corpus_', outputs_data['corpus_gleu'], iters)
+                writer.add_scalar('dev/GLEU_sentence_', np.mean(outputs_data['gleu']), iters)
+                # writer.add_scalar('dev/Loss', dev_metrics.loss, iters)
                 writer.add_scalar('dev/BLEU_corpus_', outputs_data['corpus_bleu'], iters)
 
-                if args.distillation:
-                    writer.add_scalar('dev/GLEU_corpus_dis', outputs_course['corpus_gleu'], iters)
-                    writer.add_scalar('dev/BLEU_corpus_dis', outputs_course['corpus_bleu'], iters)
-
             if not args.debug:
-                best.accumulate(outputs_data['corpus_bleu'], outputs_data['corpus_gleu'], dev_metrics.gleu, dev_metrics.loss, iters)
-                args.logger.info('the best model is achieved at {}, average greedy GLEU={}, corpus GLEU={}, corpus BLEU={}'.format(
-                    best.i, best.gleu, best.corpus_gleu, best.corpus_bleu))
+                best.accumulate(outputs_data['corpus_bleu'], np.mean(outputs_data['gleu']), iters)
+                args.logger.info('the best model is achieved at {}, average greedy GLEU={}, corpus BLEU={}'.format(best.i, best.sentence_gleu, best.corpus_bleu))
             args.logger.info('model:' + args.prefix + args.hp_str)
 
             # ---set-up a new progressor---
@@ -159,50 +133,60 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
             args.logger.info('reach the maximum updating steps.')
             break
 
-
-        # --- training --- #
+        # --- training  --- #
+        iters += 1
         model.train()
+
         def get_learning_rate(i, lr0=0.1, disable=False):
             if not disable:
                 return lr0 * 10 / math.sqrt(args.d_model) * min(1 / math.sqrt(i), i / (args.warmup * math.sqrt(args.warmup)))
             return 0.00002
+
         opt.param_groups[0]['lr'] = get_learning_rate(iters + 1, disable=args.disable_lr_schedule)
         opt.zero_grad()
+        
+        info_str = 'training step = {}, lr={:.5f}, '.format(iters, opt.param_groups[0]['lr'])
+        info = defaultdict(lambda:0)
 
         # prepare the data
-        inputs, input_masks, \
-        targets, target_masks, \
-        sources, source_masks,\
-        encoding, batch_size = model.quick_prepare(batch, args.distillation)
-        input_reorder, fertility_cost, decoder_inputs = None, None, inputs
+        for inter_step in range(args.inter_size):
 
-        #print(input_masks.size(), target_masks.size(), input_masks.sum())
-        if type(model) is FastTransformer:
-            batch_fer = batch.fer_dec if args.distillation else batch.fer
-            inputs, input_reorder, input_masks, fertility_cost = model.prepare_initial(encoding, sources, source_masks, input_masks, batch_fer)
+            batch = next(iter(train))  # load the next batch of training data.
 
+            source_inputs, source_outputs, source_masks, \
+            target_inputs, target_outputs, target_masks = model.prepare_data(batch)
+            
+            info['sents']  += target_inputs.size(0)
+            info['tokens'] += (target_masks != 0).data.sum()
+            
+            # encoding
+            encoding_outputs = model.encoding(source_inputs, source_masks)
 
-        # Maximum Likelihood Training
-        loss = model.cost(targets, target_masks, out=model(encoding, source_masks, inputs, input_masks))
-        if hasattr(args, 'fertility') and args.fertility:
-            loss += fertility_cost
+            # Maximum Likelihood Training
+            loss  = model.cost(target_outputs, target_masks, out=model(encoding_outputs, source_masks, target_inputs, target_masks))
+            info['MLE'] += export(loss)
 
+            # Source side Language Model (optional, only works for causal-encoder)
+            if args.encoder_lm and args.causal_enc:
+                loss_lm = model.cost(source_outputs, source_masks, out=encoding_outputs[-1])
+                info['LM'] += export(loss_lm)
+                loss += loss_lm
 
-        # accmulate the training metrics
-        train_metrics.accumulate(batch_size, loss, print_iter=None)
-        train_metrics.reset()
+            loss = loss / args.inter_size
+            loss.backward()
 
-        loss.backward()
+        # multiple steps, one update
         opt.step()
 
-        info = 'training step={}, loss={:.3f}, lr={:.5f}'.format(iters, export(loss), opt.param_groups[0]['lr'])
-        if hasattr(args, 'fertility') and args.fertility:
-            info += '| RE:{:.3f}'.format(export(fertility_cost))
+        info_str += 'Processed {} sents/{} tokens'.format(info['sents'], info['tokens'])
+        info_str += 'MLE_loss={:.3f}, '.format(info['MLE'] / args.inter_size)
+        if args.encoder_lm and args.causal_enc:
+            info_str += 'ENCLM_loss={:.3f}, '.format(info['LM'] / args.inter_size)
 
         if args.tensorboard and (not args.debug):
             writer.add_scalar('train/Loss', export(loss), iters)
 
+        total_tokens += info['tokens']
         progressbar.update(1)
         progressbar.set_description(info)
-
 

@@ -1,21 +1,17 @@
 import torch
 import numpy as np
-import revtok
 import os
 
 from torch.autograd import Variable
 from torchtext import data, datasets
 from nltk.translate.gleu_score import sentence_gleu, corpus_gleu
-from nltk.translate.bleu_score import corpus_bleu
+from bleu_score import corpus_bleu
 from contextlib import ExitStack
 from collections import OrderedDict
 
 INF = 1e10
 TINY = 1e-9
 def computeGLEU(outputs, targets, corpus=False, tokenizer=None):
-    if tokenizer is None:
-        tokenizer = revtok.tokenize
-
     outputs = [tokenizer(o) for o in outputs]
     targets = [tokenizer(t) for t in targets]
 
@@ -25,9 +21,6 @@ def computeGLEU(outputs, targets, corpus=False, tokenizer=None):
     return corpus_gleu([[t] for t in targets], [o for o in outputs])
 
 def computeBLEU(outputs, targets, corpus=False, tokenizer=None):
-    if tokenizer is None:
-        tokenizer = revtok.tokenize
-
     outputs = [tokenizer(o) for o in outputs]
     targets = [tokenizer(t) for t in targets]
 
@@ -37,9 +30,6 @@ def computeBLEU(outputs, targets, corpus=False, tokenizer=None):
     return corpus_bleu([[t] for t in targets], [o for o in outputs], emulate_multibleu=True)
 
 def computeGroupBLEU(outputs, targets, tokenizer=None, bra=10, maxmaxlen=80):
-    if tokenizer is None:
-        tokenizer = revtok.tokenize
-
     outputs = [tokenizer(o) for o in outputs]
     targets = [tokenizer(t) for t in targets]
     maxlens = max([len(t) for t in targets])
@@ -62,7 +52,7 @@ def computeGroupBLEU(outputs, targets, tokenizer=None, bra=10, maxmaxlen=80):
 # load the dataset + reversible tokenization
 class NormalField(data.Field):
 
-    def reverse(self, batch):
+    def reverse(self, batch, char=False):
         if not self.batch_first:
             batch.t_()
 
@@ -83,7 +73,10 @@ class NormalField(data.Field):
         def filter_special(tok):
             return tok not in (self.init_token, self.pad_token)
 
-        batch = [" ".join(filter(filter_special, ex)) for ex in batch]
+        if not char:
+            batch = [" ".join(filter(filter_special, ex)) for ex in batch]
+        else:
+            batch = ["".join(filter(filter_special, ex)) for ex in batch]
         return batch
 
 class NormalTranslationDataset(datasets.TranslationDataset):
@@ -167,6 +160,73 @@ class ParallelDataset(datasets.TranslationDataset):
                     torch.save(examples, path + '.processed.{}.pt'.format(prefix))
 
         super(datasets.TranslationDataset, self).__init__(examples, fields, **kwargs)
+
+def lazy_reader(paths, fields, max_len=None):  # infinite dataloader
+    while True:
+        with ExitStack() as stack:
+            files = [stack.enter_context(open(fname, "r", encoding="utf-8")) for fname in paths]
+            examples = []
+            for steps, lines in enumerate(zip(*files)):
+                lines = [line.strip() for line in lines]
+                if not any(line == '' for line in lines):
+                    if max_len is not None:
+                        flag = 0
+                        for line in lines:
+                            if len(line.split()) > max_len:
+                                flag = 1
+                                break
+                        if flag == 1:
+                            continue                    
+                    examples.append(lines)
+
+                if steps % 2048 == 2047:    # pre-read 4096 lines of the dataset
+                    # sort the lines based on source length + target length
+                    examples = sorted(examples, key=lambda x: sum([len(xi.split()) for xi in x]) ) 
+                    for example in examples:
+                        yield data.Example.fromlist(example, fields)
+                    examples = []
+
+            for example in examples:
+                yield data.Example.fromlist(example, fields)
+            # raise StopIteration
+            examples = []
+
+
+def full_reader(paths, fields, max_len=None):
+    with ExitStack() as stack:
+        files = [stack.enter_context(open(fname, "r", encoding="utf-8")) for fname in paths]
+        examples = []
+        for steps, lines in enumerate(zip(*files)):
+            lines = [line.strip() for line in lines]
+            if not any(line == '' for line in lines):
+                examples.append(data.Example.fromlist(lines, fields))
+        return examples
+
+
+class LazyParallelDataset(datasets.TranslationDataset):
+    """ Define a N-parallel dataset: supports abitriry numbers of input streams"""
+
+    def __init__(self, path=None, exts=None, fields=None,
+                load_dataset=False, prefix='', examples=None, lazy=True, 
+                max_len=None, **kwargs):
+
+        assert len(exts) == len(fields), 'N parallel dataset must match'
+        self.N = len(fields)
+        paths = tuple(os.path.expanduser(path + x) for x in exts)
+
+        if lazy:
+            super(datasets.TranslationDataset, self).__init__(lazy_reader(paths, fields, max_len), fields, **kwargs)
+        else:
+            super(datasets.TranslationDataset, self).__init__(full_reader(paths, fields, max_len), fields, **kwargs)
+
+    @classmethod
+    def splits(cls, path, train=None, validation=None, test=None, **kwargs):
+        train_data = None if train is None else cls(path + train, lazy=True, **kwargs)
+        val_data = None if validation is None else cls(path + validation, lazy=False, **kwargs)
+        test_data = None if test is None else cls(path + test, lazy=False, **kwargs)
+        return tuple(d for d in (train_data, val_data, test_data) if d is not None)
+
+
 
 class Metrics:
 

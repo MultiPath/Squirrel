@@ -3,39 +3,43 @@ import numpy as np
 from torchtext import data
 from torchtext import datasets
 
-import revtok
 import logging
 import random
 import argparse
+import sys
 import os
 import copy
 
 from ez_train import train_model
-from decode import decode_model
-from model import Transformer, FastTransformer, INF, TINY, softmax
-from utils import NormalField, NormalTranslationDataset, TripleTranslationDataset, ParallelDataset, merge_cache
+#from decode import decode_model
+from model import Transformer, INF, TINY, softmax
+from utils import NormalField, LazyParallelDataset, ParallelDataset, merge_cache
 from time import gmtime, strftime
 
-# check the path
-for d in ['models', 'runs', 'logs']:
-    if not os.path.exists('./{}'.format(d)):
-        os.mkdir('./{}'.format(d))
 
 # all the hyper-parameters
 parser = argparse.ArgumentParser(description='Train a Transformer-Like Model.')
 
-# dataset settings
+# dataset settings --- 
 parser.add_argument('--data_prefix', type=str, default='/data0/data/transformer_data/')
-parser.add_argument('--dataset',     type=str, default='iwslt', help='"flickr" or "iwslt"')
-parser.add_argument('--language',    type=str, default='ende',  help='a combination of two language markers to show the language pair.')
-parser.add_argument('--data_group',  type=str, default=None,  help='dataset group')
+parser.add_argument('--workspace_prefix', type=str, default='./') 
 
-parser.add_argument('--load_vocab',   action='store_true', help='load a pre-computed vocabulary')
-parser.add_argument('--load_dataset', action='store_true', help='load a pre-processed dataset')
-parser.add_argument('--use_revtok',   action='store_true', help='use reversible tokenization')
-parser.add_argument('--remove_eos',   action='store_true', help='possibly remove <eos> tokens for FastTransformer')
-parser.add_argument('--test_set',     type=str, default=None,  help='which test set to use')
+parser.add_argument('--dataset',     type=str, default='iwslt', help='"flickr" or "iwslt"')
+parser.add_argument('--char', action='store_true', help='if --char enabled, character-based model are used.')
+parser.add_argument('--src', type=str, default='en', help='source language marker')
+parser.add_argument('--trg', type=str, default='de', help='target language marker')
+
 parser.add_argument('--max_len',      type=int, default=None,  help='limit the train set sentences to this many tokens')
+parser.add_argument('--max_vocab_size', type=int, default=50000, help='max vocabulary size')
+parser.add_argument('--load_vocab',   action='store_true', help='load a pre-computed vocabulary')
+parser.add_argument('--load_lazy', action='store_true', help='load a lazy-mode dataset, not save everything in the mem')
+parser.add_argument('--remove_dec_eos', action='store_true', help='possibly remove <eos> tokens in the decoder')
+parser.add_argument('--remove_enc_eos', action='store_true', help='possibly remove <eos> tokens in the encoder')
+
+parser.add_argument('--train_set', type=str, default='train',  help='which train set to use')
+parser.add_argument('--dev_set', type=str, default='dev',  help='which dev set to use')
+parser.add_argument('--test_set', type=str, default='test',  help='which test set to use')
+
 
 # model basic settings
 parser.add_argument('--prefix', type=str, default='[time]',      help='prefix to denote the model, nothing or [time]')
@@ -43,6 +47,7 @@ parser.add_argument('--params', type=str, default='james-iwslt', help='pamarater
 
 # model ablation settings
 parser.add_argument('--causal_enc', action='store_true', help='use unidirectional encoder (useful for real-time translation)')
+parser.add_argument('--encoder_lm', action='store_true', help='use unidirectional encoder with additional loss as a LM')
 parser.add_argument('--causal',   action='store_true', help='use causal attention')
 parser.add_argument('--diag',     action='store_true', help='ignore diagonal attention when doing self-attention.')
 parser.add_argument('--use_wo',   action='store_true', help='use output weight matrix in multihead attention')
@@ -50,7 +55,7 @@ parser.add_argument('--share_embeddings',     action='store_true', help='share e
 parser.add_argument('--positional_attention', action='store_true', help='incorporate positional information in key/value')
 
 # running setting
-parser.add_argument('--mode',    type=str, default='train',  help='train, test or build')
+parser.add_argument('--mode',    type=str, default='train',  help='train, test or data')  # "data": preprocessing and save vocabulary
 parser.add_argument('--gpu',     type=int, default=0,        help='GPU to use or -1 for CPU')
 parser.add_argument('--seed',    type=int, default=19920206, help='seed for randomness')
 
@@ -58,52 +63,44 @@ parser.add_argument('--seed',    type=int, default=19920206, help='seed for rand
 parser.add_argument('--eval-every',    type=int, default=1000,    help='run dev every')
 parser.add_argument('--save_every',    type=int, default=50000,   help='save the best checkpoint every 50k updates')
 parser.add_argument('--maximum_steps', type=int, default=1000000, help='maximum steps you take to train a model')
+parser.add_argument('--inter_size',    type=int, default=4,       help='process multiple batches before one update')
 parser.add_argument('--batch_size',    type=int, default=2048,    help='# of tokens processed per batch')
 parser.add_argument('--optimizer',     type=str, default='Adam')
 parser.add_argument('--disable_lr_schedule', action='store_true', help='disable the transformer-style learning rate')
-
-parser.add_argument('--distillation', action='store_true', help='knowledge distillation at sequence level')
-parser.add_argument('--finetuning',   action='store_true', help='knowledge distillation at word level')
 
 # decoding
 parser.add_argument('--length_ratio',  type=int,   default=2, help='maximum lengths of decoding')
 parser.add_argument('--decode_mode',   type=str,   default='argmax', help='decoding mode: argmax, mean, sample, noisy, search')
 parser.add_argument('--beam_size',     type=int,   default=1, help='beam-size used in Beamsearch, default using greedy decoding')
-parser.add_argument('--f_size',        type=int,   default=1, help='heap size for sampling/searching in the fertility space')
 parser.add_argument('--alpha',         type=float, default=1, help='length normalization weights')
-parser.add_argument('--temperature',   type=float, default=1, help='smoothing temperature for noisy decodig')
 parser.add_argument('--rerank_by_bleu', action='store_true', help='use the teacher model for reranking')
 
 # model saving/reloading, output translations
 parser.add_argument('--load_from',     type=str, default=None, help='load from checkpoint')
 parser.add_argument('--resume',        action='store_true', help='when loading from the saved model, it resumes from that.')
-parser.add_argument('--share_encoder', action='store_true', help='use teacher-encoder to initialize student')
-
-parser.add_argument('--no_bpe',        action='store_true', help='output files without BPE')
-parser.add_argument('--no_write',      action='store_true', help='do not write the decoding into the decoding files.')
-parser.add_argument('--output_fer',    action='store_true', help='decoding and output fertilities')
 
 # debugging
 parser.add_argument('--debug',       action='store_true', help='debug mode: no saving or tensorboard')
 parser.add_argument('--tensorboard', action='store_true', help='use TensorBoard')
 
-
+# arguments (:)
 args = parser.parse_args()
+
+for d in ['models', 'runs', 'logs']:    # check the path
+    if not os.path.exists(os.path.join(args.workspace_prefix, d)):
+        os.mkdir(os.path.join(args.workspace_prefix, d))
 if args.prefix == '[time]':
     args.prefix = strftime("%m.%d_%H.%M.", gmtime())
-
-# get the langauage pairs:
-args.src = args.language[:2]  # source language
-args.trg = args.language[2:]  # target language
 
 # setup logger settings
 logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
 formatter = logging.Formatter('%(asctime)s %(levelname)s: - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
-fh = logging.FileHandler('./logs/log-{}.txt'.format(args.prefix))
+fh = logging.FileHandler(os.path.join(args.workspace_prefix, 'logs', 'log-{}.txt'.format(args.prefix)))
 fh.setLevel(logging.DEBUG)
 fh.setFormatter(formatter)
+
 ch = logging.StreamHandler()
 ch.setLevel(logging.DEBUG)
 ch.setFormatter(formatter)
@@ -117,151 +114,147 @@ np.random.seed(args.seed)
 torch.manual_seed(args.seed)
 torch.cuda.manual_seed_all(args.seed)
 
+# special for Pytorch 0.4
+args.device = "cuda:{}".format(args.gpu) if args.gpu > -1 else "cpu"
 
-# ----------------------------------------------------------------------------------------------------------------- #
-# setup data-field
-DataField = data.ReversibleField if args.use_revtok else NormalField
-TRG   = DataField(init_token='<init>', eos_token='<eos>', batch_first=True)
-SRC   = DataField(batch_first=True) if not args.share_embeddings else TRG
+# setup a data-field
+DataField = NormalField
 
-# setup many datasets (need to manaually setup)
-data_prefix = args.data_prefix
-if args.dataset == 'iwslt':
-    if args.test_set is None:
-        args.test_set = 'IWSLT16.TED.tst2013'
+if not args.char:
+    tokenizer = lambda s: s.split() 
+else:
+    tokenizer = lambda s: list(s)
+    
+if args.remove_dec_eos:
+    TRG = DataField(batch_first=True, tokenize=tokenizer)
+else:
+    TRG = DataField(init_token='<init>', eos_token='<eos>', batch_first=True, tokenize=tokenizer)
 
-    if args.data_group == 'test':
-        train_data, dev_data = NormalTranslationDataset.splits(
-        path=data_prefix + 'iwslt/en-de/', train='train.tags.en-de.bpe',
-        validation='{}.en-de.bpe'.format(args.test_set), exts=('.{}'.format(args.src), '.{}'.format(args.trg)),
-        fields=(SRC, TRG), load_dataset=args.load_dataset, prefix='normal')
+if args.share_embeddings:
+    SRC = TRG
+elif args.remove_enc_eos:
+    SRC = DataField(batch_first=True, tokenize=tokenizer)
+else:
+    SRC = DataField(init_token='<init>', eos_token='<eos>', batch_first=True, tokenize=tokenizer)
+    
 
-    else:  # default dataset
-        train_data, dev_data = ParallelDataset.splits(
-        path=data_prefix + 'iwslt/en-de/', train='train.tags.en-de.bpe',
-        validation='train.tags.en-de.bpe.dev', exts=('.en2', '.de2'),
-        fields=[('src', SRC), ('trg', TRG)],
-        load_dataset=args.load_dataset, prefix='ts')
+# read the dataset
+DatasetFunc = LazyParallelDataset if (args.load_lazy and args.mode != 'data') else ParallelDataset
+train_data, dev_data, test_data = DatasetFunc.splits(
+    path=os.path.join(args.data_prefix, args.dataset, args.src + '-' + args.trg) + '/', 
+    train=args.train_set, validation=args.dev_set, test=args.test_set, 
+    exts=('.src', '.trg'), fields=[('src', SRC), ('trg', TRG)])
+vocab_name = 'vocab.{}-{}.{}.{}.pt'.format(args.src, args.trg, 
+                                        's' if args.share_embeddings else 'n',
+                                        'c' if args.char else 'w')
 
-    decoding_path = data_prefix + 'iwslt/en-de/{}.en-de.bpe.new'
+if args.mode == 'data':
+
+    # build vocabulary
+    if not args.share_embeddings:
+        SRC.build_vocab(train_data, dev_data, max_size=args.max_vocab_size)
+    TRG.build_vocab(train_data, dev_data, max_size=args.max_vocab_size)
+    
+    torch.save([SRC.vocab, TRG.vocab], os.path.join(args.data_prefix, args.dataset, args.src + '-' + args.trg, vocab_name))
+    logger.info('save the processed vocabulary, {} {}'.format(len(SRC.vocab), len(TRG.vocab)))
+    sys.exit(1)
 
 else:
-    raise NotImplementedError
 
-# build vocabularies
-if args.load_vocab and os.path.exists(data_prefix + '{}/vocab{}_{}.pt'.format(
-        args.dataset, 'shared' if args.share_embeddings else '', '{}-{}'.format(args.src, args.trg))):
+    # load vocabulary
+    assert os.path.exists(os.path.join(args.data_prefix, args.dataset, args.src + '-' + args.trg, vocab_name)), 'need to pre-compute the vocab'
 
     logger.info('load saved vocabulary.')
-    src_vocab, trg_vocab = torch.load(data_prefix + '{}/vocab{}_{}.pt'.format(
-        args.dataset, 'shared' if args.share_embeddings else '', '{}-{}'.format(args.src, args.trg)))
+    src_vocab, trg_vocab = torch.load(os.path.join(args.data_prefix, args.dataset, args.src + '-' + args.trg, vocab_name))
+
     SRC.vocab = src_vocab
     TRG.vocab = trg_vocab
 
-else:
-
-    logger.info('save the vocabulary')
-    if not args.share_embeddings:
-        SRC.build_vocab(train_data, dev_data, max_size=50000)
-    TRG.build_vocab(train_data, dev_data, max_size=50000)
-    torch.save([SRC.vocab, TRG.vocab], data_prefix + '{}/vocab{}_{}.pt'.format(
-        args.dataset, 'shared' if args.share_embeddings else '', '{}-{}'.format(args.src, args.trg)))
 args.__dict__.update({'trg_vocab': len(TRG.vocab), 'src_vocab': len(SRC.vocab)})
 
-# build alignments ---
+# dynamic batching
 def dyn_batch_with_padding(new, i, sofar):
     prev_max_len = sofar / (i - 1) if i > 1 else 0
-    if args.distillation:
-        return max(len(new.src), len(new.trg), len(new.dec), prev_max_len) * i
-    else:
-        return max(len(new.src), len(new.trg),  prev_max_len) * i
+    return max(len(new.src), len(new.trg),  prev_max_len) * i
+
+def dyn_batch_with_overhead(new, i, sofar):
+    
+    def oh(x):
+        return x * (1 + 0.001 * x)
+
+    prev_max_len = sofar / (i - 1) if i > 1 else 0
+    return max(oh(len(new.src)), oh(len(new.trg)),  prev_max_len) * i
 
 def dyn_batch_without_padding(new, i, sofar):
-    if args.distillation:
-        return sofar + max(len(new.src), len(new.trg), len(new.dec))
-    else:
-        return sofar + max(len(new.src), len(new.trg))
+    return sofar + max(len(new.src), len(new.trg))
 
-# work around torchtext making it hard to share vocabs without sharing other field properties
-if args.share_embeddings:
-    SRC = copy.deepcopy(SRC)
-    SRC.init_token = None
-    SRC.eos_token = None
-    train_data.fields['src'] = SRC
-    dev_data.fields['src'] = SRC
-
-if args.max_len is not None:
-    train_data.examples = [ex for ex in train_data.examples if len(ex.trg) <= args.max_len]
 
 if args.batch_size == 1:  # speed-test: one sentence per batch.
     batch_size_fn = lambda new, count, sofar: count
 else:
-    batch_size_fn = dyn_batch_without_padding
+    if not args.char:
+        batch_size_fn = dyn_batch_without_padding
+    else:
+        batch_size_fn = dyn_batch_with_overhead
 
+
+# batch-iterator
 train_real, dev_real = data.BucketIterator.splits(
-    (train_data, dev_data), batch_sizes=(args.batch_size, args.batch_size), device=args.gpu,
+    (train_data, dev_data), batch_sizes=(args.batch_size, args.batch_size), device=args.device,
     batch_size_fn=batch_size_fn, repeat=None if args.mode == 'train' else False)
 logger.info("build the dataset. done!")
 # ----------------------------------------------------------------------------------------------------------------- #
 
 # model hyper-params:
 hparams = None
-if args.dataset == 'iwslt':
-    if args.params == 'james-iwslt':
-        hparams = {'d_model': 278, 'd_hidden': 507, 'n_layers': 5,
-                    'n_heads': 2, 'drop_ratio': 0.079, 'warmup': 746} # ~32
-    elif args.params == 'james-iwslt2':
-        hparams = {'d_model': 278, 'd_hidden': 2048, 'n_layers': 5,
-                    'n_heads': 2, 'drop_ratio': 0.079, 'warmup': 746} # ~32
-    teacher_hparams = {'d_model': 278, 'd_hidden': 507, 'n_layers': 5,
-                    'n_heads': 2, 'drop_ratio': 0.079, 'warmup': 746}
-
-
-if hparams is None:
-    logger.info('use default parameters of t2t-base')
-    hparams = {'d_model': 512, 'd_hidden': 512, 'n_layers': 6,
+if args.params == 'james-iwslt':
+    hparams = {'d_model': 278, 'd_hidden': 507, 'n_layers': 5,
+                'n_heads': 2, 'drop_ratio': 0.079, 'warmup': 746} # ~32
+else:
+    logger.info('use default parameters of t2t-base')  # t2t-base, 512-2048-6
+    hparams = {'d_model': 512, 'd_hidden': 2048, 'n_layers': 6,
                 'n_heads': 8, 'drop_ratio': 0.1, 'warmup': 16000} # ~32
 args.__dict__.update(hparams)
 
-# ----------------------------------------------------------------------------------------------------------------- #
-# show the arg:
-logger.info(args)
 
-hp_str = (f"{args.dataset}_subword_"
-        f"{args.d_model}_{args.d_hidden}_{args.n_layers}_{args.n_heads}_"
-        f"{args.drop_ratio:.3f}_{args.warmup}_{'uni_' if args.causal_enc else ''}")
+hp_str = (f"{args.dataset}_"
+          f"{args.src}_{args.trg}_"
+          f"{'causal' if args.causal_enc else ''}_"
+          f"{'lm' if args.encoder_lm else ''}_"
+          f"{'c' if args.char else 'w'}_"
+          f"{args.inter_size*args.batch_size}")
 logger.info(f'Starting with HPARAMS: {hp_str}')
-model_name = './models/' + args.prefix + hp_str
+model_name = os.path.join(args.workspace_prefix, 'models', args.prefix + hp_str)
 
 # build the model
-model = Transformer(SRC, TRG, args)
+model = Transformer(SRC, TRG, args).to(torch.device(args.device))
 logger.info(str(model))
+
+# load pre-trained parameters
 if args.load_from is not None:
     with torch.cuda.device(args.gpu):
-        model.load_state_dict(torch.load('./models/' + args.load_from + '.pt',
-        map_location=lambda storage, loc: storage.cuda()))  # load the pretrained models.
+        model.load_state_dict(torch.load(
+            os.path.join(args.workspace_prefix, 'models', args.load_from + '.pt'),
+            map_location=lambda storage, loc: storage.cuda()))  # load the pretrained models.
 
-# use cuda
-if args.gpu > -1:
-    model.cuda(args.gpu)
 
 # additional information
 args.__dict__.update({'model_name': model_name, 'hp_str': hp_str,  'logger': logger})
+logger.info(args)
+
 
 # ----------------------------------------------------------------------------------------------------------------- #
 if args.mode == 'train':
     logger.info('starting training')
     train_model(args, model, train_real, dev_real)
 
-elif args.mode == 'test':
-    logger.info('starting decoding from the pre-trained model, on the test set...')
-    name_suffix = '{}_b={}_model_{}.txt'.format(args.decode_mode, args.beam_size, args.load_from)
-    names = ['src.{}'.format(name_suffix), 'trg.{}'.format(name_suffix),'dec.{}'.format(name_suffix)]
+# elif args.mode == 'test':
+#     logger.info('starting decoding from the pre-trained model, on the test set...')
+#     name_suffix = '{}_b={}_model_{}.txt'.format(args.decode_mode, args.beam_size, args.load_from)
+#     names = ['src.{}'.format(name_suffix), 'trg.{}'.format(name_suffix),'dec.{}'.format(name_suffix)]
 
-    if args.model is FastTransformer:
-        names += ['fer.{}'.format(name_suffix)]
-    if args.rerank_by_bleu:
-        teacher_model = None
-    decode_model(args, model, dev_real, evaluate=True, decoding_path=decoding_path if not args.no_write else None, names=names)
+#     if args.rerank_by_bleu:
+#         teacher_model = None
+#     decode_model(args, model, dev_real, evaluate=True, decoding_path=decoding_path if not args.no_write else None, names=names)
 
-logger.info("done.")
+# logger.info("done.")

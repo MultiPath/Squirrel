@@ -60,7 +60,8 @@ parser.add_argument('--gpu',     type=int, default=0,        help='GPU to use or
 parser.add_argument('--seed',    type=int, default=19920206, help='seed for randomness')
 
 # training
-parser.add_argument('--eval-every',    type=int, default=1000,    help='run dev every')
+parser.add_argument('--label_smooth',  type=float, default=0.1,   help='regularization via label-smoothing during training.')
+parser.add_argument('--eval_every',    type=int, default=1000,    help='run dev every')
 parser.add_argument('--save_every',    type=int, default=50000,   help='save the best checkpoint every 50k updates')
 parser.add_argument('--maximum_steps', type=int, default=1000000, help='maximum steps you take to train a model')
 parser.add_argument('--inter_size',    type=int, default=4,       help='process multiple batches before one update')

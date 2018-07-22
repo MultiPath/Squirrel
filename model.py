@@ -324,8 +324,7 @@ class DecoderLayer(nn.Module):
         self.positional = positional
         self.selfattn = ResidualBlock(
             MultiHead2(args.d_model, args.d_model, args.n_heads,
-                    args.drop_ratio, causal, diag, window,
-                    use_wo=args.use_wo),
+                    args.drop_ratio, causal),
             args.d_model, args.drop_ratio)
 
         self.crossattn = ResidualBlock(
@@ -345,7 +344,7 @@ class DecoderLayer(nn.Module):
 
     def forward(self, x, encoding, p=None, mask_src=None, mask_trg=None):
 
-        x = self.selfattn(x, x, x, mask_trg, feedback_trg)   #
+        x = self.selfattn(x, x, x, mask_trg)   #
         if self.positional:
             pos_encoding, weights = positional_encodings_like(x), None
             x = self.pos_selfattn(pos_encoding, pos_encoding, x, mask_trg)  # positional attention
@@ -582,22 +581,27 @@ class Transformer(nn.Module):
         return outputs
 
     def apply_mask_cost(self, loss, mask, return_batch_loss=False):
-        cost = (loss * mask).sum()) / (mask.sum() + TINY)
+        cost = (loss * mask).sum() / (mask.sum() + TINY)
         if not return_batch_loss:
             return cost
 
         loss = loss.sum(1, keepdim=True) / (TINY + mask.sum(1, keepdim=True))
         return cost, loss
 
-    def cost(self, decoder_targets, decoder_masks, out):
+    def cost(self, decoder_targets, decoder_masks, out, label_smooth=0.0):
         # get loss in a sequence-format to save computational time.
-
         input_masks = decoder_masks.byte()
         decoder_targets = decoder_targets[input_masks]
         out = out[input_masks.unsqueeze(-1).expand_as(out)].view(-1, out.size(-1))
 
         logits = self.decoder.out(out)
-        loss = F.cross_entropy(logits, decoder_targets)
+        
+        # FIXME: tell me if this implementation is BUG or not.
+        if label_smooth > 0:
+            entropy = log_softmax(logits)
+            loss = F.nll_loss(entropy, decoder_targets) * (1 - label_smooth) + entropy.mean() * label_smooth
+        else:
+            loss = F.cross_entropy(logits, decoder_targets)
         return loss
 
     def batched_cost(self, decoder_targets, decoder_masks, probs, return_batch_loss=False):
@@ -608,5 +612,4 @@ class Transformer(nn.Module):
         else:
             loss = -(torch.log(probs + TINY) * decoder_targets).sum(-1)
         return self.apply_mask_cost(loss, decoder_masks, return_batch_loss)
-
 

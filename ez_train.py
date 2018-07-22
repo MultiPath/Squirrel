@@ -108,7 +108,7 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
                 torch.save([iters, best.opt.state_dict()], '{}_iter={}.pt.states'.format(args.model_name, iters))
 
         # --- validation --- #
-        if iters % args.eval_every == 0:
+        if False: #iters % args.eval_every == 0:
             progressbar.close()
 
             outputs_data = valid_model(args, model, dev, print_out=True)
@@ -162,8 +162,9 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
             # encoding
             encoding_outputs = model.encoding(source_inputs, source_masks)
 
-            # Maximum Likelihood Training
-            loss  = model.cost(target_outputs, target_masks, out=model(encoding_outputs, source_masks, target_inputs, target_masks))
+            # Maximum Likelihood Training (with label smoothing trick)
+            decoding_outputs = model(encoding_outputs, source_masks, target_inputs, target_masks)        
+            loss  = model.cost(target_outputs, target_masks, out=decoding_outputs, label_smooth=args.label_smooth)
             info['MLE'] += export(loss)
 
             # Source side Language Model (optional, only works for causal-encoder)
@@ -174,7 +175,7 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
 
             loss = loss / args.inter_size
             loss.backward()
-
+            
         # multiple steps, one update
         opt.step()
 
@@ -188,5 +189,5 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
 
         total_tokens += info['tokens']
         progressbar.update(1)
-        progressbar.set_description(info)
+        progressbar.set_description(info_str)
 

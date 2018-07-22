@@ -26,15 +26,15 @@ def grad_reverse(x):
 
 def positional_encodings_like(x, t=None):   # hope to be differentiable
     if t is None:
-        positions = torch.arange(0, x.size(-2)) # .expand(*x.size()[:2])
+        positions = torch.arange(0, x.size(-2)).float() # .expand(*x.size()[:2])
         if x.is_cuda:
             positions = positions.cuda(x.get_device())
-        positions = Variable(positions.float())
+        positions = Variable(positions)
     else:
         positions = t
 
     # channels
-    channels = torch.arange(0, x.size(-1), 2) / x.size(-1) # 0 2 4 6 ... (256)
+    channels = torch.arange(0, x.size(-1), 2).float() / x.size(-1) # 0 2 4 6 ... (256)
     if x.is_cuda:
         channels = channels.cuda(x.get_device())
     channels = 1 / (10000 ** Variable(channels))
@@ -486,7 +486,7 @@ class Decoder(nn.Module):
                 x = hiddens[l][:, :, :t + 1].contiguous().view(B * W, -1, C)
                 x = self.layers[l].selfattn(x[:, -1:, :], x, x)
                 hiddens[l + 1][:, :, t] = self.layers[l].feedforward(
-                    self.layers[l].attention(x, encoding[l], encoding[l], mask_src)).view(
+                    self.layers[l].crossattn(x, encoding[l], encoding[l], mask_src)).view(
                         B, W, C)
 
             # topk2_logps: scores, topk2_inds: top word index at each beam, batch x beam x beam
@@ -556,8 +556,8 @@ class Transformer(nn.Module):
         source_masks, target_masks = self.prepare_masks(source_outputs), self.prepare_masks(target_outputs)
         return source_inputs, source_outputs, source_masks, target_inputs, target_outputs, target_masks
 
-    def forward(self, encoding_outputs, encoder_masks, decoder_inputs, decoder_masks,
-                decoding=False, beam=1, alpha=0.6, return_probs=False):
+    def decoding(self, encoding_outputs, encoder_masks, decoder_inputs, decoder_masks,
+                 decoding=False, beam=1, alpha=0.6, return_probs=False):
 
         if (return_probs and decoding) or (not decoding):
             out = self.decoder(decoder_inputs, encoding_outputs, encoder_masks, decoder_masks)

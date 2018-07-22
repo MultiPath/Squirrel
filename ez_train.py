@@ -38,8 +38,8 @@ def valid_model(args, model, dev, print_out=False):
             encoding_outputs = model.encoding(source_inputs, source_masks)
 
             # decoding
-            decoding_outputs, out, probs = model(encoding_outputs, source_masks, target_inputs, target_masks, 
-                                                decoding=True, return_probs=True)
+            decoding_outputs, out, probs = model.decoding(encoding_outputs, source_masks, target_inputs, target_masks, 
+                                                          decoding=True, return_probs=True)
             
             # reverse to string-sequence
             dev_outputs = [('src', source_outputs), ('trg', target_outputs), ('trg', decoding_outputs)]
@@ -108,7 +108,7 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
                 torch.save([iters, best.opt.state_dict()], '{}_iter={}.pt.states'.format(args.model_name, iters))
 
         # --- validation --- #
-        if False: #iters % args.eval_every == 0:
+        if iters % args.eval_every == 0:
             progressbar.close()
 
             outputs_data = valid_model(args, model, dev, print_out=True)
@@ -163,7 +163,7 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
             encoding_outputs = model.encoding(source_inputs, source_masks)
 
             # Maximum Likelihood Training (with label smoothing trick)
-            decoding_outputs = model(encoding_outputs, source_masks, target_inputs, target_masks)        
+            decoding_outputs = model.decoding(encoding_outputs, source_masks, target_inputs, target_masks)        
             loss  = model.cost(target_outputs, target_masks, out=decoding_outputs, label_smooth=args.label_smooth)
             info['MLE'] += export(loss)
 
@@ -179,7 +179,8 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
         # multiple steps, one update
         opt.step()
 
-        info_str += 'Processed {} sents/{} tokens'.format(info['sents'], info['tokens'])
+        total_tokens += info['tokens']
+        info_str += 'Train {} sents/{} tokens, total {} tokens, '.format(info['sents'], info['tokens'], total_tokens)
         info_str += 'MLE_loss={:.3f}, '.format(info['MLE'] / args.inter_size)
         if args.encoder_lm and args.causal_enc:
             info_str += 'ENCLM_loss={:.3f}, '.format(info['LM'] / args.inter_size)
@@ -187,7 +188,7 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
         if args.tensorboard and (not args.debug):
             writer.add_scalar('train/Loss', export(loss), iters)
 
-        total_tokens += info['tokens']
+        
         progressbar.update(1)
         progressbar.set_description(info_str)
 

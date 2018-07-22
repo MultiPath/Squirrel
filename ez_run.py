@@ -11,7 +11,7 @@ import os
 import copy
 
 from ez_train import train_model
-#from decode import decode_model
+from ez_decode import decode_model
 from model import Transformer, INF, TINY, softmax
 from utils import NormalField, LazyParallelDataset, ParallelDataset, merge_cache
 from time import gmtime, strftime
@@ -201,7 +201,8 @@ else:
 
 # batch-iterator
 train_real, dev_real = data.BucketIterator.splits(
-    (train_data, dev_data), batch_sizes=(args.batch_size, args.batch_size), device=args.device,
+    (train_data, dev_data), batch_sizes=(args.batch_size, args.batch_size), 
+    device=args.device,
     batch_size_fn=batch_size_fn, repeat=None if args.mode == 'train' else False)
 logger.info("build the dataset. done!")
 # ----------------------------------------------------------------------------------------------------------------- #
@@ -249,13 +250,14 @@ if args.mode == 'train':
     logger.info('starting training')
     train_model(args, model, train_real, dev_real)
 
-# elif args.mode == 'test':
-#     logger.info('starting decoding from the pre-trained model, on the test set...')
+elif args.mode == 'test':
+    logger.info('starting decoding from the pre-trained model, on the test set...')
 #     name_suffix = '{}_b={}_model_{}.txt'.format(args.decode_mode, args.beam_size, args.load_from)
 #     names = ['src.{}'.format(name_suffix), 'trg.{}'.format(name_suffix),'dec.{}'.format(name_suffix)]
 
 #     if args.rerank_by_bleu:
 #         teacher_model = None
-#     decode_model(args, model, dev_real, evaluate=True, decoding_path=decoding_path if not args.no_write else None, names=names)
+    with torch.no_grad():   
+        decode_model(args, model, dev_real, evaluate=True) #, decoding_path=decoding_path if not args.no_write else None, names=names)
 
 # logger.info("done.")

@@ -1,12 +1,12 @@
 # Neural Machine Translation based on Transformer
 
-**Requirements**:
+**Requirements**: <br>
   Python 3.6  <br>
   pytorch >= 0.4 <br>
   torchtext >= 0.3 (installed from the source) <br>
   tqdm <br>
 
-**Dataset**
+**Dataset** <br>
 We provided the proprocessed (BPE) parallel corpora at <br>
 https://www.dropbox.com/sh/p5b6m14is8hd4rn/AAAW5M6ddaiwjd5DbugNPmdEa?dl=0
 

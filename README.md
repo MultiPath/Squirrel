@@ -1,18 +1,13 @@
-# Non-autoregressive Neural Machine Translation
-PyTorch implementation of the "Non-Autoregressive Transformer (NAT)" model described in https://arxiv.org/abs/1711.02281
+# Neural Machine Translation based on Transformer Model
+PyTorch implementation 
+-- Keep updating
 
-Requirements:
+-- Requirements:
   Python 3.6
   
-  pytorch > 0.2
+  pytorch >= 0.4
   
   torchtext: 
-  
-    open tools/text and run python setup.py install
-    
-    open tools/revtok and run python setup.py install
-  
-  pip install translate-toolkit
   
   pip install tqdm
 

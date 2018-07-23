@@ -592,14 +592,14 @@ class Transformer(nn.Module):
         # get loss in a sequence-format to save computational time.
         input_masks = decoder_masks.byte()
         decoder_targets = decoder_targets[input_masks]
-        out = out[input_masks.unsqueeze(-1).expand_as(out)].view(-1, out.size(-1))
+        # print(input_masks.size(), decoder_targets.size(), out.size())
 
+        out = out[input_masks.unsqueeze(-1).expand_as(out)].view(-1, out.size(-1))
         logits = self.decoder.out(out)
         
         # FIXME: tell me if this implementation is BUG or not.
         if label_smooth > 0:
-            entropy = log_softmax(logits)
-            loss = F.nll_loss(entropy, decoder_targets) * (1 - label_smooth) + entropy.mean() * label_smooth
+            loss = F.cross_entropy(logits, decoder_targets) * (1 - label_smooth) - log_softmax(logits).mean() * label_smooth
         else:
             loss = F.cross_entropy(logits, decoder_targets)
         return loss

@@ -20,8 +20,8 @@ WMT16 RO-EN <br>
 **Basic function** <br>
 python ez_run.py \
                 --prefix [time] \  
-                --gpu  <CUDA> \
-                --mode <MODE> \
+                --gpu  <GPU_ID> \
+                --mode MODE \
                 --data_prefix <DATA_DIR> \
                 --dataset "wmt16" \
                 --src "ro" --trg "en" \
@@ -39,9 +39,9 @@ python ez_run.py \
                 --tensorboard \
                 --debug \
 
-<MODE>: "data"  # build vocabulary <br>
-<MODE>: "train" # train the NMT model with t2t-base setup. batch_size = 1200 x 3 <br>
-<MODE>: "test"  # decoding on the dev/test set using beam-search. beam_size = 5, alpha = 1 <br>
+MODE = "data"  # build vocabulary <br>
+MODE = "train" # train the NMT model with t2t-base setup. batch_size = 1200 x 3 <br>
+MODE = "test"  # decoding on the dev/test set using beam-search. beam_size = 5, alpha = 1 <br>
 
 # TODO
   Add more description about data processing/training/testing

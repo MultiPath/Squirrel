@@ -23,8 +23,7 @@ You can simply download all the datasets and put them to your <DATA_DIR>.<br>
 WMT16 RO-EN <br>
 
 
-**Basic functions** <br>
-*build vocabulary*
+**Build Vocabulary** <br>
 ```shell
 python ez_run.py \
                 --prefix [time]  \
@@ -39,7 +38,7 @@ python ez_run.py \
                 --char # (optional) if use, build the character-level vocabulary.
 ```
 
-*train* <br>
+**Train**
 train the NMT model with basic Transformer <br>
 Due to pytorch limitation, the multi-GPU version is still under constration.
 In order to achieve large batch size on single GPU, we used a trick to perform multiple passes (--inter_size) before one update to the parametrs which, however, hurts the training efficiency.

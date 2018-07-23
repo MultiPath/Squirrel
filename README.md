@@ -19,25 +19,25 @@ WMT16 RO-EN <br>
 
 **Basic function** <br>
 python ez_run.py \
-                --prefix [time] \  
-                --gpu  <GPU_ID> \
-                --mode MODE \
-                --data_prefix <DATA_DIR> \
-                --dataset "wmt16" \
-                --src "ro" --trg "en" \
-                --train_set "train.bpe" \
-                --dev_set   "dev.bpe"   \
-                --test_set  "test.bpe"  \
-                --workspace_prefix <MODEL_DIR> \
-                --params "t2t-base" \
-                --eval_every 500  \
-                --batch_size 1200 \
-                --inter_size 3 \
-                --beam 5 \
-                --alpha 1 \
-                --share_embeddings \
-                --tensorboard \
-                --debug \
+                --prefix [time]  
+                --gpu  <GPU_ID> 
+                --mode MODE 
+                --data_prefix <DATA_DIR> 
+                --dataset "wmt16" 
+                --src "ro" --trg "en" 
+                --train_set "train.bpe" 
+                --dev_set   "dev.bpe"   
+                --test_set  "test.bpe"  
+                --workspace_prefix <MODEL_DIR> 
+                --params "t2t-base" 
+                --eval_every 500 
+                --batch_size 1200 
+                --inter_size 3 
+                --beam 5 
+                --alpha 1 
+                --share_embeddings 
+                --tensorboard 
+                --debug 
 
 MODE = "data"  # build vocabulary <br>
 MODE = "train" # train the NMT model with t2t-base setup. batch_size = 1200 x 3 <br>

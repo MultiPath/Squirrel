@@ -34,6 +34,7 @@ python ez_run.py \
                 --eval_every 500 \
                 --batch_size 1200 \
                 --inter_size 3 \
+                --label_smooth 0.1 \
                 --beam 5 \
                 --alpha 1 \
                 --share_embeddings \
@@ -42,7 +43,7 @@ python ez_run.py \
 ```
 ```python
 MODE = "data"  # build the vocabulary 
-MODE = "train" # train the NMT model with t2t-base setup. batch_size = 1200 x 3 
+MODE = "train" # train the NMT model with t2t-base setup. batch_size = 1200 x 3 = 3600
 MODE = "test"  # decoding on the dev/test set using beam-search. beam_size = 5, alpha = 1 
 ```
 # TODO

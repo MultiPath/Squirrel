@@ -18,31 +18,33 @@ WMT16 RO-EN <br>
 
 
 **Basic function** <br>
+```python
 python ez_run.py \
-                --prefix [time]  
-                --gpu  <GPU_ID> 
-                --mode MODE 
-                --data_prefix <DATA_DIR> 
-                --dataset "wmt16" 
-                --src "ro" --trg "en" 
-                --train_set "train.bpe" 
-                --dev_set   "dev.bpe"   
-                --test_set  "test.bpe"  
-                --workspace_prefix <MODEL_DIR> 
-                --params "t2t-base" 
-                --eval_every 500 
-                --batch_size 1200 
-                --inter_size 3 
-                --beam 5 
-                --alpha 1 
-                --share_embeddings 
-                --tensorboard 
-                --debug 
-
-MODE = "data"  # build vocabulary <br>
-MODE = "train" # train the NMT model with t2t-base setup. batch_size = 1200 x 3 <br>
-MODE = "test"  # decoding on the dev/test set using beam-search. beam_size = 5, alpha = 1 <br>
-
+                --prefix [time]  \
+                --gpu  <GPU_ID> \
+                --mode MODE \
+                --data_prefix <DATA_DIR> \
+                --dataset "wmt16" \
+                --src "ro" --trg "en" \
+                --train_set "train.bpe" \
+                --dev_set   "dev.bpe"   \
+                --test_set  "test.bpe"  \
+                --workspace_prefix <MODEL_DIR> \
+                --params "t2t-base" \
+                --eval_every 500 \
+                --batch_size 1200 \
+                --inter_size 3 \
+                --beam 5 \
+                --alpha 1 \
+                --share_embeddings \
+                --tensorboard \
+                --debug \
+```
+```python
+MODE = "data"  # build the vocabulary 
+MODE = "train" # train the NMT model with t2t-base setup. batch_size = 1200 x 3 
+MODE = "test"  # decoding on the dev/test set using beam-search. beam_size = 5, alpha = 1 
+```
 # TODO
   Add more description about data processing/training/testing
   The torchtext requirements can be removed if possible.

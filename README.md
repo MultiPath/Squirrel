@@ -17,7 +17,7 @@ You can simply download all the datasets and put them to your <DATA_DIR>.<br>
 WMT16 RO-EN <br>
 
 
-**Basic function**
+**Basic function** <br>
 python ez_run.py \
                 --prefix [time] \  
                 --gpu  <CUDA> \

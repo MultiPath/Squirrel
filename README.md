@@ -7,12 +7,20 @@ Vaswani, Ashish, et al. "Attention is all you need."
 Advances in Neural Information Processing Systems. 2017.
 (http://papers.nips.cc/paper/7181-attention-is-all-you-need)
 
+Popel, Martin, and Ondřej Bojar. "Training Tips for the Transformer Model." 
+The Prague Bulletin of Mathematical Linguistics 110.1 (2018): 43-70.
+(https://ufal.mff.cuni.cz/pbml/110/art-popel-bojar.pdf)
+
+------
+
 **Requirements**: <br>
   Python 3.6  <br>
   PyTorch >= 0.4 <br>
   torchtext >= 0.3 (installed from the source https://github.com/pytorch/text) <br>
   tqdm <br>
   tensorflow-cpu, tensorbaordX <br> (optional) use tensorboard for visualization
+
+------
 
 **Dataset** <br>
 We provided the proprocessed (BPE) parallel corpora at <br>
@@ -24,7 +32,9 @@ currently included <br>
 WMT16 RO-EN (600K) <br>
 WMT16 EN-DE (4.5M) <br>
 
-**Building Vocabulary** <br>
+------
+
+**Pre-processing** <br>
 ```shell
 python ez_run.py \
                 --prefix [time]  \
@@ -38,6 +48,8 @@ python ez_run.py \
                 --test_set  "test.bpe"  \
                 --char # (optional) if use, build the character-level vocabulary.
 ```
+
+------
 
 **Training** <br>
 train the NMT model with basic Transformer <br>
@@ -70,6 +82,8 @@ python ez_run.py \
                 --tensorboard \
                 --debug                # (optional) if use, no saving tensorboard.
 ```
+------
+
 **Decoding** <br>
 decode from the pretrained NMT model. In default, decode from the dev set using beam-search (beam size=5, alpha=0.6)
 ```shell

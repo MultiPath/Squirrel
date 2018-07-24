@@ -56,7 +56,7 @@ python ez_run.py \
                 --train_set "train.bpe" \
                 --dev_set   "dev.bpe"   \
                 --test_set  "test.bpe"  \
-                --load_lazy  \         # (optional) suitable for Large corpus. Pre-shuffling the dataset is required.
+                --load_lazy  \         # (recommended) suitable for Large corpus. Pre-shuffling the dataset is required.
                 --workspace_prefix <MODEL_DIR> \  # where you save models, states, and logs.
                 --params "t2t-base" \  # d_model=512, d_ff=2048, n_h=8, n_l=6, warmup=16000
                 --eval_every 500 \

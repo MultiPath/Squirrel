@@ -2,11 +2,11 @@
 CUDA=${1}
 MODE=${2:-train}
 
-#export CUDA_VISIBLE_DEVICES=${CUDA}
-
+export CUDA_VISIBLE_DEVICES=${CUDA}
+export CUDA_LAUNCH_BLOCKING=1
 python ez_run.py \
                 --prefix [time] \
-                --gpu ${CUDA} \
+                --gpu 0 \
                 --mode ${MODE} \
                 --data_prefix "/data0/data/transformer_data/" \
                 --dataset "wmt16" \
@@ -14,6 +14,7 @@ python ez_run.py \
                 --train_set "train.bpe" \
                 --dev_set   "dev.bpe"   \
                 --test_set  "test.bpe"  \
+                --load_lazy \
                 --workspace_prefix "/data0/jiatao/work/Squirrel/" \
                 --params "t2t-base" \
                 --eval_every 500  \
@@ -23,7 +24,8 @@ python ez_run.py \
                 --share_embeddings \
                 --tensorboard \
                 --beam 5 \
-                
+                # --debug
+
                 # --debug \
                 # --char \
                 # --causal_enc \

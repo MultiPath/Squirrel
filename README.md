@@ -1,4 +1,5 @@
 # Neural Machine Translation based on Transformer
+<img src="https://github.com/MultiPath/Squirrel/raw/master/sandbox/squarrel.png" alt="GitHub" title="Squirrel" height="365" />
 
 **Major Reference**:
 
@@ -11,7 +12,7 @@ Advances in Neural Information Processing Systems. 2017.
   pytorch >= 0.4 <br>
   torchtext >= 0.3 (installed from the source) <br>
   tqdm <br>
-  tensorflow-cpu, tensorbaordX <br> (if need to use tensorboard for visualization)
+  tensorflow-cpu, tensorbaordX <br> (optional) use tensorboard for visualization
 
 **Dataset** <br>
 We provided the proprocessed (BPE) parallel corpora at <br>

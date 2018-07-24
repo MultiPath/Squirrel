@@ -194,7 +194,9 @@ if args.batch_size == 1:  # speed-test: one sentence per batch.
     batch_size_fn = lambda new, count, sofar: count
 else:
     if not args.char:
-        batch_size_fn = dyn_batch_without_padding
+        #batch_size_fn = dyn_batch_without_padding
+        batch_size_fn = dyn_batch_with_padding
+        
     else:
         batch_size_fn = dyn_batch_with_overhead
 
@@ -202,8 +204,9 @@ else:
 # batch-iterator
 train_real, dev_real = data.BucketIterator.splits(
     (train_data, dev_data), batch_sizes=(args.batch_size, args.batch_size), 
-    device=args.device,
-    batch_size_fn=batch_size_fn, repeat=None if args.mode == 'train' else False)
+    device=args.device, batch_size_fn=batch_size_fn, 
+    repeat=None if args.mode == 'train' else False,
+    shuffle=(not args.load_lazy))
 logger.info("build the dataset. done!")
 # ----------------------------------------------------------------------------------------------------------------- #
 

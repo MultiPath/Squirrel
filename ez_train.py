@@ -10,6 +10,12 @@ from model import Transformer
 from utils import Metrics, Best, computeGLEU, computeBLEU
 
 # -- helper functions
+# def proc(x):
+#     if x < 1000:
+#         return str(x)
+#     if x < 1000000:
+#         return '{:.3f}K'.format(x / 1000.0)
+#     return '{:.3f}M'.format(x / 1000000.0)
 
 def export(x):
     try:
@@ -28,37 +34,35 @@ def valid_model(args, model, dev, print_out=False):
     model.eval()
 
     for j, dev_batch in enumerate(dev):
-        with torch.no_grad():
+       
+        # prepare the data
+        source_inputs, source_outputs, source_masks, \
+        target_inputs, target_outputs, target_masks = model.prepare_data(dev_batch)
 
-            # prepare the data
-            source_inputs, source_outputs, source_masks, \
-            target_inputs, target_outputs, target_masks = model.prepare_data(dev_batch)
+        # encoding
+        encoding_outputs = model.encoding(source_inputs, source_masks)
 
-            # encoding
-            encoding_outputs = model.encoding(source_inputs, source_masks)
+        # decoding
+        decoding_outputs, out, probs = model.decoding(encoding_outputs, source_masks, target_inputs, target_masks, 
+                                                        decoding=True, return_probs=True)
+        
+        # reverse to string-sequence
+        dev_outputs = [('src', source_outputs), ('trg', target_outputs), ('trg', decoding_outputs)]
+        dev_outputs = [model.output_decoding(d) for d in dev_outputs]
+        
+        # compute sentence-level GLEU score 
+        gleu = computeGLEU(dev_outputs[2], dev_outputs[1], corpus=False, tokenizer=debpe)
+        
+        # save to the outputs
+        outputs['src'] += dev_outputs[0]
+        outputs['trg'] += dev_outputs[1]
+        outputs['dec'] += dev_outputs[2]
+        outputs['gleu'] += gleu
 
-            # decoding
-            decoding_outputs, out, probs = model.decoding(encoding_outputs, source_masks, target_inputs, target_masks, 
-                                                          decoding=True, return_probs=True)
-            
-            # reverse to string-sequence
-            dev_outputs = [('src', source_outputs), ('trg', target_outputs), ('trg', decoding_outputs)]
-            dev_outputs = [model.output_decoding(d) for d in dev_outputs]
-            
-            # compute sentence-level GLEU score 
-            gleu = computeGLEU(dev_outputs[2], dev_outputs[1], corpus=False, tokenizer=debpe)
-            
-            # save to the outputs
-            outputs['src'] += dev_outputs[0]
-            outputs['trg'] += dev_outputs[1]
-            outputs['dec'] += dev_outputs[2]
-            outputs['gleu'].append(gleu)
-
-
-            if print_out:
-                for k, d in enumerate(dev_outputs):
-                    args.logger.info("{}: {}".format(print_seqs[k], d[0]))
-                args.logger.info('------------------------------------------------------------------')
+        if print_out:
+            for k, d in enumerate(dev_outputs):
+                args.logger.info("{}: {}".format(print_seqs[k], d[0]))
+            args.logger.info('------------------------------------------------------------------')
 
     outputs['corpus_bleu'] = computeBLEU(outputs['dec'], outputs['trg'], corpus=True, tokenizer=debpe)
     args.logger.info("The dev-set corpus BLEU = {}".format(outputs['corpus_bleu']))
@@ -111,7 +115,9 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
         if iters % args.eval_every == 0:
             progressbar.close()
 
-            outputs_data = valid_model(args, model, dev, print_out=True)
+            with torch.no_grad():
+                outputs_data = valid_model(args, model, dev, print_out=True)
+
             if args.tensorboard and (not args.debug):
                 writer.add_scalar('dev/GLEU_sentence_', np.mean(outputs_data['gleu']), iters)
                 # writer.add_scalar('dev/Loss', dev_metrics.loss, iters)
@@ -180,7 +186,8 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
         opt.step()
 
         total_tokens += info['tokens']
-        info_str += 'Train {} sents/{} tokens, total {} tokens, '.format(info['sents'], info['tokens'], total_tokens)
+
+        info_str += '{} sents/{} tokens, total {} tokens, '.format(info['sents'], info['tokens'], total_tokens)
         info_str += 'MLE_loss={:.3f}, '.format(info['MLE'] / args.inter_size)
         if args.encoder_lm and args.causal_enc:
             info_str += 'ENCLM_loss={:.3f}, '.format(info['LM'] / args.inter_size)

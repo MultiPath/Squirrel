@@ -1,11 +1,9 @@
 import torch
+import math
 from torch import nn
 from torch.nn import functional as F
 from torch.autograd import Variable, Function
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
-
-import math
-
 from utils import computeGLEU, masked_sort, unsorted
 
 INF = 1e10
@@ -590,13 +588,13 @@ class Transformer(nn.Module):
 
     def cost(self, decoder_targets, decoder_masks, out, label_smooth=0.0):
         # get loss in a sequence-format to save computational time.
-        input_masks = decoder_masks.byte()
+        input_masks = (decoder_masks > 0)
         decoder_targets = decoder_targets[input_masks]
-        # print(input_masks.size(), decoder_targets.size(), out.size())
-
+        
         out = out[input_masks.unsqueeze(-1).expand_as(out)].view(-1, out.size(-1))
         logits = self.decoder.out(out)
-        
+        # print(input_masks.size(), decoder_targets.max(), decoder_targets.min(), out.size(), logits.size())
+
         # FIXME: tell me if this implementation is BUG or not.
         if label_smooth > 0:
             loss = F.cross_entropy(logits, decoder_targets) * (1 - label_smooth) - log_softmax(logits).mean() * label_smooth

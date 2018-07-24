@@ -16,8 +16,7 @@ def computeGLEU(outputs, targets, corpus=False, tokenizer=None):
     targets = [tokenizer(t) for t in targets]
 
     if not corpus:
-        return torch.Tensor([sentence_gleu(
-            [t],  o) for o, t in zip(outputs, targets)])
+        return [sentence_gleu([t],  o) for o, t in zip(outputs, targets)]
     return corpus_gleu([[t] for t in targets], [o for o in outputs])
 
 def computeBLEU(outputs, targets, corpus=False, tokenizer=None):
@@ -163,10 +162,12 @@ class ParallelDataset(datasets.TranslationDataset):
 
 def lazy_reader(paths, fields, max_len=None):  # infinite dataloader
     while True:
+        
         with ExitStack() as stack:
             files = [stack.enter_context(open(fname, "r", encoding="utf-8")) for fname in paths]
             examples = []
             for steps, lines in enumerate(zip(*files)):
+
                 lines = [line.strip() for line in lines]
                 if not any(line == '' for line in lines):
                     if max_len is not None:

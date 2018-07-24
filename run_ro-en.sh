@@ -14,16 +14,17 @@ python ez_run.py \
                 --dev_set   "dev.bpe"   \
                 --test_set  "test.bpe"  \
                 --load_lazy \
-                --workspace_prefix "/data0/jiatao/work/Squirrel/" \
+                --workspace_prefix "/data0/workspace/squirrel/" \
                 --params "t2t-base" \
                 --eval_every 500  \
-                --batch_size 1200 \
-                --inter_size 3 \
-                --label_smooth 0.0 \
+                --batch_size 1250 \
+                --inter_size 4 \
+                --label_smooth 0.1 \
                 --share_embeddings \
                 --tensorboard \
                 --beam 5 \
-                --debug
+                
+                #--debug
 
                 # --debug
 

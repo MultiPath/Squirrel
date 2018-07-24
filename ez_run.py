@@ -222,11 +222,12 @@ else:
 args.__dict__.update(hparams)
 
 
-hp_str = (f"{args.dataset}_"
+hp_str = (f"{args.dataset}_{args.params}_"
           f"{args.src}_{args.trg}_"
-          f"{'causal' if args.causal_enc else ''}_"
-          f"{'lm' if args.encoder_lm else ''}_"
+          f"{'causal_' if args.causal_enc else ''}"
+          f"{'lm_' if args.encoder_lm else ''}"
           f"{'c' if args.char else 'w'}_"
+          f"{args.label_smooth}_"
           f"{args.inter_size*args.batch_size}")
 logger.info(f'Starting with HPARAMS: {hp_str}')
 model_name = os.path.join(args.workspace_prefix, 'models', args.prefix + hp_str)
@@ -249,7 +250,12 @@ if args.load_from is not None:
 
 # additional information
 args.__dict__.update({'model_name': model_name, 'hp_str': hp_str,  'logger': logger})
-logger.info(args)
+
+# show
+args_str = ''
+for a in args.__dict__:
+    args_str += '{}:\t{}\n'.format(a, args.__dict__[a])
+logger.info(args_str)
 
 
 # ----------------------------------------------------------------------------------------------------------------- #

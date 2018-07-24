@@ -306,8 +306,8 @@ class FeedForward(nn.Module):
 
 
     def forward(self, x):
-        # return self.linear2(self.dropout(F.relu(self.linear1(x))))  # adding dropout in feedforward layer
-        return self.linear2(F.relu(self.linear1(x)))
+        return self.linear2(self.dropout(F.relu(self.linear1(x))))  # adding dropout in feedforward layer
+        # return self.linear2(F.relu(self.linear1(x)))
 
 class EncoderLayer(nn.Module):
 
@@ -600,18 +600,12 @@ class Transformer(nn.Module):
     def cost(self, decoder_targets, decoder_masks, out, label_smooth=0.0):
         # get loss in a sequence-format to save computational time.
         decoder_targets, out = with_mask(decoder_targets, out, decoder_masks.byte())
-        
-        # input_masks = (decoder_masks > 0)
-        # print(input_masks.sum())
-        # decoder_targets = decoder_targets[input_masks]
-        # out = out[input_masks.unsqueeze(-1).expand_as(out)].view(-1, out.size(-1))
-        
         logits = self.decoder.out(out)
-        # print(input_masks.size(), decoder_targets.max(), decoder_targets.min(), out.size(), logits.size())
 
         # FIXME: tell me if this implementation is BUG or not.
         if label_smooth > 0:
-            loss = F.cross_entropy(logits, decoder_targets) * (1 - label_smooth) - log_softmax(logits).mean() * label_smooth
+            scores = log_softmax(logits)
+            loss = F.nll_loss(scores, decoder_targets) * (1 - label_smooth) - scores.mean() * label_smooth
         else:
             loss = F.cross_entropy(logits, decoder_targets)
         return loss

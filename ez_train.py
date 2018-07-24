@@ -60,9 +60,10 @@ def valid_model(args, model, dev, print_out=False):
         outputs['dec'] += dev_outputs[2]
         outputs['gleu'] += gleu
 
-        if print_out:
+        if print_out and (j < 5):
             for k, d in enumerate(dev_outputs):
                 args.logger.info("{}: {}".format(print_seqs[k], d[0]))
+                
             args.logger.info('------------------------------------------------------------------')
 
         info = 'Validation: decoding step={}, gleu={:.3f}'.format(j + 1, np.mean(gleu))
@@ -123,7 +124,7 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
             progressbar.close()
 
             with torch.no_grad():
-                outputs_data = valid_model(args, model, dev, print_out=False)
+                outputs_data = valid_model(args, model, dev, print_out=True)
 
             if args.tensorboard and (not args.debug):
                 writer.add_scalar('dev/GLEU_sentence_', np.mean(outputs_data['gleu']), iters)

@@ -29,7 +29,7 @@ def debpe(x):
 
 def valid_model(args, model, dev, print_out=False):
     print_seqs = ['[sources]', '[targets]', '[decoded]']
-    outputs = {'src': [], 'trg': [], 'dec': [], 'gleu': []}
+    outputs = defaultdict(lambda:[])
 
     progressbar = tqdm(total=len([1 for _ in dev]), desc='start decoding for validation...')
     model.eval()
@@ -42,7 +42,9 @@ def valid_model(args, model, dev, print_out=False):
 
         # encoding
         encoding_outputs = model.encoding(source_inputs, source_masks)
-
+        if args.causal_enc and args.encoder_lm:
+            outputs['accuracy'] += model.accuracy(source_outputs, source_masks, encoding_outputs[-1], 'encoder')
+        
         # decoding
         decoding_outputs, out, probs = model.decoding(encoding_outputs, source_masks, target_inputs, target_masks, 
                                                         decoding=True, return_probs=True)
@@ -66,7 +68,10 @@ def valid_model(args, model, dev, print_out=False):
                 
             args.logger.info('------------------------------------------------------------------')
 
-        info = 'Validation: decoding step={}, gleu={:.3f}'.format(j + 1, np.mean(gleu))
+        info = 'Validation: decoding step={}, gleu={:.3f}'.format(j + 1, np.mean(outputs['gleu']))
+        if args.causal_enc and args.encoder_lm:
+            info += ', source predict acc={:.3f}'.format(np.mean(outputs['accuracy']))
+
         progressbar.update(1)
         progressbar.set_description(info)
     progressbar.close()
@@ -130,6 +135,9 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
                 writer.add_scalar('dev/GLEU_sentence_', np.mean(outputs_data['gleu']), iters)
                 # writer.add_scalar('dev/Loss', dev_metrics.loss, iters)
                 writer.add_scalar('dev/BLEU_corpus_', outputs_data['corpus_bleu'], iters)
+                
+                if args.causal_enc and args.encoder_lm:
+                    writer.add_scalar('dev/Source_Predict_', np.mean(outputs_data['accuracy']), iters)
 
             if not args.debug:
                 best.accumulate(outputs_data['corpus_bleu'], np.mean(outputs_data['gleu']), iters)
@@ -159,14 +167,13 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
         opt.param_groups[0]['lr'] = get_learning_rate(iters, disable=args.disable_lr_schedule)
         opt.zero_grad()
         
-        info_str = 'training step = {}, lr={:.5f}, '.format(iters, opt.param_groups[0]['lr'])
+        info_str = 'training step = {}, lr={:.7f}, '.format(iters, opt.param_groups[0]['lr'])
         info = defaultdict(lambda:0)
 
         # prepare the data
         for inter_step in range(args.inter_size):
 
             batch = next(train)  # load the next batch of training data.
-            #to = time.time()
 
             source_inputs, source_outputs, source_masks, \
             target_inputs, target_outputs, target_masks = model.prepare_data(batch)
@@ -179,12 +186,12 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
 
             # Maximum Likelihood Training (with label smoothing trick)
             decoding_outputs = model.decoding(encoding_outputs, source_masks, target_inputs, target_masks)        
-            loss  = model.cost(target_outputs, target_masks, out=decoding_outputs, label_smooth=args.label_smooth)
+            loss  = model.cost(target_outputs, target_masks, outputs=decoding_outputs, label_smooth=args.label_smooth)
             info['MLE'] += export(loss)
 
             # Source side Language Model (optional, only works for causal-encoder)
             if args.encoder_lm and args.causal_enc:
-                loss_lm = model.cost(source_outputs, source_masks, out=encoding_outputs[-1])
+                loss_lm = model.cost(source_outputs, source_masks, outputs=encoding_outputs[-1], mode='encoder')
                 info['LM'] += export(loss_lm)
                 loss += loss_lm
 
@@ -202,7 +209,8 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
 
         if args.tensorboard and (not args.debug):
             writer.add_scalar('train/Loss', info['MLE'] / args.inter_size, iters)
-
+            if args.encoder_lm and args.causal_enc:
+                writer.add_scalar('train/Enc_LM_loss', info['LM'] / args.inter_size)
         
         progressbar.update(1)
         progressbar.set_description(info_str)

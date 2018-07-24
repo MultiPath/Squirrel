@@ -365,11 +365,8 @@ class Encoder(nn.Module):
 
     def __init__(self, field, args, causal=False):
         super().__init__()
-        if args.share_embeddings:
-            self.out = nn.Linear(args.d_model, len(field.vocab))
-        else:
-            self.embed = nn.Embedding(len(field.vocab), args.d_model)
-
+        
+        self.out = nn.Linear(args.d_model, len(field.vocab))
         self.layers = nn.ModuleList(
             [EncoderLayer(args, causal) for i in range(args.n_layers)])
         self.dropout = nn.Dropout(args.drop_ratio)
@@ -378,11 +375,8 @@ class Encoder(nn.Module):
         self.share_embeddings = args.share_embeddings
 
     def forward(self, x, mask=None):
-        if self.share_embeddings:
-            x = F.embedding(x, self.out.weight * math.sqrt(self.d_model))
-        else:
-            x = self.embed(x)
 
+        x = F.embedding(x, self.out.weight * math.sqrt(self.d_model))
         x += positional_encodings_like(x)  # add positional encoding.
         encoding = [x]
 
@@ -597,18 +591,37 @@ class Transformer(nn.Module):
         loss = loss.sum(1, keepdim=True) / (TINY + mask.sum(1, keepdim=True))
         return cost, loss
 
-    def cost(self, decoder_targets, decoder_masks, out, label_smooth=0.0):
+    def cost(self, targets, masks, outputs, label_smooth=0.0, mode='decoder'):
         # get loss in a sequence-format to save computational time.
-        decoder_targets, out = with_mask(decoder_targets, out, decoder_masks.byte())
-        logits = self.decoder.out(out)
+        targets, outputs = with_mask(targets, outputs, masks.byte())
+        
+        if mode == 'decoder':
+            logits = self.decoder.out(outputs)
+        else:
+            logits = self.encoder.out(outputs)
 
         # FIXME: tell me if this implementation is BUG or not.
         if label_smooth > 0:
             scores = log_softmax(logits)
-            loss = F.nll_loss(scores, decoder_targets) * (1 - label_smooth) - scores.mean() * label_smooth
+            loss = F.nll_loss(scores, targets) * (1 - label_smooth) - scores.mean() * label_smooth
         else:
-            loss = F.cross_entropy(logits, decoder_targets)
+            loss = F.cross_entropy(logits, targets)
         return loss
+
+    def accuracy(self, targets, masks, outputs, mode='decoder'):
+        # get loss in a sequence-format to save computational time.
+        targets, outputs = with_mask(targets, outputs, masks.byte())
+        
+        if mode == 'decoder':
+            logits = self.decoder.out(outputs)
+        else:
+            logits = self.encoder.out(outputs)
+
+        preds = logits.max(-1)[1]
+        with torch.cuda.device_of(preds):
+            corrects = (preds == targets).float().tolist()
+
+        return corrects
 
     def batched_cost(self, decoder_targets, decoder_masks, probs, return_batch_loss=False):
         # get loss in a batch-mode

@@ -23,7 +23,7 @@ The Prague Bulletin of Mathematical Linguistics 110.1 (2018): 43-70.
 ------
 
 **Dataset** <br>
-We provided the proprocessed (BPE) parallel corpora at <br>
+We provided the pre-processed (BPE) parallel corpora at <br>
 https://www.dropbox.com/sh/p5b6m14is8hd4rn/AAAW5M6ddaiwjd5DbugNPmdEa?dl=0
 
 You can simply download all the datasets and put them to your <DATA_DIR>.<br>

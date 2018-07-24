@@ -232,8 +232,12 @@ logger.info(f'Starting with HPARAMS: {hp_str}')
 model_name = os.path.join(args.workspace_prefix, 'models', args.prefix + hp_str)
 
 # build the model
-model = Transformer(SRC, TRG, args).to(torch.device(args.device))
+model = Transformer(SRC, TRG, args)
 logger.info(str(model))
+
+# use GPU 
+if args.gpu > -1:
+    model.to(torch.device(args.device))
 
 # load pre-trained parameters
 if args.load_from is not None:

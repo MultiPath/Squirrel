@@ -68,6 +68,16 @@ def mask(targets, out, input_mask=None, return_mask=False):
         return targets[input_mask], out[out_mask].view(-1, out.size(-1)), the_mask
     return targets[input_mask], out[out_mask].view(-1, out.size(-1))
 
+def with_mask(targets, out, input_mask=None, return_mask=False):
+    if input_mask is None:
+        input_mask = (targets != 1)
+    
+    out_mask = input_mask.unsqueeze(-1).expand_as(out)
+
+    if return_mask:
+        return targets[input_mask], out[out_mask].view(-1, out.size(-1)), the_mask
+    return targets[input_mask], out[out_mask].view(-1, out.size(-1))
+
 def demask(inputs, the_mask):
     # inputs: 1-D sequences
     # the_mask: batch x max-len
@@ -239,12 +249,12 @@ class Attention(nn.Module):
         if mask is not None:
             if dot_products.dim() == 2:
                 assert mask.dim() == 2, "only works on 2D masks"
-                dot_products -= ((1 - mask) * INF)
+                dot_products.data -= ((1 - mask) * INF)
             else:
                 if mask.dim() == 2:
-                    dot_products -= ((1 - mask[:, None, :]) * INF)
+                    dot_products.data -= ((1 - mask[:, None, :]) * INF)
                 else:
-                    dot_products -= ((1 - mask) * INF)
+                    dot_products.data -= ((1 - mask) * INF)
 
         if value is None:
             return dot_products
@@ -294,9 +304,10 @@ class FeedForward(nn.Module):
         self.linear2 = Linear(d_hidden, d_model)
         self.dropout = nn.Dropout(drop_ratio)
 
-    def forward(self, x):
-        return self.linear2(self.dropout(F.relu(self.linear1(x))))  # adding dropout in feedforward layer
 
+    def forward(self, x):
+        # return self.linear2(self.dropout(F.relu(self.linear1(x))))  # adding dropout in feedforward layer
+        return self.linear2(F.relu(self.linear1(x)))
 
 class EncoderLayer(nn.Module):
 
@@ -540,9 +551,9 @@ class Transformer(nn.Module):
 
     def prepare_masks(self, inputs):
         if inputs.ndimension() == 2:  # index inputs
-            masks = (inputs != self.field.vocab.stoi['<pad>']).float()
+            masks = (inputs.data != self.field.vocab.stoi['<pad>']).float()
         else:                         # one-hot vector inputs
-            masks = (inputs[:, :, self.field.vocab.stoi['<pad>']] != 1).float()
+            masks = (inputs.data[:, :, self.field.vocab.stoi['<pad>']] != 1).float()
         return masks
 
     def encoding(self, encoder_inputs, encoder_masks):
@@ -588,10 +599,13 @@ class Transformer(nn.Module):
 
     def cost(self, decoder_targets, decoder_masks, out, label_smooth=0.0):
         # get loss in a sequence-format to save computational time.
-        input_masks = (decoder_masks > 0)
-        decoder_targets = decoder_targets[input_masks]
+        decoder_targets, out = with_mask(decoder_targets, out, decoder_masks.byte())
         
-        out = out[input_masks.unsqueeze(-1).expand_as(out)].view(-1, out.size(-1))
+        # input_masks = (decoder_masks > 0)
+        # print(input_masks.sum())
+        # decoder_targets = decoder_targets[input_masks]
+        # out = out[input_masks.unsqueeze(-1).expand_as(out)].view(-1, out.size(-1))
+        
         logits = self.decoder.out(out)
         # print(input_masks.size(), decoder_targets.max(), decoder_targets.min(), out.size(), logits.size())
 

@@ -2,7 +2,7 @@ import torch
 import numpy as np
 import math
 import time
-
+import time
 from collections import defaultdict
 from torch.autograd import Variable
 from tqdm import tqdm, trange
@@ -31,6 +31,7 @@ def valid_model(args, model, dev, print_out=False):
     print_seqs = ['[sources]', '[targets]', '[decoded]']
     outputs = {'src': [], 'trg': [], 'dec': [], 'gleu': []}
 
+    progressbar = tqdm(total=len([1 for _ in dev]), desc='start decoding for validation...')
     model.eval()
 
     for j, dev_batch in enumerate(dev):
@@ -63,6 +64,11 @@ def valid_model(args, model, dev, print_out=False):
             for k, d in enumerate(dev_outputs):
                 args.logger.info("{}: {}".format(print_seqs[k], d[0]))
             args.logger.info('------------------------------------------------------------------')
+
+        info = 'Validation: decoding step={}, gleu={:.3f}'.format(j + 1, np.mean(gleu))
+        progressbar.update(1)
+        progressbar.set_description(info)
+    progressbar.close()
 
     outputs['corpus_bleu'] = computeBLEU(outputs['dec'], outputs['trg'], corpus=True, tokenizer=debpe)
     args.logger.info("The dev-set corpus BLEU = {}".format(outputs['corpus_bleu']))
@@ -116,7 +122,7 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
             progressbar.close()
 
             with torch.no_grad():
-                outputs_data = valid_model(args, model, dev, print_out=True)
+                outputs_data = valid_model(args, model, dev, print_out=False)
 
             if args.tensorboard and (not args.debug):
                 writer.add_scalar('dev/GLEU_sentence_', np.mean(outputs_data['gleu']), iters)
@@ -148,7 +154,7 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
                 return lr0 * 10 / math.sqrt(args.d_model) * min(1 / math.sqrt(i), i / (args.warmup * math.sqrt(args.warmup)))
             return 0.00002
 
-        opt.param_groups[0]['lr'] = get_learning_rate(iters + 1, disable=args.disable_lr_schedule)
+        opt.param_groups[0]['lr'] = get_learning_rate(iters, disable=args.disable_lr_schedule)
         opt.zero_grad()
         
         info_str = 'training step = {}, lr={:.5f}, '.format(iters, opt.param_groups[0]['lr'])
@@ -158,6 +164,8 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
         for inter_step in range(args.inter_size):
 
             batch = next(iter(train))  # load the next batch of training data.
+
+            to = time.time()
 
             source_inputs, source_outputs, source_masks, \
             target_inputs, target_outputs, target_masks = model.prepare_data(batch)
@@ -181,10 +189,9 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
 
             loss = loss / args.inter_size
             loss.backward()
-            
+
         # multiple steps, one update
         opt.step()
-
         total_tokens += info['tokens']
 
         info_str += '{} sents/{} tokens, total {} tokens, '.format(info['sents'], info['tokens'], total_tokens)
@@ -193,7 +200,7 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
             info_str += 'ENCLM_loss={:.3f}, '.format(info['LM'] / args.inter_size)
 
         if args.tensorboard and (not args.debug):
-            writer.add_scalar('train/Loss', export(loss), iters)
+            writer.add_scalar('train/Loss', info['MLE'] / args.inter_size, iters)
 
         
         progressbar.update(1)

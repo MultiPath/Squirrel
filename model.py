@@ -24,15 +24,15 @@ def grad_reverse(x):
 
 def positional_encodings_like(x, t=None):   # hope to be differentiable
     if t is None:
-        positions = torch.arange(0, x.size(-2)).float() # .expand(*x.size()[:2])
+        positions = torch.arange(0, x.size(-2)) # .expand(*x.size()[:2])
         if x.is_cuda:
             positions = positions.cuda(x.get_device())
-        positions = Variable(positions)
+        positions = Variable(positions.float())
     else:
         positions = t
 
     # channels
-    channels = torch.arange(0, x.size(-1), 2).float() / x.size(-1) # 0 2 4 6 ... (256)
+    channels = torch.arange(0, x.size(-1), 2) / x.size(-1) # 0 2 4 6 ... (256)
     if x.is_cuda:
         channels = channels.cuda(x.get_device())
     channels = 1 / (10000 ** Variable(channels))
@@ -355,7 +355,7 @@ class DecoderLayer(nn.Module):
 
         x = self.selfattn(x, x, x, mask_trg)   #
         if self.positional:
-            pos_encoding, weights = positional_encodings_like(x), None
+            pos_encoding = positional_encodings_like(x)
             x = self.pos_selfattn(pos_encoding, pos_encoding, x, mask_trg)  # positional attention
         x = self.feedforward(self.crossattn(x, encoding, encoding, mask_src))
         return x

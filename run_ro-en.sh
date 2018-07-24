@@ -3,7 +3,6 @@ CUDA=${1}
 MODE=${2:-train}
 
 export CUDA_VISIBLE_DEVICES=${CUDA}
-export CUDA_LAUNCH_BLOCKING=1
 python ez_run.py \
                 --prefix [time] \
                 --gpu 0 \
@@ -20,11 +19,12 @@ python ez_run.py \
                 --eval_every 500  \
                 --batch_size 1200 \
                 --inter_size 3 \
-                --label_smooth 0.1 \
+                --label_smooth 0.0 \
                 --share_embeddings \
                 --tensorboard \
                 --beam 5 \
-                
+                --debug
+
                 # --debug
 
                 # --debug \

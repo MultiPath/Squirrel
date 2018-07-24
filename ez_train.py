@@ -107,7 +107,8 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
 
     # statistics
     total_tokens = 0
-
+    train = iter(train)
+    
     while True:
 
         # --- saving --- #
@@ -163,9 +164,8 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
         # prepare the data
         for inter_step in range(args.inter_size):
 
-            batch = next(iter(train))  # load the next batch of training data.
-
-            to = time.time()
+            batch = next(train)  # load the next batch of training data.
+            #to = time.time()
 
             source_inputs, source_outputs, source_masks, \
             target_inputs, target_outputs, target_masks = model.prepare_data(batch)

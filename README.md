@@ -112,7 +112,7 @@ python ez_run.py \
 Some ablation studies of different models can be found as follows:
 
 | WMT16 RO-EN | t2t-base, label_smooth=0 | t2t-base, label_smooth=0.1 |
-| :--- | :----: | ----: |
+| :--- | :----: | :----: |
 | (dev) greedy | 32.82 | 34.16 |
 | (dev) beam=5, alpha=0.6   | 33.39 |  34.73    |
 | (test) greedy | 31.51 | 32.68 |

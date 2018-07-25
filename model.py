@@ -116,6 +116,14 @@ def argmax(x):  # return the one-hot vectors
     x_hard = x_hard.view(*shape)
     return x_hard
 
+def shift(x, n = 3):
+    xs = [x.unsqueeze(-1)]
+    for i in range(1, n+1):
+        p = x.new_zeros(*x.size())
+        p[:, :-i] = x[:, i:]
+        xs.append(p.unsqueeze(-1))
+    return torch.cat(xs, -1)
+
 # torch.matmul can't do (4, 3, 2) @ (4, 2) -> (4, 3)
 def matmul(x, y):
     if x.dim() == y.dim():
@@ -403,10 +411,22 @@ class PryIO(IO):
     def __init__(self, field, args):
         super().__init__(field, args)
 
-        # TODO: experimental: just have a try
+        # TODO: experimental: just have a try?
         self.deconv1 = nn.ConvTranspose1d(args.d_model, args.d_model, 2, 2)
+    
+    def expand(self, x):
+        b, l, t = x.size()
+        x = x.view(-1, t).contiguous().unsqueeze(-1)
+        x = self.deconv1(x)
+        return x.view(b, l, t, -1).contiguous()
 
-
+    def cost(self, targets, masks, outputs, label_smooth=0.0):
+        targets, masks = shift(targets, 2), shift(masks, 2)
+        outputs = torch.cat([outputs.unsqueeze(-1), self.expand(outputs)], -1).transpose(3, 2)
+        # print(targets.size(), masks.size(), outputs.size())
+        targets, outputs = with_mask(targets, outputs, masks.byte())
+        logits = log_softmax(self.o(outputs))
+        return F.nll_loss(logits, targets) * (1 - label_smooth) - logits.mean() * label_smooth
 
 
 class Encoder(nn.Module):
@@ -572,8 +592,12 @@ class Transformer(nn.Module):
         self.encoder = Encoder(src, args, causal=args.causal_enc)
         self.decoder = Decoder(trg, args, causal=True)
         
-        self.io_dec = IO(trg, args)
-        self.io_enc = IO(src, args)
+        if args.pry_io:
+            self.io_dec = PryIO(trg, args)
+            self.io_enc = PryIO(src, args)
+        else:
+            self.io_dec = IO(trg, args)
+            self.io_enc = IO(src, args)
 
         if args.share_embeddings:
             self.io_enc.out.weight = self.io_dec.out.weight

@@ -52,7 +52,7 @@ parser.add_argument('--causal',   action='store_true', help='use causal attentio
 parser.add_argument('--cross_attn_fashion', type=str, default='forward', choices=['forward', 'reverse', 'last_layer'])
 parser.add_argument('--share_embeddings',     action='store_true', help='share embeddings between encoder and decoder')
 parser.add_argument('--positional_attention', action='store_true', help='incorporate positional information in key/value')
-
+parser.add_argument('--pry_io', action='store_true', help='multi-step prediction')
 # running setting
 parser.add_argument('--mode',    type=str, default='train',  help='train, test or data')  # "data": preprocessing and save vocabulary
 parser.add_argument('--gpu',     type=int, default=0,        help='GPU to use or -1 for CPU')

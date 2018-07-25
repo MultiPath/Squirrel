@@ -372,30 +372,41 @@ class IO(nn.Module):
         self.out = nn.Linear(args.d_model, len(field.vocab), bias=False)
         self.scale = math.sqrt(args.d_model)
 
-    def forward(self, x, mode='out', pos=True):
-        if mode == 'out':
-            return self.out(x)
-        
-        elif mode == 'in':
-            x = F.embedding(x, self.out.weight * self.scale)
-            if pos:
-                x += positional_encodings_like(x)
-            return x
-        else:
-            raise NotImplementedError
+    def i(self, x, pos=True):
+        x = F.embedding(x, self.out.weight * self.scale)
+        if pos:
+            x += positional_encodings_like(x)
+        return x
+
+    def o(self, x):
+        return self.out(x)
 
     def cost(self, targets, masks, outputs, label_smooth=0.0):
         targets, outputs = with_mask(targets, outputs, masks.byte())
-        logits = log_softmax(self.forward(outputs, mode='out'))
+        logits = log_softmax(self.o(outputs))
         return F.nll_loss(logits, targets) * (1 - label_smooth) - logits.mean() * label_smooth
 
     def acc(self, targets, masks, outputs):
         with torch.cuda.device_of(targets):
             targets, outputs = with_mask(targets, outputs, masks.byte())
-            return (self.forward(outputs, mode='out').max(-1)[1] == targets).float().tolist()
+            return (self.o(outputs).max(-1)[1] == targets).float().tolist()
 
     def reverse(self, outputs):
         return self.field.reverse(outputs.data, self.args.char)
+
+
+class PryIO(IO):
+    """
+        IO of navie multi-step prediction.
+        For "out" mode, it predicts multiple words using deconv.
+    """
+    def __init__(self, field, args):
+        super().__init__(field, args)
+
+        # TODO: experimental: just have a try
+        self.deconv1 = nn.ConvTranspose1d(args.d_model, args.d_model, 2, 2)
+
+
 
 
 class Encoder(nn.Module):
@@ -461,7 +472,7 @@ class Decoder(nn.Module):
 
         for t in range(T):
             
-            hiddens[0][:, t] = self.dropout(hiddens[0][:, t] + io_dec(outs[:, t], mode='in', pos=False))
+            hiddens[0][:, t] = self.dropout(hiddens[0][:, t] + io_dec.i(outs[:, t], pos=False))
 
             for l in range(len(self.layers)):
                 x = hiddens[l][:, :t+1]
@@ -469,7 +480,7 @@ class Decoder(nn.Module):
                 hiddens[l + 1][:, t] = self.layers[l].feedforward(
                     self.layers[l].crossattn(x, encoding[l], encoding[l], mask_src))[:, 0]
 
-            _, preds = io_dec(hiddens[-1][:, t], mode='out').max(-1)
+            _, preds = io_dec.o(hiddens[-1][:, t]).max(-1)
             preds[eos_yet] = self.field.vocab.stoi['<pad>']
 
             eos_yet = eos_yet | (preds.data == self.field.vocab.stoi['<eos>'])
@@ -506,7 +517,7 @@ class Decoder(nn.Module):
 
         for t in range(T):
             hiddens[0][:, :, t] = self.dropout(
-                hiddens[0][:, :, t] + io_dec(outs[:, :, t], mode='in', pos=False))
+                hiddens[0][:, :, t] + io_dec.i(outs[:, :, t], pos=False))
             for l in range(len(self.layers)):
                 x = hiddens[l][:, :, :t + 1].contiguous().view(B * W, -1, C)
                 x = self.layers[l].selfattn(x[:, -1:, :], x, x)
@@ -515,7 +526,7 @@ class Decoder(nn.Module):
                         B, W, C)
 
             # topk2_logps: scores, topk2_inds: top word index at each beam, batch x beam x beam
-            topk2_logps = log_softmax(io_dec(hiddens[-1][:, :, t], mode='out'))
+            topk2_logps = log_softmax(io_dec.o(hiddens[-1][:, :, t]))
             topk2_logps[:, :, self.field.vocab.stoi['<pad>']] = -INF
             topk2_logps, topk2_inds = topk2_logps.topk(W, dim=-1)
 
@@ -577,13 +588,13 @@ class Transformer(nn.Module):
         return source_inputs, source_outputs, source_masks, target_inputs, target_outputs, target_masks
 
     def encoding(self, encoder_inputs, encoder_masks):
-        return self.encoder(self.io_enc(encoder_inputs, mode='in', pos=True), encoder_masks)
+        return self.encoder(self.io_enc.i(encoder_inputs, pos=True), encoder_masks)
 
     def decoding(self, encoding_outputs, encoder_masks, decoder_inputs, decoder_masks,
                  decoding=False, beam=1, alpha=0.6, return_probs=False):
 
         if (return_probs and decoding) or (not decoding):
-            out = self.decoder(self.io_dec(decoder_inputs, mode='in', pos=True), encoding_outputs, encoder_masks, decoder_masks)
+            out = self.decoder(self.io_dec.i(decoder_inputs, pos=True), encoding_outputs, encoder_masks, decoder_masks)
 
         if decoding:
             if beam == 1:  # greedy decoding
@@ -592,11 +603,11 @@ class Transformer(nn.Module):
                 output = self.decoder.beam_search(self.io_dec, encoding_outputs, encoder_masks, decoder_masks, beam, alpha)
 
             if return_probs:
-                return output, out, softmax(self.io_dec(out, mode='out'))
+                return output, out, softmax(self.io_dec.o(out))
             return output
 
         if return_probs:
-            return out, softmax(self.io_dec(out, mode='out'))
+            return out, softmax(self.io_dec.o(out))
         return out
 
     # def apply_mask(self, inputs, mask, p=1):

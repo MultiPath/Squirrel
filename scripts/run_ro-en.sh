@@ -22,6 +22,8 @@ python ez_run.py \
                 --label_smooth 0.1 \
                 --share_embeddings \
                 --tensorboard \
-                --debug
+                --causal_enc \
+                # --encoder_lm
+                #--debug
                 
 

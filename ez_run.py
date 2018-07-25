@@ -49,8 +49,7 @@ parser.add_argument('--params', type=str, default='james-iwslt', help='pamarater
 parser.add_argument('--causal_enc', action='store_true', help='use unidirectional encoder (useful for real-time translation)')
 parser.add_argument('--encoder_lm', action='store_true', help='use unidirectional encoder with additional loss as a LM')
 parser.add_argument('--causal',   action='store_true', help='use causal attention')
-parser.add_argument('--diag',     action='store_true', help='ignore diagonal attention when doing self-attention.')
-parser.add_argument('--use_wo',   action='store_true', help='use output weight matrix in multihead attention')
+parser.add_argument('--cross_attn_fashion', type=str, default='forward', choices=['forward', 'reverse', 'last_layer'])
 parser.add_argument('--share_embeddings',     action='store_true', help='share embeddings between encoder and decoder')
 parser.add_argument('--positional_attention', action='store_true', help='incorporate positional information in key/value')
 

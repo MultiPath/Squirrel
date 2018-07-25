@@ -447,10 +447,18 @@ class Decoder(nn.Module):
         self.field = field
         self.length_ratio = args.length_ratio
         self.positional = positional
+        self.cross_attn_fashion = args.cross_attn_fashion
 
     def forward(self, x, encoding, mask_src=None, mask_trg=None):
 
         x = self.dropout(x)
+        if self.cross_attn_fashion == 'reverse':
+            encoding = encoding[1:][::-1]
+        elif self.cross_attn_fashion == 'last_layer':
+            encoding = [encoding[-1] for _ in len(self.layers)]
+        else:
+            pass
+
         for l, (layer, enc) in enumerate(zip(self.layers, encoding[1:])):
             x = layer(x, enc, mask_src=mask_src, mask_trg=mask_trg)
         return x

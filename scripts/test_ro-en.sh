@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 CUDA=${1}
-MODE=${2:-train}
 
 export CUDA_VISIBLE_DEVICES=${CUDA}
 python ez_run.py \
                 --prefix [time] \
                 --gpu 0 \
-                --mode ${MODE} \
+                --mode test \
                 --data_prefix "/data0/data/transformer_data/" \
                 --dataset "wmt16" \
                 --src "ro" --trg "en" \
@@ -14,18 +13,15 @@ python ez_run.py \
                 --dev_set   "dev.bpe"   \
                 --test_set  "test.bpe"  \
                 --load_lazy \
-                --workspace_prefix "/data0/workspace/squirrel_io/" \
+                --workspace_prefix "/data0/workspace/squirrel/" \
+                --load_from "07.24_15.26.wmt16_t2t-base_ro_en_causal_lm_w_0.1_5000" \
                 --params "t2t-base" \
-                --eval_every 500  \
-                --batch_size 1250 \
-                --inter_size 4 \
-                --label_smooth 0.1 \
+                --batch_size 12500 \
                 --share_embeddings \
                 --tensorboard \
-                --cross_attn_fashion "reverse" \
-                #--debug
-                #--causal_enc \
-                # --encoder_lm
-                #--debug
+                --causal_enc \
+                --encoder_lm \
+                --beam 1 --alpha 0.6 \
+                --debug
                 
 

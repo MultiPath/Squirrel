@@ -1,5 +1,7 @@
 import torch
 import math
+
+from abc import ABCMeta, abstractmethod
 from torch import nn
 from torch.nn import functional as F
 from torch.autograd import Variable, Function
@@ -359,6 +361,27 @@ class DecoderLayer(nn.Module):
             x = self.pos_selfattn(pos_encoding, pos_encoding, x, mask_trg)  # positional attention
         x = self.feedforward(self.crossattn(x, encoding, encoding, mask_src))
         return x
+
+
+class IO(nn.Module):
+    
+    def __init__(self, field, args):
+        super().__init__()
+
+        self.out = nn.Linear(args.d_model, len(field.vocab), bias=False)
+        self.scale = math.sqrt(args.d_model)
+
+    def forward(x, mode='out', pos=True):
+        if mode == 'out':
+            return self.out(x)
+        
+        elif mode == 'in':
+            embed = F.embedding(x, self.out.weight * self.scale)
+            if pos:
+                embed += positional_encodings_like(x)
+            return embed
+        else:
+            raise NotImplementedError
 
 
 class Encoder(nn.Module):

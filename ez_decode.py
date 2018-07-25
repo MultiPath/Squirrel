@@ -25,7 +25,7 @@ def cutoff(s, t):
 
 def decode_model(args, model, dev, evaluate=True, decoding_path=None, names=None, maxsteps=None):
 
-    args.logger.info("decoding with {}, beam_size={}, alpha={}".format(args.decode_mode, args.beam_size, args.alpha))
+    args.logger.info("decoding beam-search: beam_size={}, alpha={}".format(args.beam_size, args.alpha))
     dev.train = False  # make iterator volatile=True
 
     if maxsteps is None:

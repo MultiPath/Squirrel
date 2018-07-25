@@ -36,9 +36,9 @@ parser.add_argument('--load_lazy', action='store_true', help='load a lazy-mode d
 parser.add_argument('--remove_dec_eos', action='store_true', help='possibly remove <eos> tokens in the decoder')
 parser.add_argument('--remove_enc_eos', action='store_true', help='possibly remove <eos> tokens in the encoder')
 
-parser.add_argument('--train_set', type=str, default='train',  help='which train set to use')
-parser.add_argument('--dev_set', type=str, default='dev',  help='which dev set to use')
-parser.add_argument('--test_set', type=str, default='test',  help='which test set to use')
+parser.add_argument('--train_set', type=str, default=None,  help='which train set to use')
+parser.add_argument('--dev_set', type=str, default=None,  help='which dev set to use')
+parser.add_argument('--test_set', type=str, default=None,  help='which test set to use')
 
 
 # model basic settings
@@ -71,10 +71,9 @@ parser.add_argument('--disable_lr_schedule', action='store_true', help='disable 
 
 # decoding
 parser.add_argument('--length_ratio',  type=int,   default=2, help='maximum lengths of decoding')
-parser.add_argument('--decode_mode',   type=str,   default='argmax', help='decoding mode: argmax, mean, sample, noisy, search')
 parser.add_argument('--beam_size',     type=int,   default=1, help='beam-size used in Beamsearch, default using greedy decoding')
 parser.add_argument('--alpha',         type=float, default=1, help='length normalization weights')
-parser.add_argument('--rerank_by_bleu', action='store_true', help='use the teacher model for reranking')
+parser.add_argument('--no_bpe', action='store_true', help='do not output BPE in the decoding mode.')
 
 # model saving/reloading, output translations
 parser.add_argument('--load_from',     type=str, default=None, help='load from checkpoint')
@@ -87,7 +86,7 @@ parser.add_argument('--tensorboard', action='store_true', help='use TensorBoard'
 # arguments (:)
 args = parser.parse_args()
 
-for d in ['models', 'runs', 'logs']:    # check the path
+for d in ['models', 'runs', 'logs', 'decodes']:    # check the path
     if not os.path.exists(os.path.join(args.workspace_prefix, d)):
         os.mkdir(os.path.join(args.workspace_prefix, d))
 if args.prefix == '[time]':
@@ -265,12 +264,16 @@ if args.mode == 'train':
 
 elif args.mode == 'test':
     logger.info('starting decoding from the pre-trained model, on the test set...')
-#     name_suffix = '{}_b={}_model_{}.txt'.format(args.decode_mode, args.beam_size, args.load_from)
-#     names = ['src.{}'.format(name_suffix), 'trg.{}'.format(name_suffix),'dec.{}'.format(name_suffix)]
+    assert args.load_from is not None, 'must decode from a pre-trained model.'
 
-#     if args.rerank_by_bleu:
-#         teacher_model = None
+    decoding_path = os.path.join(args.workspace_prefix, 'decodes', args.load_from)
+    if not os.path.exists(decoding_path):
+        os.mkdir(decoding_path)
+    name_suffix = 'b={}_a={}.txt'.format(args.beam_size, args.alpha)
+    names = ['{}.src.{}'.format(args.test_set, name_suffix), 
+             '{}.trg.{}'.format(args.test_set, name_suffix),
+             '{}.dec.{}'.format(args.test_set, name_suffix)]
     with torch.no_grad():   
-        decode_model(args, model, dev_real, evaluate=True) #, decoding_path=decoding_path if not args.no_write else None, names=names)
+        decode_model(args, model, dev_real, evaluate=True, decoding_path=decoding_path, names=names)
 
-# logger.info("done.")
+logger.info("done.")

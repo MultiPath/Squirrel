@@ -367,21 +367,35 @@ class IO(nn.Module):
     
     def __init__(self, field, args):
         super().__init__()
-
+        self.field = field
+        self.args = args
         self.out = nn.Linear(args.d_model, len(field.vocab), bias=False)
         self.scale = math.sqrt(args.d_model)
 
-    def forward(x, mode='out', pos=True):
+    def forward(self, x, mode='out', pos=True):
         if mode == 'out':
             return self.out(x)
         
         elif mode == 'in':
-            embed = F.embedding(x, self.out.weight * self.scale)
+            x = F.embedding(x, self.out.weight * self.scale)
             if pos:
-                embed += positional_encodings_like(x)
-            return embed
+                x += positional_encodings_like(x)
+            return x
         else:
             raise NotImplementedError
+
+    def cost(self, targets, masks, outputs, label_smooth=0.0):
+        targets, outputs = with_mask(targets, outputs, masks.byte())
+        logits = log_softmax(self.forward(outputs, mode='out'))
+        return F.nll_loss(logits, targets) * (1 - label_smooth) - logits.mean() * label_smooth
+
+    def acc(self, targets, masks, outputs):
+        with torch.cuda.device_of(targets):
+            targets, outputs = with_mask(targets, outputs, masks.byte())
+            return (self.forward(outputs, mode='out').max(-1)[1] == targets).float().tolist()
+
+    def reverse(self, outputs):
+        return self.field.reverse(outputs.data, self.args.char)
 
 
 class Encoder(nn.Module):
@@ -389,7 +403,6 @@ class Encoder(nn.Module):
     def __init__(self, field, args, causal=False):
         super().__init__()
         
-        self.out = nn.Linear(args.d_model, len(field.vocab))
         self.layers = nn.ModuleList(
             [EncoderLayer(args, causal) for i in range(args.n_layers)])
         self.dropout = nn.Dropout(args.drop_ratio)
@@ -399,10 +412,7 @@ class Encoder(nn.Module):
 
     def forward(self, x, mask=None):
 
-        x = F.embedding(x, self.out.weight * math.sqrt(self.d_model))
-        x += positional_encodings_like(x)  # add positional encoding.
         encoding = [x]
-
         x = self.dropout(x)
         for layer in self.layers:
             x = layer(x, mask)
@@ -421,30 +431,20 @@ class Decoder(nn.Module):
             [DecoderLayer(args, causal, positional, noisy)
             for i in range(args.n_layers)])
 
-        self.out = nn.Linear(args.d_model, len(field.vocab))
-
         self.dropout = nn.Dropout(args.drop_ratio)
         self.d_model = args.d_model
         self.field = field
         self.length_ratio = args.length_ratio
         self.positional = positional
 
-    def forward(self, x, encoding, mask_src=None, mask_trg=None, input_embeddings=False):
+    def forward(self, x, encoding, mask_src=None, mask_trg=None):
 
-        if not input_embeddings:  # compute input embeddings
-            if x.ndimension() == 2:
-                x = F.embedding(x, self.out.weight * math.sqrt(self.d_model))
-            elif x.ndimension() == 3:  # softmax relaxiation
-                x = x @ self.out.weight * math.sqrt(self.d_model)  # batch x len x embed_size
-
-        x += positional_encodings_like(x)
         x = self.dropout(x)
-
         for l, (layer, enc) in enumerate(zip(self.layers, encoding[1:])):
             x = layer(x, enc, mask_src=mask_src, mask_trg=mask_trg)
         return x
 
-    def greedy(self, encoding, mask_src=None, mask_trg=None):
+    def greedy(self, io_dec, encoding, mask_src=None, mask_trg=None):
 
         encoding = encoding[1:]
         B, T, C = encoding[0].size()  # batch-size, decoding-length, size
@@ -454,15 +454,14 @@ class Decoder(nn.Module):
                     self.field.vocab.stoi['<init>']))
         hiddens = [Variable(encoding[0].data.new(B, T, C).zero_())
                     for l in range(len(self.layers) + 1)]
-        embedW = self.out.weight * math.sqrt(self.d_model)
+        # embedW = self.out.weight * math.sqrt(self.d_model)
         hiddens[0] = hiddens[0] + positional_encodings_like(hiddens[0])
 
         eos_yet = encoding[0].data.new(B).byte().zero_()
 
         for t in range(T):
-
-            hiddens[0][:, t] = self.dropout(
-                hiddens[0][:, t] + F.embedding(outs[:, t], embedW))
+            
+            hiddens[0][:, t] = self.dropout(hiddens[0][:, t] + io_dec(outs[:, t], mode='in', pos=False))
 
             for l in range(len(self.layers)):
                 x = hiddens[l][:, :t+1]
@@ -470,7 +469,7 @@ class Decoder(nn.Module):
                 hiddens[l + 1][:, t] = self.layers[l].feedforward(
                     self.layers[l].crossattn(x, encoding[l], encoding[l], mask_src))[:, 0]
 
-            _, preds = self.out(hiddens[-1][:, t]).max(-1)
+            _, preds = io_dec(hiddens[-1][:, t], mode='out').max(-1)
             preds[eos_yet] = self.field.vocab.stoi['<pad>']
 
             eos_yet = eos_yet | (preds.data == self.field.vocab.stoi['<eos>'])
@@ -480,7 +479,7 @@ class Decoder(nn.Module):
 
         return outs[:, 1:t+2]
 
-    def beam_search(self, encoding, mask_src=None, mask_trg=None, width=2, alpha=0.6):  # width: beamsize, alpha: length-norm
+    def beam_search(self, io_dec, encoding, mask_src=None, mask_trg=None, width=2, alpha=0.6):  # width: beamsize, alpha: length-norm
         encoding = encoding[1:]
         W = width
         B, T, C = encoding[0].size()
@@ -499,7 +498,7 @@ class Decoder(nn.Module):
         logps = Variable(encoding[0].data.new(B, W).float().fill_(0))  # scores
         hiddens = [Variable(encoding[0].data.new(B, W, T, C).zero_())  # decoder states: batch x beamsize x len x h
                     for l in range(len(self.layers) + 1)]
-        embedW = self.out.weight * math.sqrt(self.d_model)
+        # embedW = self.out.weight * math.sqrt(self.d_model)
         hiddens[0] = hiddens[0] + positional_encodings_like(hiddens[0])
         eos_yet = encoding[0].data.new(B, W).byte().zero_()  # batch x beamsize, all the sentences are not finished yet.
         eos_mask = eos_yet.float().fill_(INF)[:, :, None].expand(B, W, W)  # --- big bug, logps < 0
@@ -507,7 +506,7 @@ class Decoder(nn.Module):
 
         for t in range(T):
             hiddens[0][:, :, t] = self.dropout(
-                hiddens[0][:, :, t] + F.embedding(outs[:, :, t], embedW))
+                hiddens[0][:, :, t] + io_dec(outs[:, :, t], mode='in', pos=False))
             for l in range(len(self.layers)):
                 x = hiddens[l][:, :, :t + 1].contiguous().view(B * W, -1, C)
                 x = self.layers[l].selfattn(x[:, -1:, :], x, x)
@@ -516,7 +515,7 @@ class Decoder(nn.Module):
                         B, W, C)
 
             # topk2_logps: scores, topk2_inds: top word index at each beam, batch x beam x beam
-            topk2_logps = log_softmax(self.out(hiddens[-1][:, :, t]))
+            topk2_logps = log_softmax(io_dec(hiddens[-1][:, :, t], mode='out'))
             topk2_logps[:, :, self.field.vocab.stoi['<pad>']] = -INF
             topk2_logps, topk2_inds = topk2_logps.topk(W, dim=-1)
 
@@ -552,106 +551,72 @@ class Transformer(nn.Module):
     def __init__(self, src, trg, args):
         super().__init__()
         self.encoder = Encoder(src, args, causal=args.causal_enc)
-        self.decoder = Decoder(trg, args)
-        self.field = trg
-        self.share_embeddings = args.share_embeddings
-        self.args = args
-        if args.share_embeddings:
-            self.encoder.out.weight = self.decoder.out.weight
+        self.decoder = Decoder(trg, args, causal=True)
+        
+        self.io_dec = IO(trg, args)
+        self.io_enc = IO(src, args)
 
-    def output_decoding(self, outputs):
-        field, text = outputs
-        if field is 'src':
-            return self.encoder.field.reverse(text.data, self.args.char)
-        else:
-            return self.decoder.field.reverse(text.data, self.args.char)
+        if args.share_embeddings:
+            self.io_enc.out.weight = self.io_dec.out.weight
+
+        self.fields = {'src': src, 'trg': trg}
+        self.args = args
 
     def prepare_masks(self, inputs):
-        if inputs.ndimension() == 2:  # index inputs
-            masks = (inputs.data != self.field.vocab.stoi['<pad>']).float()
+        field, text = inputs
+        if text.ndimension() == 2:  # index inputs
+            masks = (text.data != self.fields[field].vocab.stoi['<pad>']).float()
         else:                         # one-hot vector inputs
-            masks = (inputs.data[:, :, self.field.vocab.stoi['<pad>']] != 1).float()
+            masks = (text.data[:, :, self.fields[field].vocab.stoi['<pad>']] != 1).float()
         return masks
-
-    def encoding(self, encoder_inputs, encoder_masks):
-        return self.encoder(encoder_inputs, encoder_masks)
 
     def prepare_data(self, batch):
         source_inputs, source_outputs = batch.src[:, :-1].contiguous(), batch.src[:, 1:].contiguous()
         target_inputs, target_outputs = batch.trg[:, :-1].contiguous(), batch.trg[:, 1:].contiguous()
-        source_masks, target_masks = self.prepare_masks(source_outputs), self.prepare_masks(target_outputs)
+        source_masks, target_masks = self.prepare_masks(('src', source_outputs)), self.prepare_masks(('trg', target_outputs))
         return source_inputs, source_outputs, source_masks, target_inputs, target_outputs, target_masks
+
+    def encoding(self, encoder_inputs, encoder_masks):
+        return self.encoder(self.io_enc(encoder_inputs, mode='in', pos=True), encoder_masks)
 
     def decoding(self, encoding_outputs, encoder_masks, decoder_inputs, decoder_masks,
                  decoding=False, beam=1, alpha=0.6, return_probs=False):
 
         if (return_probs and decoding) or (not decoding):
-            out = self.decoder(decoder_inputs, encoding_outputs, encoder_masks, decoder_masks)
+            out = self.decoder(self.io_dec(decoder_inputs, mode='in', pos=True), encoding_outputs, encoder_masks, decoder_masks)
 
         if decoding:
             if beam == 1:  # greedy decoding
-                output = self.decoder.greedy(encoding_outputs, encoder_masks, decoder_masks)
+                output = self.decoder.greedy(self.io_dec, encoding_outputs, encoder_masks, decoder_masks)
             else:
-                output = self.decoder.beam_search(encoding_outputs, encoder_masks, decoder_masks, beam, alpha)
+                output = self.decoder.beam_search(self.io_dec, encoding_outputs, encoder_masks, decoder_masks, beam, alpha)
 
             if return_probs:
-                return output, out, softmax(self.decoder.out(out))
+                return output, out, softmax(self.io_dec(out, mode='out'))
             return output
 
         if return_probs:
-            return out, softmax(self.decoder.out(out))
+            return out, softmax(self.io_dec(out, mode='out'))
         return out
 
-    def apply_mask(self, inputs, mask, p=1):
-        outputs = inputs * mask + (1 + (-1) * mask) * p
-        return outputs
+    # def apply_mask(self, inputs, mask, p=1):
+    #     outputs = inputs * mask + (1 + (-1) * mask) * p
+    #     return outputs
 
-    def apply_mask_cost(self, loss, mask, return_batch_loss=False):
-        cost = (loss * mask).sum() / (mask.sum() + TINY)
-        if not return_batch_loss:
-            return cost
+    # def apply_mask_cost(self, loss, mask, return_batch_loss=False):
+    #     cost = (loss * mask).sum() / (mask.sum() + TINY)
+    #     if not return_batch_loss:
+    #         return cost
 
-        loss = loss.sum(1, keepdim=True) / (TINY + mask.sum(1, keepdim=True))
-        return cost, loss
+    #     loss = loss.sum(1, keepdim=True) / (TINY + mask.sum(1, keepdim=True))
+    #     return cost, loss
 
-    def cost(self, targets, masks, outputs, label_smooth=0.0, mode='decoder'):
-        # get loss in a sequence-format to save computational time.
-        targets, outputs = with_mask(targets, outputs, masks.byte())
-        
-        if mode == 'decoder':
-            logits = self.decoder.out(outputs)
-        else:
-            logits = self.encoder.out(outputs)
+    # def batched_cost(self, decoder_targets, decoder_masks, probs, return_batch_loss=False):
+    #     # get loss in a batch-mode
 
-        # FIXME: tell me if this implementation is BUG or not.
-        if label_smooth > 0:
-            scores = log_softmax(logits)
-            loss = F.nll_loss(scores, targets) * (1 - label_smooth) - scores.mean() * label_smooth
-        else:
-            loss = F.cross_entropy(logits, targets)
-        return loss
-
-    def accuracy(self, targets, masks, outputs, mode='decoder'):
-        # get loss in a sequence-format to save computational time.
-        targets, outputs = with_mask(targets, outputs, masks.byte())
-        
-        if mode == 'decoder':
-            logits = self.decoder.out(outputs)
-        else:
-            logits = self.encoder.out(outputs)
-
-        preds = logits.max(-1)[1]
-        with torch.cuda.device_of(preds):
-            corrects = (preds == targets).float().tolist()
-
-        return corrects
-
-    def batched_cost(self, decoder_targets, decoder_masks, probs, return_batch_loss=False):
-        # get loss in a batch-mode
-
-        if decoder_targets.ndimension() == 2:  # batch x length
-            loss = -torch.log(probs + TINY).gather(2, decoder_targets[:, :, None])[:, :, 0]  # batch x length
-        else:
-            loss = -(torch.log(probs + TINY) * decoder_targets).sum(-1)
-        return self.apply_mask_cost(loss, decoder_masks, return_batch_loss)
+    #     if decoder_targets.ndimension() == 2:  # batch x length
+    #         loss = -torch.log(probs + TINY).gather(2, decoder_targets[:, :, None])[:, :, 0]  # batch x length
+    #     else:
+    #         loss = -(torch.log(probs + TINY) * decoder_targets).sum(-1)
+    #     return self.apply_mask_cost(loss, decoder_masks, return_batch_loss)
 

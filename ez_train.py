@@ -43,15 +43,16 @@ def valid_model(args, model, dev, print_out=False):
         # encoding
         encoding_outputs = model.encoding(source_inputs, source_masks)
         if args.causal_enc and args.encoder_lm:
-            outputs['accuracy'] += model.accuracy(source_outputs, source_masks, encoding_outputs[-1], 'encoder')
+            outputs['accuracy'] += model.io_enc.acc(source_outputs, source_masks, encoding_outputs[-1])
         
         # decoding
         decoding_outputs, out, probs = model.decoding(encoding_outputs, source_masks, target_inputs, target_masks, 
-                                                        decoding=True, return_probs=True)
+                                                      decoding=True, return_probs=True)
         
         # reverse to string-sequence
-        dev_outputs = [('src', source_outputs), ('trg', target_outputs), ('trg', decoding_outputs)]
-        dev_outputs = [model.output_decoding(d) for d in dev_outputs]
+        dev_outputs = [model.io_enc.reverse(source_outputs),
+                       model.io_dec.reverse(target_outputs),
+                       model.io_dec.reverse(decoding_outputs)]
         
         # compute sentence-level GLEU score 
         gleu = computeGLEU(dev_outputs[2], dev_outputs[1], corpus=False, tokenizer=debpe)
@@ -186,12 +187,12 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
 
             # Maximum Likelihood Training (with label smoothing trick)
             decoding_outputs = model.decoding(encoding_outputs, source_masks, target_inputs, target_masks)        
-            loss  = model.cost(target_outputs, target_masks, outputs=decoding_outputs, label_smooth=args.label_smooth)
+            loss  = model.io_dec.cost(target_outputs, target_masks, outputs=decoding_outputs, label_smooth=args.label_smooth)
             info['MLE'] += export(loss)
 
             # Source side Language Model (optional, only works for causal-encoder)
             if args.encoder_lm and args.causal_enc:
-                loss_lm = model.cost(source_outputs, source_masks, outputs=encoding_outputs[-1], mode='encoder')
+                loss_lm = model.io_enc.cost(source_outputs, source_masks, outputs=encoding_outputs[-1])
                 info['LM'] += export(loss_lm)
                 loss += loss_lm
 

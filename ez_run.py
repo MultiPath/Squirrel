@@ -86,6 +86,9 @@ parser.add_argument('--tensorboard', action='store_true', help='use TensorBoard'
 # arguments (:)
 args = parser.parse_args()
 
+if not os.path.exists(args.workspace_prefix):
+    os.mkdir(args.workspace_prefix)
+
 for d in ['models', 'runs', 'logs', 'decodes']:    # check the path
     if not os.path.exists(os.path.join(args.workspace_prefix, d)):
         os.mkdir(os.path.join(args.workspace_prefix, d))

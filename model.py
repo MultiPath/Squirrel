@@ -415,17 +415,28 @@ class PryIO(IO):
         self.deconv1 = nn.ConvTranspose1d(args.d_model, args.d_model, 2, 2)
     
     def expand(self, x):
-        b, l, t = x.size()
-        x = x.view(-1, t).contiguous().unsqueeze(-1)
-        x = self.deconv1(x)
-        return x.view(b, l, t, -1).contiguous()
+        S = x.size()
+        x = x.view(-1, S[-1]).contiguous().unsqueeze(-1)
+        #x = self.deconv1(x)
+        x = self.deconv1(F.relu(x))
+        return x.view(*S, -1).contiguous()
+
+    def o(self, x):
+        x = self.expand(x)
+        if x.dim() == 4:
+            x = x[:, :, :, 0] 
+        else:
+            x = x[:, :, 0]
+
+        return self.out(x)
 
     def cost(self, targets, masks, outputs, label_smooth=0.0):
-        targets, masks = shift(targets, 2), shift(masks, 2)
-        outputs = torch.cat([outputs.unsqueeze(-1), self.expand(outputs)], -1).transpose(3, 2)
+        targets, masks = shift(targets, 1), shift(masks, 1)
+        outputs = self.expand(outputs).transpose(3, 2)
+
         # print(targets.size(), masks.size(), outputs.size())
         targets, outputs = with_mask(targets, outputs, masks.byte())
-        logits = log_softmax(self.o(outputs))
+        logits = log_softmax(self.out(outputs))
         return F.nll_loss(logits, targets) * (1 - label_smooth) - logits.mean() * label_smooth
 
 
@@ -594,7 +605,7 @@ class Transformer(nn.Module):
         
         if args.pry_io:
             self.io_dec = PryIO(trg, args)
-            self.io_enc = PryIO(src, args)
+            self.io_enc = IO(src, args)
         else:
             self.io_dec = IO(trg, args)
             self.io_enc = IO(src, args)

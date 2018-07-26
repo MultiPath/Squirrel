@@ -30,7 +30,7 @@ You can simply download all the datasets and put them to your <DATA_DIR>.<br>
 currently included <br>
 
 WMT16 RO-EN (600K) <br>
-WMT16 EN-DE (4.5M) <br>
+WMT14 EN-DE (4.5M) <br>
 
 ------
 
@@ -110,14 +110,27 @@ python ez_run.py \
                 --causal_enc \         # (optional) if use, encoder uses causal attention (unidirectional)
                 --encoder_lm \         # (optional) if use, additional LM loss over encoder (requires "--causal_enc")
 ```
-Some ablation studies of different models can be found as follows:
+Some ablation studies of different models can be found as follows. For all cases, beam search uses beam_size=5, alpha=0.6.
+(1) For Ro-En experiments, we found that the label smoothing is quite important for Transformer.
+    We also try a model with causal encoder (with additional source side language model loss) which can achieve very close performance compared to a full attention model. 
 
-| WMT16 RO-EN | base, ls=0 | base, ls=0.1 | casual_enc + enc_lm, ls=0.1 |
+| WMT16 Ro-En | base, ls=0 | base, ls=0.1 | casual + lm, ls=0.1 |
 | :--- | :----: | :----: | :----: |
 | (dev) greedy | 32.82 | 34.16 | 33.78 |
-| (dev) beam=5   | 33.39 |  34.73    | 33.95 |
+| (dev) beam search   | 33.39 |  34.73    | 33.95 |
 | (test) greedy | 31.51 | 32.68 | 32.49 |
-| (test) beam=5  | 31.94 |  33.00    | 32.73 |
+| (test) beam search  | 31.94 |  **33.00**    | 32.73 |
+
+(2) For En-De, which is relavitely more challenging compared to Ro-En. Following (Vaswani et. al, 2017), we valid the model based on newstest2013, and test on newstest2014.
+
+ We argue that the batch_size is an important hyper-parameter for such large dataset. Since our code is currently not supporting multi-GPU training yet, large batch size is obtained by running multiple steps (for 15,000, we use batch_size=1500, inter_size=10) before updating the parameters. We also show the original performance noted in the Transformer paper, where the model used a batch size of 25,000, together with model-averaging.
+
+| WMT14 En-De | batch_size = 5000 | batch_size = 15000 | (Vaswani et. al, 2017)
+| :--- | :----: | :----: | :----: | 
+| (newstest2013) greedy   | 23.11 |   | - | 
+| (newstest2013) beam=5   | 23.62 |   | 25.8 |
+| (test) greedy           | 22.62 |   |  - |  
+| (test) beam=5           | 23.71 |   | 27.3 |
 
 # TODO
   Add more description about data processing/training/testing

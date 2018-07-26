@@ -22,7 +22,8 @@ python ez_run.py \
                 --label_smooth 0.1 \
                 --share_embeddings \
                 --tensorboard \
-                
+                --pry_io \
+                #--debug
                 #--cross_attn_fashion "reverse" \
                 #--debug
                 #--causal_enc \

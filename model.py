@@ -412,12 +412,18 @@ class PryIO(IO):
         super().__init__(field, args)
 
         # TODO: experimental: just have a try?
-        self.deconv1 = nn.ConvTranspose1d(args.d_model, args.d_model, 2, 2)
+        self.depth = args.pry_depth
+        self.deconv = nn.ModuleList([nn.ConvTranspose1d(args.d_model, args.d_model, 2, 2) for _ in range(self.depth))
     
     def expand(self, x):
         S = x.size()
         x = x.view(-1, S[-1]).contiguous().unsqueeze(-1)
-        x = self.deconv1(x)
+
+        for i in range(self.depth):
+            x = self.deconv[i](x)
+            if i != (self.depth - 1):
+                x = F.selu(x)
+
         # x = self.deconv1(F.relu(x))
         return x.view(*S, -1).contiguous()
 
@@ -431,7 +437,7 @@ class PryIO(IO):
         return self.out(x)
 
     def cost(self, targets, masks, outputs, label_smooth=0.0):
-        targets, masks = shift(targets, 1), shift(masks, 1)
+        targets, masks = shift(targets, 2 ** self.depth - 1), shift(masks, 2 ** self.depth - 1)
         outputs = self.expand(outputs).transpose(3, 2)
 
         # print(targets.size(), masks.size(), outputs.size())

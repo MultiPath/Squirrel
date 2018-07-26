@@ -417,8 +417,8 @@ class PryIO(IO):
     def expand(self, x):
         S = x.size()
         x = x.view(-1, S[-1]).contiguous().unsqueeze(-1)
-        #x = self.deconv1(x)
-        x = self.deconv1(F.relu(x))
+        x = self.deconv1(x)
+        # x = self.deconv1(F.relu(x))
         return x.view(*S, -1).contiguous()
 
     def o(self, x):

@@ -674,7 +674,7 @@ class Transformer(nn.Module):
             return out, softmax(self.io_dec.o(out))
         return out
 
-    def simultaneous_decoding(self, input_stream, mask_stream):
+    def simultaneous_decoding(self, input_stream, mask_stream, agent=None):
 
         assert self.args.cross_attn_fashion == 'forward', 'currently only forward'
         B, T0 = input_stream.size()
@@ -739,7 +739,10 @@ class Transformer(nn.Module):
             
 
             # random :: decision
-            actions = mask_stream.new_zeros(B, 1) > 0 #.uniform_(0, 1) > 0  # 1: write, 0: read
+            if agent is None: # random agent
+                actions = mask_stream.new_zeros(B, 1).uniform_(0, 1) > 0.8  # 1: write, 0: read
+            else:
+                actions = agent(encoding_outputs, decoding_outputs, preds)
 
             # TODO: (optional) if there is no more words left. you cannot read, only write.
             actions = actions | (mask_stream.gather(1, t_enc + 1) == 0)
@@ -761,7 +764,7 @@ class Transformer(nn.Module):
 
             # print(actions[0, 0].item(), t_dec[0, 0].item(), 
             #       self.fields['trg'].vocab.itos[outputs[0, t+1].item()])
-            
+
             # gather data
             output_stream.scatter_(1, t_dec, outputs[:, t+1:t+2])
 
@@ -771,3 +774,6 @@ class Transformer(nn.Module):
         return output_stream[:, 1:]
         
 
+class Agent(nn.Module):
+
+    pass

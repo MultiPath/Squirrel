@@ -84,6 +84,10 @@ parser.add_argument('--beam_size',     type=int,   default=1, help='beam-size us
 parser.add_argument('--alpha',         type=float, default=1, help='length normalization weights')
 parser.add_argument('--no_bpe', action='store_true', help='do not output BPE in the decoding mode.')
 
+# Learning to Translation in Real-Time
+parser.add_argument('--real_time', action='store_true', help='real-time translation.')
+
+
 # model saving/reloading, output translations
 parser.add_argument('--load_from',     type=str, default=None, help='load from checkpoint')
 parser.add_argument('--resume',        action='store_true', help='when loading from the saved model, it resumes from that.')
@@ -226,7 +230,7 @@ hparams = None
 if args.params == 'james-iwslt':
     hparams = {'d_model': 278, 'd_hidden': 507, 'n_layers': 5,
                 'n_heads': 2, 'drop_ratio': 0.079, 'warmup': 746} # ~32
-elif args.param == 't2t-base':
+elif args.params == 't2t-base':
     logger.info('use default parameters of t2t-base')  # t2t-base, 512-2048-6
     hparams = {'d_model': 512, 'd_hidden': 2048, 'n_layers': 6,
                 'n_heads': 8, 'drop_ratio': 0.1, 'warmup': 16000} # ~32

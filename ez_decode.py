@@ -24,6 +24,7 @@ def cutoff(s, t):
 
 
 def decode_model(args, model, dev, evaluate=True, decoding_path=None, names=None, maxsteps=None):
+    print_seqs = ['[sources]', '[targets]', '[decoded]']
 
     args.logger.info("decoding beam-search: beam_size={}, alpha={}".format(args.beam_size, args.alpha))
     dev.train = False  # make iterator volatile=True
@@ -57,16 +58,28 @@ def decode_model(args, model, dev, evaluate=True, decoding_path=None, names=None
         source_inputs, source_outputs, source_masks, \
         target_inputs, target_outputs, target_masks = model.prepare_data(dev_batch)
         
-        # encoding
-        encoding_outputs = model.encoding(source_inputs, source_masks)
+        if not args.real_time:
+            # encoding
+            encoding_outputs = model.encoding(source_inputs, source_masks)
 
-        # decoding
-        decoding_outputs = model.decoding(encoding_outputs, source_masks, target_inputs, target_masks, 
-                                        beam=args.beam_size, alpha=args.alpha, decoding=True, return_probs=False)
-        
+            # decoding
+            decoding_outputs = model.decoding(encoding_outputs, source_masks, target_inputs, target_masks, 
+                                            beam=args.beam_size, alpha=args.alpha, decoding=True, return_probs=False)
+        else:
+            # currently only supports simultaneous greedy decoding
+            decoding_outputs = model.simultaneous_decoding(source_inputs, source_masks)
+
+
         # reverse to string-sequence
-        dev_outputs = [('src', source_outputs), ('trg', target_outputs), ('trg', decoding_outputs)]
-        dev_outputs = [model.output_decoding(d) for d in dev_outputs]
+        dev_outputs = [model.io_enc.reverse(source_outputs),
+                       model.io_dec.reverse(target_outputs),
+                       model.io_dec.reverse(decoding_outputs)]
+
+        # for j in range(source_inputs.size(0)):
+        #     for k, d in enumerate(dev_outputs):
+        #         args.logger.info("{}: {}".format(print_seqs[k], d[j]))
+        #     args.logger.info("-----------------------------------")
+        #     1/0
 
         used_t = time.time() - start_t
         curr_time += used_t
@@ -93,4 +106,5 @@ def decode_model(args, model, dev, evaluate=True, decoding_path=None, names=None
     if evaluate:
         corpus_bleu = computeBLEU(dec_outputs, trg_outputs, corpus=True, tokenizer=debpe)
         args.logger.info("The dev-set corpus BLEU = {}".format(corpus_bleu))
+
 

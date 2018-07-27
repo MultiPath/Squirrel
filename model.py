@@ -29,9 +29,10 @@ def positional_encodings_like(x, t=None):   # hope to be differentiable
         positions = torch.arange(0, x.size(-2)) # .expand(*x.size()[:2])
         if x.is_cuda:
             positions = positions.cuda(x.get_device())
-        positions = Variable(positions.float())
+        positions = Variable(positions)
     else:
         positions = t
+    positions = positions.float()
 
     # channels
     channels = torch.arange(0, x.size(-1), 2) / x.size(-1) # 0 2 4 6 ... (256)
@@ -673,24 +674,100 @@ class Transformer(nn.Module):
             return out, softmax(self.io_dec.o(out))
         return out
 
-    # def apply_mask(self, inputs, mask, p=1):
-    #     outputs = inputs * mask + (1 + (-1) * mask) * p
-    #     return outputs
+    def simultaneous_decoding(self, input_stream, mask_stream):
 
-    # def apply_mask_cost(self, loss, mask, return_batch_loss=False):
-    #     cost = (loss * mask).sum() / (mask.sum() + TINY)
-    #     if not return_batch_loss:
-    #         return cost
+        assert self.args.cross_attn_fashion == 'forward', 'currently only forward'
+        B, T0 = input_stream.size()
+        T = T0 * (1 + self.args.length_ratio)
 
-    #     loss = loss.sum(1, keepdim=True) / (TINY + mask.sum(1, keepdim=True))
-    #     return cost, loss
+        # (simulated) input stream
+        input_stream = torch.cat([input_stream, input_stream.new_zeros(B, T - T0 + 1)], 1)  # extended 
+        mask_stream  = torch.cat([mask_stream,  mask_stream.new_zeros(B, T - T0 + 1)], 1)  # extended
+        output_stream = input_stream.new_zeros(B, T + 1).fill_(self.fields['trg'].vocab.stoi['<pad>'])
 
-    # def batched_cost(self, decoder_targets, decoder_masks, probs, return_batch_loss=False):
-    #     # get loss in a batch-mode
+        # prepare blanks.
+        inputs  = input_stream.new_zeros(B, T + 1).fill_(self.fields['src'].vocab.stoi['<init>'])  # inputs
+        outputs = input_stream.new_zeros(B, T + 1).fill_(self.fields['trg'].vocab.stoi['<init>'])  # outputs
+        
+        inputs_mask  = mask_stream.new_zeros(B, T + 1)
+        outputs_mask = mask_stream.new_zeros(B, T + 1)
 
-    #     if decoder_targets.ndimension() == 2:  # batch x length
-    #         loss = -torch.log(probs + TINY).gather(2, decoder_targets[:, :, None])[:, :, 0]  # batch x length
-    #     else:
-    #         loss = -(torch.log(probs + TINY) * decoder_targets).sum(-1)
-    #     return self.apply_mask_cost(loss, decoder_masks, return_batch_loss)
+        encoding_outputs = [input_stream.new_zeros(B, T, self.args.d_model).float() 
+                            for _ in range(self.args.n_layers + 1)]
+        decoding_outputs = [input_stream.new_zeros(B, T, self.args.d_model).float()
+                            for _ in range(self.args.n_layers + 1)]
+
+        t_enc = input_stream.new_zeros(B, 1)
+        t_dec = input_stream.new_zeros(B, 1)
+        eos_yet = input_stream.new_zeros(B, 1).byte()  # stopping mark
+
+
+        # start real-time translation (please be careful..slow)
+        inputs_mask[:, 0]  = 1
+        outputs_mask[:, 0] = 1
+        
+        for t in range(T):
+
+            # encoding
+            encoding_outputs[0][:, t:t+1] = self.io_enc.i(inputs[:, t:t+1], pos=False) 
+            encoding_outputs[0][:, t:t+1] += positional_encodings_like(encoding_outputs[0][:, t:t+1], t_enc)
+            encoding_outputs[0][:, t:t+1] = self.encoder.dropout(encoding_outputs[0][:, t:t+1])
+
+            for l in range(self.args.n_layers):
+                encoding_outputs[l + 1][:, t:t+1] = self.encoder.layers[l].feedforward(
+                    self.encoder.layers[l].selfattn(
+                        encoding_outputs[l][:, t:t+1], 
+                        encoding_outputs[l][:, :t+1], 
+                        encoding_outputs[l][:, :t+1], 
+                        inputs_mask[:, :t+1]))
+
+            # decoding
+            decoding_outputs[0][:, t:t+1] = self.io_dec.i(outputs[:, t:t+1], pos=False)
+            decoding_outputs[0][:, t:t+1] += positional_encodings_like(decoding_outputs[0][:, t:t+1], t_dec)
+            decoding_outputs[0][:, t:t+1] = self.decoder.dropout(decoding_outputs[0][:, t:t+1])
+
+            for l in range(self.args.n_layers):
+                x = decoding_outputs[l][:, :t+1]
+                x = self.decoder.layers[l].selfattn(decoding_outputs[l][:, t:t+1], x, x, outputs_mask[:, :t+1])
+                decoding_outputs[l + 1][:, t:t+1] = self.decoder.layers[l].feedforward(
+                    self.decoder.layers[l].crossattn(
+                        x, encoding_outputs[l + 1][:, :t+1], 
+                        encoding_outputs[l + 1][:, :t+1], 
+                        inputs_mask[:, :t+1]))
+
+            preds = self.io_dec.o(decoding_outputs[-1][:, t:t+1]).max(-1)[1]
+            
+
+            # random :: decision
+            actions = mask_stream.new_zeros(B, 1) > 0 #.uniform_(0, 1) > 0  # 1: write, 0: read
+
+            # TODO: (optional) if there is no more words left. you cannot read, only write.
+            actions = actions | (mask_stream.gather(1, t_enc + 1) == 0)
+
+            # update decoder
+            t_dec += actions.long()
+            outputs_mask[:, t:t+1] = actions.float()
+            outputs_mask[:, t+1] = 1
+            preds = preds * actions.long() + outputs[:, t:t+1] * (1 - actions.long())  # if not write, keep the previous word.
+            preds[eos_yet] = self.fields['trg'].vocab.stoi['<pad>']
+            outputs[:, t+1:t+2] = preds
+            
+            eos_yet = eos_yet | ((preds == self.fields['trg'].vocab.stoi['<eos>']) & actions)
+
+            # update encoder
+            t_enc += 1 - actions.long()
+            inputs_mask[:, t+1:t+2] = mask_stream.gather(1, t_enc) * (1 - actions.float())
+            inputs[:, t+1:t+2] = input_stream.gather(1, t_enc) 
+
+            # print(actions[0, 0].item(), t_dec[0, 0].item(), 
+            #       self.fields['trg'].vocab.itos[outputs[0, t+1].item()])
+            
+            # gather data
+            output_stream.scatter_(1, t_dec, outputs[:, t+1:t+2])
+
+            if eos_yet.all():
+                break
+
+        return output_stream[:, 1:]
+        
 

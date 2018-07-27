@@ -22,7 +22,11 @@ python ez_run.py \
                 --label_smooth 0.1 \
                 --share_embeddings \
                 --tensorboard \
-                --pry_io \
+                --cross_attn_fashion "reverse" \
+
+                # --pry_io \
+                # --pry_depth 2 \
+                #--debug
                 #--debug
                 #--cross_attn_fashion "reverse" \
                 #--debug

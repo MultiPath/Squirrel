@@ -413,7 +413,7 @@ class PryIO(IO):
 
         # TODO: experimental: just have a try?
         self.depth = args.pry_depth
-        self.deconv = nn.ModuleList([nn.ConvTranspose1d(args.d_model, args.d_model, 2, 2) for _ in range(self.depth))
+        self.deconv = nn.ModuleList([nn.ConvTranspose1d(args.d_model, args.d_model, 2, 2) for _ in range(self.depth)])
     
     def expand(self, x):
         S = x.size()
@@ -424,7 +424,6 @@ class PryIO(IO):
             if i != (self.depth - 1):
                 x = F.selu(x)
 
-        # x = self.deconv1(F.relu(x))
         return x.view(*S, -1).contiguous()
 
     def o(self, x):
@@ -503,6 +502,13 @@ class Decoder(nn.Module):
     def greedy(self, io_dec, encoding, mask_src=None, mask_trg=None):
 
         encoding = encoding[1:]
+        if self.cross_attn_fashion == 'reverse':
+            encoding = encoding[::-1]
+        elif self.cross_attn_fashion == 'last_layer':
+            encoding = [encoding[-1] for _ in len(self.layers)]
+        else:
+            pass
+        
         B, T, C = encoding[0].size()  # batch-size, decoding-length, size
         T *= self.length_ratio
 
@@ -537,6 +543,14 @@ class Decoder(nn.Module):
 
     def beam_search(self, io_dec, encoding, mask_src=None, mask_trg=None, width=2, alpha=0.6):  # width: beamsize, alpha: length-norm
         encoding = encoding[1:]
+
+        if self.cross_attn_fashion == 'reverse':
+            encoding = encoding[::-1]
+        elif self.cross_attn_fashion == 'last_layer':
+            encoding = [encoding[-1] for _ in len(self.layers)]
+        else:
+            pass
+        
         W = width
         B, T, C = encoding[0].size()
 

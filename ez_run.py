@@ -43,7 +43,15 @@ parser.add_argument('--test_set', type=str, default=None,  help='which test set 
 
 # model basic settings
 parser.add_argument('--prefix', type=str, default='[time]',      help='prefix to denote the model, nothing or [time]')
-parser.add_argument('--params', type=str, default='james-iwslt', help='pamarater sets: james-iwslt, t2t-base, etc')
+parser.add_argument('--params', type=str, default='customize', help='pamarater sets: james-iwslt, t2t-base')
+
+# customize
+parser.add_argument('--d_model',  type=int, default=512,   help='basic parameter of the model size')
+parser.add_argument('--d_hidden', type=int, default=2048,  help='used in feedforward network')
+parser.add_argument('--warmup',   type=int, default=16000, help='warming-up steps during training')
+parser.add_argument('--n_layers', type=int, default=6,     help='number of encoder-decoder')
+parser.add_argument('--n_heads',  type=int, default=8,     help='number of heads for multi-head attention')
+parser.add_argument('--drop_ratio', type=float, default=0.1, help='dropout ratio')
 
 # model ablation settings
 parser.add_argument('--causal_enc', action='store_true', help='use unidirectional encoder (useful for real-time translation)')
@@ -218,10 +226,14 @@ hparams = None
 if args.params == 'james-iwslt':
     hparams = {'d_model': 278, 'd_hidden': 507, 'n_layers': 5,
                 'n_heads': 2, 'drop_ratio': 0.079, 'warmup': 746} # ~32
-else:
+elif args.param == 't2t-base':
     logger.info('use default parameters of t2t-base')  # t2t-base, 512-2048-6
     hparams = {'d_model': 512, 'd_hidden': 2048, 'n_layers': 6,
                 'n_heads': 8, 'drop_ratio': 0.1, 'warmup': 16000} # ~32
+else:
+    logger.info("following the user setting.")
+
+
 args.__dict__.update(hparams)
 
 

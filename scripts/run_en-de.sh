@@ -14,14 +14,15 @@ python ez_run.py \
                 --dev_set   "newstest2013.tok.bpe.32000"   \
                 --test_set  "newstest2014.tok.bpe.32000"  \
                 --load_lazy \
-                --workspace_prefix "/data0/workspace/squirrel/" \
-                --params "t2t-base" \
+                --workspace_prefix "/data0/workspace/squirrel_io/" \
                 --eval_every 500  \
-                --batch_size 1250 \
-                --inter_size 4 \
+                --batch_size 1500 \
+                --inter_size 16 \
+                --warmup 8000 \
                 --label_smooth 0.1 \
                 --share_embeddings \
                 --tensorboard \
-                --beam 5 \
+                #--debug
+                #--beam 5 \
                 
 

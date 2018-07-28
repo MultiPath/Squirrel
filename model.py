@@ -492,7 +492,7 @@ class Decoder(nn.Module):
         if self.cross_attn_fashion == 'reverse':
             encoding = encoding[1:][::-1]
         elif self.cross_attn_fashion == 'last_layer':
-            encoding = [encoding[-1] for _ in len(self.layers)]
+            encoding = [encoding[-1] for _ in range(len(self.layers))]
         else:
             pass
 
@@ -506,7 +506,7 @@ class Decoder(nn.Module):
         if self.cross_attn_fashion == 'reverse':
             encoding = encoding[::-1]
         elif self.cross_attn_fashion == 'last_layer':
-            encoding = [encoding[-1] for _ in len(self.layers)]
+            encoding = [encoding[-1] for _ in range(len(self.layers))]
         else:
             pass
         
@@ -548,7 +548,7 @@ class Decoder(nn.Module):
         if self.cross_attn_fashion == 'reverse':
             encoding = encoding[::-1]
         elif self.cross_attn_fashion == 'last_layer':
-            encoding = [encoding[-1] for _ in len(self.layers)]
+            encoding = [encoding[-1] for _ in range(len(self.layers))]
         else:
             pass
         
@@ -740,7 +740,7 @@ class Transformer(nn.Module):
 
             # random :: decision
             if agent is None: # random agent
-                actions = mask_stream.new_zeros(B, 1).uniform_(0, 1) > 0.8  # 1: write, 0: read
+                actions = mask_stream.new_zeros(B, 1).uniform_(0, 1) > 0.9  # 1: write, 0: read
             else:
                 actions = agent(encoding_outputs, decoding_outputs, preds)
 

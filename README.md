@@ -11,6 +11,8 @@ Popel, Martin, and Ondřej Bojar. "Training Tips for the Transformer Model."
 The Prague Bulletin of Mathematical Linguistics 110.1 (2018): 43-70.
 (https://ufal.mff.cuni.cz/pbml/110/art-popel-bojar.pdf)
 
+Gu, Jiatao, Graham Neubig, Kyunghyun Cho, and Victor OK Li. "Learning to translate in real-time with neural machine translation." arXiv preprint arXiv:1610.00388 (2016).
+
 ------
 
 **Requirements**: <br>

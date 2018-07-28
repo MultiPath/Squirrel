@@ -217,16 +217,27 @@ else:
 
 
 # batch-iterator
-train_real, dev_real = data.BucketIterator.splits(
-    (train_data, dev_data), batch_sizes=(args.batch_size, args.batch_size), 
-    device=args.device, batch_size_fn=batch_size_fn, 
-    repeat=None if args.mode == 'train' else False,
-    shuffle=(not args.load_lazy))
-logger.info("build the dataset. done!")
+if train_data is not None:
+    logger.info("build the training set.")
+    train_real = data.BucketIterator(train_data, batch_size=args.batch_size, device=args.device,
+                                    batch_size_fn=batch_size_fn, train=True, 
+                                    repeat=None if args.mode == 'train' else False,
+                                    shuffle=(not args.load_lazy))
+if dev_data is not None:
+    logger.info("build the validation set.")
+    dev_real = data.BucketIterator(dev_data, batch_size=args.batch_size * 4, device=args.device,
+                                    batch_size_fn=batch_size_fn, train=False)
+    
+if test_data is not None: 
+    logger.info("build the testing set.")   
+    test_real = data.BucketIterator(test_data, batch_size=args.batch_size * 8, device=args.device,
+                                    batch_size_fn=batch_size_fn, train=False)
+
+
 # ----------------------------------------------------------------------------------------------------------------- #
 
 # model hyper-params:
-hparams = None
+hparams = {}
 if args.params == 'james-iwslt':
     hparams = {'d_model': 278, 'd_hidden': 507, 'n_layers': 5,
                 'n_heads': 2, 'drop_ratio': 0.079, 'warmup': 746} # ~32
@@ -254,6 +265,10 @@ model_name = os.path.join(args.workspace_prefix, 'models', args.prefix + hp_str)
 # build the model
 model = Transformer(SRC, TRG, args)
 logger.info(str(model))
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+logger.info("total trainable parameters: {}".format(count_parameters(model)))
 
 # use GPU 
 if args.gpu > -1:
@@ -294,6 +309,6 @@ elif args.mode == 'test':
              '{}.trg.{}'.format(args.test_set, name_suffix),
              '{}.dec.{}'.format(args.test_set, name_suffix)]
     with torch.no_grad():   
-        decode_model(args, model, dev_real, evaluate=True, decoding_path=decoding_path, names=names)
+        decode_model(args, model, test_real, evaluate=True, decoding_path=decoding_path, names=names)
 
 logger.info("done.")

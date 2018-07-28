@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 import numpy as np
 import os
 
@@ -374,4 +375,5 @@ def merge_cache(decoding_path, names0, last_epoch=0, max_cache=20):
         code = 'cat {} > {}.train.{}'.format(" ".join(filenames), '{}/{}'.format(decoding_path, name), last_epoch)
         os.system(code)
     os.remove(decoding_path + '/_temp_decode')
+
 

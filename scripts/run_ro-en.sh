@@ -22,7 +22,7 @@ python ez_run.py \
                 --label_smooth 0.1 \
                 --share_embeddings \
                 --tensorboard \
-                --cross_attn_fashion "reverse" \
+                --cross_attn_fashion "last_layer" \
 
                 # --pry_io \
                 # --pry_depth 2 \

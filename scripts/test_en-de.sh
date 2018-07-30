@@ -11,11 +11,11 @@ python ez_run.py \
                 --dataset "wmt16" \
                 --src "en" --trg "de" \
                 --train_set "train.tok.clean.bpe.32000.shuf" \
-                --dev_set   "newstest2013.tok.bpe.32000"   \
+                --dev_set   "newstest2014.tok.bpe.32000"   \
                 --test_set  "newstest2014.tok.bpe.32000"  \
                 --load_lazy \
                 --workspace_prefix "/data0/workspace/squirrel/" \
-                --load_from "07.24_12.01.wmt16_t2t-base_en_de_w_0.1_5000" \
+                --load_from "07.24_14.20.wmt16_t2t-base_en_de_w_0.1_15000" \
                 --params "t2t-base" \
                 --batch_size 12500 \
                 --share_embeddings \

@@ -23,7 +23,8 @@ python ez_run.py \
                 --share_embeddings \
                 --tensorboard \
                 --cross_attn_fashion "forward" \
-                --debug
+                
+                #--debug
 
                 # --pry_io \
                 # --pry_depth 2 \

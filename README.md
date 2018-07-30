@@ -161,12 +161,12 @@ Based on our observation, in the our implementation, "forward" attention works b
 
  We argue that the batch_size is an important hyper-parameter for such large dataset. Since our code is currently not supporting multi-GPU training yet, large batch size is obtained by running multiple steps (for 15,000, we use batch_size=1500, inter_size=10) before updating the parameters. We also show the original performance noted in the Transformer paper, where the model used a batch size of 25,000, together with model-averaging.
 
-| WMT14 En-De | batch_size = 5000 | batch_size = 15000 | (Vaswani et. al, 2017)
+| WMT14 En-De | bs = 5000 | bs = 15000 | (Vaswani et. al, 2017)
 | :--- | :----: | :----: | :----: | 
-| (newstest2013) greedy   | 23.11 |   | - | 
-| (newstest2013) beam=5   | 23.62 |   | 25.8 |
-| (test) greedy           | 22.62 |   |  - |  
-| (test) beam=5           | 23.71 |   | 27.3 |
+| (newstest2013) greedy   | 23.11 |  24.95 | - | 
+| (newstest2013) beam=5   | 23.62 |  25.14 | 25.8 |
+| (newstest2014) greedy           | 22.62 |  24.92 |  - |  
+| (newstest2014) beam=5           | 23.71 |  25.97 | 27.3 |
 
 # TODO
   Add more description about data processing/training/testing

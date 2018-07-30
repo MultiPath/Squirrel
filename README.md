@@ -47,7 +47,6 @@ python ez_run.py \
                 --trg "en" \
                 --train_set "train.bpe" \
                 --dev_set   "dev.bpe"   \
-                --test_set  "test.bpe"  \
                 --char # (optional) if use, build the character-level vocabulary.
 ```
 
@@ -69,10 +68,9 @@ python ez_run.py \
                 --trg "en" \
                 --train_set "train.bpe" \
                 --dev_set   "dev.bpe"   \
-                --test_set  "test.bpe"  \
                 --load_lazy  \         # (recommended) suitable for Large corpus. Pre-shuffling the dataset is required.
                 --workspace_prefix <MODEL_DIR> \  # where you save models, states, and logs.
-                --params "t2t-base" \  # d_model=512, d_ff=2048, n_h=8, n_l=6, warmup=16000
+                --params "t2t-base" \  # d_model=512, d_ff=2048, n_h=8, n_l=6, warmup=16,000
                 --eval_every 500 \
                 --batch_size 1200 \    # the actual batch-size=1200*3=3600
                 --inter_size 3 \      
@@ -85,10 +83,29 @@ python ez_run.py \
                 --tensorboard \
                 --debug                # (optional) if use, no saving tensorboard.
 ```
+
+The code will automatically record in <MODEL_DIR> respectively in: <br>
+<MODEL_DIR>/logs/log-[time].txt      (detailed logs, easy to check the parameter settings.) <br>
+<MODEL_DIR>/models/<MODEL_NAME>.pt   (models and running states. Automatically save the best model achieved highest score on the dev-set.) <br>
+<MODEL_DIR>/runs/<MODEL_NAME>        (tensorboard data used for visualization. Only works when --debug is not used.) <br>
+
+**Use Tensorboard** <br>
+Make sure to install *tensorflow* and *tensorboardX* first.
+
+Make sure not to use --debug argument.
+
+```shell
+tensorboard --logdir=<MODEL_DIR>/runs --port=<YOUR_PORT>
+```
+Please see the following examples for the experiments of WMT En-De:
+
+<img src="https://github.com/MultiPath/Squirrel/raw/master/sandbox/tensorboard_example.jpeg" alt="GitHub" title="Tensorboard" height="365" />
+
+
 ------
 
 **Decoding** <br>
-decode from the pretrained NMT model. In default, decode from the dev set using beam-search (beam size=5, alpha=0.6)
+decode from the pretrained NMT model. In default, decode from the dev set using beam-search (beam size=5, alpha=0.6).
 ```shell
 python ez_run.py \
                 --prefix [time]  \
@@ -98,8 +115,6 @@ python ez_run.py \
                 --dataset "wmt16" \
                 --src "ro" \
                 --trg "en" \
-                --train_set "train.bpe" \
-                --dev_set   "dev.bpe"   \
                 --test_set  "test.bpe"  \
                 --workspace_prefix <MODEL_DIR> \  # where you save models, states, and logs.
                 --load_from <MODEL_PATH>  # pretrained model
@@ -112,6 +127,7 @@ python ez_run.py \
                 --causal_enc \         # (optional) if use, encoder uses causal attention (unidirectional)
                 --encoder_lm \         # (optional) if use, additional LM loss over encoder (requires "--causal_enc")
 ```
+
 Some ablation studies of different models can be found as follows. For all cases, beam search uses beam_size=5, alpha=0.6.
 (1) For Ro-En experiments, we found that the label smoothing is quite important for Transformer.
     We also try a model with causal encoder (with additional source side language model loss) which can achieve very close performance compared to a full attention model. 

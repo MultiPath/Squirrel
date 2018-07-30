@@ -22,7 +22,8 @@ python ez_run.py \
                 --label_smooth 0.1 \
                 --share_embeddings \
                 --tensorboard \
-                --cross_attn_fashion "last_layer" \
+                --cross_attn_fashion "forward" \
+                --debug
 
                 # --pry_io \
                 # --pry_depth 2 \

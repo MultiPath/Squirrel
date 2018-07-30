@@ -106,7 +106,7 @@ for d in ['models', 'runs', 'logs', 'decodes']:    # check the path
     if not os.path.exists(os.path.join(args.workspace_prefix, d)):
         os.mkdir(os.path.join(args.workspace_prefix, d))
 if args.prefix == '[time]':
-    args.prefix = strftime("%m.%d_%H.%M.", gmtime())
+    args.prefix = strftime("%m.%d_%H.%M.%S.", gmtime())
 
 # setup logger settings
 logger = logging.getLogger()
@@ -268,7 +268,7 @@ logger.info(str(model))
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
-logger.info("total trainable parameters: {}".format(count_parameters(model)))
+logger.info("total trainable parameters: {}".format(format(count_parameters(model),',')))
 
 # use GPU 
 if args.gpu > -1:

@@ -116,6 +116,9 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
     total_tokens = 0
     train = iter(train)
     
+    # save the arguments
+    # torch.save(args, '{}.pt.options'.format(args.model_name))
+
     while True:
 
         # --- saving --- #
@@ -203,7 +206,7 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
         opt.step()
         total_tokens += info['tokens']
 
-        info_str += '{} sents/{} tokens, total {} tokens, '.format(info['sents'], info['tokens'], total_tokens)
+        info_str += '{} sents/{} tokens, total {} tokens, '.format(info['sents'], info['tokens'], format(total_tokens, ','))
         info_str += 'MLE_loss={:.3f}, '.format(info['MLE'] / args.inter_size)
         if args.encoder_lm and args.causal_enc:
             info_str += 'ENCLM_loss={:.3f}, '.format(info['LM'] / args.inter_size)

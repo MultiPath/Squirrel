@@ -226,7 +226,7 @@ class LazyParallelDataset(datasets.TranslationDataset):
         train_data = None if train is None else cls(path + train, lazy=True, **kwargs)
         val_data = None if validation is None else cls(path + validation, lazy=False, **kwargs)
         test_data = None if test is None else cls(path + test, lazy=False, **kwargs)
-        return tuple(d for d in (train_data, val_data, test_data) if d is not None)
+        return train_data, val_data, test_data
 
 
 

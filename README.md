@@ -72,7 +72,7 @@ python ez_run.py \
                 --workspace_prefix <MODEL_DIR> \  # where you save models, states, and logs.
                 --params "t2t-base" \  # d_model=512, d_ff=2048, n_h=8, n_l=6, warmup=16,000
                 --eval_every 500 \
-                --batch_size 1200 \    # the actual batch-size=1200*3=3600
+                --batch_size 1200 \    # the actual batch-size=1200*3=3600, for validation, it is batch_size x 4 in default.
                 --inter_size 3 \      
                 --label_smooth 0.1 \   # (optional) if > 0.1, use label-smoothing when training
                 --share_embeddings \   # (optional) if use, source and target share the same vocabulary.
@@ -84,10 +84,12 @@ python ez_run.py \
                 --debug                # (optional) if use, no saving tensorboard.
 ```
 
-The code will automatically record in <MODEL_DIR> respectively in: <br>
-<MODEL_DIR>/logs/log-[time].txt      (detailed logs, easy to check the parameter settings.) <br>
-<MODEL_DIR>/models/<MODEL_NAME>.pt   (models and running states. Automatically save the best model achieved highest score on the dev-set.) <br>
-<MODEL_DIR>/runs/<MODEL_NAME>        (tensorboard data used for visualization. Only works when --debug is not used.) <br>
+The code will automatically record in <MODEL_DIR> respectively in: 
+```
+<MODEL_DIR>/logs/log-[time].txt      #detailed logs, easy to check the parameter settings.
+<MODEL_DIR>/models/<MODEL_NAME>.pt   #models and running states. Automatically save the best model achieved highest score on the dev-set.
+<MODEL_DIR>/runs/<MODEL_NAME>        #tensorboard data used for visualization. Only works when --debug is not used.
+```
 
 **Use Tensorboard** <br>
 Make sure to install *tensorflow* and *tensorboardX* first.
@@ -105,7 +107,9 @@ Please see the following examples for the experiments of WMT En-De:
 ------
 
 **Decoding** <br>
-decode from the pretrained NMT model. In default, decode from the dev set using beam-search (beam size=5, alpha=0.6).
+decode from the pretrained NMT model. In default, decode from the dev set using beam-search (beam size=5, alpha=0.6). <br>
+please check the saved the log to make sure the testing model has the same options as training.
+
 ```shell
 python ez_run.py \
                 --prefix [time]  \
@@ -119,25 +123,38 @@ python ez_run.py \
                 --workspace_prefix <MODEL_DIR> \  # where you save models, states, and logs.
                 --load_from <MODEL_PATH>  # pretrained model
                 --params "t2t-base" \  # d_model=512, d_ff=2048, n_h=8, n_l=6, warmup=16000
-                --batch_size 12000 \   # 
+                --batch_size 1250 \    # in default we use batch_size x 8 as the actual batch-size.
                 --beam 5 \
-                --alpha 0.6 \
+                --alpha 0.6 \          # hyper-parameter for length-penalty
                 --share_embeddings \   # (optional) if use, source and target share the same vocabulary.
                 --char \               # (optional) if use, train the character-level instead of bpe-level. 
                 --causal_enc \         # (optional) if use, encoder uses causal attention (unidirectional)
                 --encoder_lm \         # (optional) if use, additional LM loss over encoder (requires "--causal_enc")
+                --cross_attn_fashion "forward" \ # (optional) ["forward", "reverse", "last_layer"], in default "forward", 
 ```
 
-Some ablation studies of different models can be found as follows. For all cases, beam search uses beam_size=5, alpha=0.6.
+Some ablation studies of different models can be found as follows. For all cases, beam search uses beam_size=5, alpha=0.6. <br>
 (1) For Ro-En experiments, we found that the label smoothing is quite important for Transformer.
     We also try a model with causal encoder (with additional source side language model loss) which can achieve very close performance compared to a full attention model. 
 
-| WMT16 Ro-En | base, ls=0 | base, ls=0.1 | casual + lm, ls=0.1 |
+| WMT16 Ro-En | base, ls=0 | base, ls=0.1 |  casual, ls=0.1 | casual + lm, ls=0.1 |
+| :--- | :----: | :----: | :----: | :----: |
+| (dev) greedy | 32.82 | 34.16 | 33.26 | 33.78 |
+| (dev) beam search   | 33.39 |  34.73  | 33.74 | 33.95 |
+| (test) greedy | 31.51 | 32.68 | 31.70 | 32.49 |
+| (test) beam search  | 31.94 |  **33.00**  | 32.12 | 32.73 |
+
+<!-- We also have an interesting comparison with different cross-attention fashion for Ro-En. In the typical Transformer model (assuming n_layers=6), <br>
+"forward": decoder layer l attends to encoder layer l <br>
+"reverse": decoder layer l attends to encoder layer 6 - l <br>
+"last_layer": decoder layer always attends to encoder layer 6 (suggested in the original (Vaswani et. al, 2017))
+
+| WMT16 Ro-En | forward| reverse | last_layer |
 | :--- | :----: | :----: | :----: |
-| (dev) greedy | 32.82 | 34.16 | 33.78 |
-| (dev) beam search   | 33.39 |  34.73    | 33.95 |
-| (test) greedy | 31.51 | 32.68 | 32.49 |
-| (test) beam search  | 31.94 |  **33.00**    | 32.73 |
+| (dev) greedy | 32.68 | crashed |  |
+| (dev) beam search   | **33.00** |  crashed    | |
+
+Based on our observation, in the our implementation, "forward" attention works better than the default version, and "reverse" attention will crash before converge. -->
 
 (2) For En-De, which is relavitely more challenging compared to Ro-En. Following (Vaswani et. al, 2017), we valid the model based on newstest2013, and test on newstest2014.
 

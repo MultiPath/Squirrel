@@ -486,30 +486,27 @@ class Decoder(nn.Module):
         self.positional = positional
         self.cross_attn_fashion = args.cross_attn_fashion
 
-    def forward(self, x, encoding, mask_src=None, mask_trg=None):
-
-        x = self.dropout(x)
+    def prepare_encoder(self, encoding):
         if self.cross_attn_fashion == 'reverse':
             encoding = encoding[1:][::-1]
         elif self.cross_attn_fashion == 'last_layer':
             encoding = [encoding[-1] for _ in range(len(self.layers))]
         else:
-            pass
+            encoding = encoding[1:]
+        return encoding
 
-        for l, (layer, enc) in enumerate(zip(self.layers, encoding[1:])):
+    def forward(self, x, encoding, mask_src=None, mask_trg=None):
+
+        x = self.dropout(x)
+        encoding = self.prepare_encoder(encoding)
+
+        for l, (layer, enc) in enumerate(zip(self.layers, encoding)):
             x = layer(x, enc, mask_src=mask_src, mask_trg=mask_trg)
         return x
 
     def greedy(self, io_dec, encoding, mask_src=None, mask_trg=None):
 
-        encoding = encoding[1:]
-        if self.cross_attn_fashion == 'reverse':
-            encoding = encoding[::-1]
-        elif self.cross_attn_fashion == 'last_layer':
-            encoding = [encoding[-1] for _ in range(len(self.layers))]
-        else:
-            pass
-        
+        encoding = self.prepare_encoder(encoding)
         B, T, C = encoding[0].size()  # batch-size, decoding-length, size
         T *= self.length_ratio
 
@@ -543,14 +540,8 @@ class Decoder(nn.Module):
         return outs[:, 1:t+2]
 
     def beam_search(self, io_dec, encoding, mask_src=None, mask_trg=None, width=2, alpha=0.6):  # width: beamsize, alpha: length-norm
-        encoding = encoding[1:]
-
-        if self.cross_attn_fashion == 'reverse':
-            encoding = encoding[::-1]
-        elif self.cross_attn_fashion == 'last_layer':
-            encoding = [encoding[-1] for _ in range(len(self.layers))]
-        else:
-            pass
+        
+        encoding = self.prepare_encoder(encoding)
         
         W = width
         B, T, C = encoding[0].size()

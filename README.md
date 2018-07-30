@@ -133,7 +133,8 @@ python ez_run.py \
                 --cross_attn_fashion "forward" \ # (optional) ["forward", "reverse", "last_layer"], in default "forward", 
 ```
 
-Some ablation studies of different models can be found as follows. For all cases, beam search uses beam_size=5, alpha=0.6. <br>
+Some ablation studies of different models can be found as follows. <br>
+For all cases, beam search uses beam_size=5, alpha=0.6. <br>
 (1) For Ro-En experiments, we found that the label smoothing is quite important for Transformer.
     We also try a model with causal encoder (with additional source side language model loss) which can achieve very close performance compared to a full attention model. 
 

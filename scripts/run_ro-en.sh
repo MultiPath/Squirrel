@@ -14,6 +14,7 @@ python ez_run.py \
                 --dev_set   "dev.bpe"   \
                 --test_set  "test.bpe"  \
                 --load_lazy \
+                --pry_io \
                 --workspace_prefix "/data0/workspace/squirrel_io/" \
                 --params "t2t-base" \
                 --eval_every 500  \
@@ -23,7 +24,8 @@ python ez_run.py \
                 --share_embeddings \
                 --tensorboard \
                 --cross_attn_fashion "forward" \
-                
+                --debug
+
                 #--debug
 
                 # --pry_io \

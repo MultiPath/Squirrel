@@ -122,14 +122,14 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
     while True:
 
         # --- saving --- #
-        if iters % args.save_every == 0:
+        if iters % args.save_every == 1:
             args.logger.info('save (back-up) checkpoints at iter={}'.format(iters))
             with torch.cuda.device(args.gpu):
                 torch.save(best.model.state_dict(), '{}_iter={}.pt'.format(args.model_name, iters))
                 torch.save([iters, best.opt.state_dict()], '{}_iter={}.pt.states'.format(args.model_name, iters))
 
         # --- validation --- #
-        if iters % args.eval_every == 0:
+        if iters % args.eval_every == 1:
             progressbar.close()
 
             with torch.no_grad():
@@ -150,7 +150,6 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
 
             # ---set-up a new progressor---
             progressbar = tqdm(total=args.eval_every, desc='start training.')
-
 
         if maxsteps is None:
             maxsteps = args.maximum_steps
@@ -201,6 +200,8 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
 
             loss = loss / args.inter_size
             loss.backward()
+            
+            #print(info)
 
         # multiple steps, one update
         opt.step()

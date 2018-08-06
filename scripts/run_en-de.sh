@@ -16,13 +16,15 @@ python ez_run.py \
                 --load_lazy \
                 --workspace_prefix "/data0/workspace/squirrel_io/" \
                 --eval_every 500  \
-                --batch_size 1500 \
-                --inter_size 16 \
-                --warmup 8000 \
+                --batch_size 1200 \
+                --inter_size 3 \
+                --warmup 16000 \
                 --label_smooth 0.1 \
                 --share_embeddings \
                 --tensorboard \
-                #--debug
+                --debug
+                
+
                 #--beam 5 \
                 
 

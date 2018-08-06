@@ -35,7 +35,7 @@ def positional_encodings_like(x, t=None):   # hope to be differentiable
     positions = positions.float()
 
     # channels
-    channels = torch.arange(0, x.size(-1), 2) / x.size(-1) # 0 2 4 6 ... (256)
+    channels = torch.arange(0, x.size(-1), 2).float() / x.size(-1) # 0 2 4 6 ... (256)
     if x.is_cuda:
         channels = channels.cuda(x.get_device())
     channels = 1 / (10000 ** Variable(channels))
@@ -415,7 +415,10 @@ class PryIO(IO):
         # TODO: experimental: just have a try?
         self.depth = args.pry_depth
         self.deconv = nn.ModuleList([nn.ConvTranspose1d(args.d_model, args.d_model, 2, 2) for _ in range(self.depth)])
-    
+        self.tau = 1000
+        # self.checker = Linear(args.d_model, args.d_model, bias=True)
+        # self.wk = Linear(d_key,   d_key, bias=True)
+
     def expand(self, x):
         S = x.size()
         x = x.view(-1, S[-1]).contiguous().unsqueeze(-1)
@@ -423,9 +426,26 @@ class PryIO(IO):
         for i in range(self.depth):
             x = self.deconv[i](x)
             if i != (self.depth - 1):
-                x = F.selu(x)
+                x = F.relu(x)
 
         return x.view(*S, -1).contiguous()
+
+    def check(self, outputs, block_outputs):
+        N, T, B, D = block_outputs.size()
+        maxidx = self.out(block_outputs).max(-1)[1]
+        maxout = F.embedding(maxidx, self.out.weight * self.scale)
+        
+        scores = matmul(outputs, maxout.transpose(2, 3))
+        scores = torch.exp((scores - scores.max().item()) / self.tau)  # temperature \lambda should be annealed?
+    
+        for t in range(T):
+            pass
+
+
+        print(scores[0, 0])
+
+        1/0
+        pass
 
     def o(self, x):
         x = self.expand(x)
@@ -438,11 +458,13 @@ class PryIO(IO):
 
     def cost(self, targets, masks, outputs, label_smooth=0.0):
         targets, masks = shift(targets, 2 ** self.depth - 1), shift(masks, 2 ** self.depth - 1)
-        outputs = self.expand(outputs).transpose(3, 2)
+        block_outputs = self.expand(outputs).transpose(3, 2) # batch-size x seq-size x block-size x d_model
+
+        self.check(outputs, block_outputs)
 
         # print(targets.size(), masks.size(), outputs.size())
-        targets, outputs = with_mask(targets, outputs, masks.byte())
-        logits = log_softmax(self.out(outputs))
+        targets, block_outputs = with_mask(targets, block_outputs, masks.byte())
+        logits = log_softmax(self.out(block_outputs))
         return F.nll_loss(logits, targets) * (1 - label_smooth) - logits.mean() * label_smooth
 
 
@@ -542,7 +564,7 @@ class Decoder(nn.Module):
     def beam_search(self, io_dec, encoding, mask_src=None, mask_trg=None, width=2, alpha=0.6):  # width: beamsize, alpha: length-norm
         
         encoding = self.prepare_encoder(encoding)
-        
+
         W = width
         B, T, C = encoding[0].size()
 
@@ -764,7 +786,15 @@ class Transformer(nn.Module):
 
         return output_stream[:, 1:]
         
+"""
+-- re-implementation of "Block-wise Parallel Decoding for Deep Autoregressive Models" -- 
+"""
+class BlockwiseTransformer(Transformer):
 
-class Agent(nn.Module):
+    def __init__(self, src, trg, args):
+        assert args.pry_io, "Block-wise Decoding requires a block-based decoder."
 
-    pass
+        super().__init__(src, trg, args)
+    
+    
+        

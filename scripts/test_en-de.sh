@@ -20,8 +20,9 @@ python ez_run.py \
                 --batch_size 12500 \
                 --share_embeddings \
                 --tensorboard \
-                --beam 1 --alpha 0.6 \
+                --beam 5 --alpha 0.6 \
                 --debug
+                
 
                 
 

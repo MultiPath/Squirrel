@@ -16,7 +16,7 @@ python ez_run.py \
                 --params "t2t-base" \
                 --batch_size 1250 \
                 --share_embeddings \
-                --beam 1 --alpha 0.6 \
+                --beam 5 --alpha 0.6 \
                 --causal_enc
                 # --debug
                 

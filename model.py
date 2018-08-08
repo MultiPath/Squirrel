@@ -46,7 +46,7 @@ def positional_encodings_like(x, t=None):   # hope to be differentiable
     encodings = encodings.contiguous().view(*encodings.size()[:-2], -1)  # batch x target_len x 512
 
     if encodings.ndimension() == 2:
-        encodings = encodings.unsqueeze(0).expand_as(x)
+        encodings = encodings.unsqueeze(0).expand_as(x).contiguous()
 
     return encodings
 
@@ -61,15 +61,6 @@ def cosine_sim(x, y):
     x = x / (x.norm(dim=-1, keepdim=True).expand_as(x) + TINY)
     y = y / (y.norm(dim=-1, keepdim=True).expand_as(y) + TINY)
     return (x * y).sum(dim=-1)
-
-def mask(targets, out, input_mask=None, return_mask=False):
-    if input_mask is None:
-        input_mask = (targets != 1)
-    out_mask = input_mask.unsqueeze(-1).expand_as(out)
-
-    if return_mask:
-        return targets[input_mask], out[out_mask].view(-1, out.size(-1)), the_mask
-    return targets[input_mask], out[out_mask].view(-1, out.size(-1))
 
 def with_mask(targets, out, input_mask=None, return_mask=False):
     if input_mask is None:
@@ -433,14 +424,17 @@ class PryIO(IO):
     def check(self, outputs, block_outputs):
         N, T, B, D = block_outputs.size()
         maxidx = self.out(block_outputs).max(-1)[1]
-        maxout = F.embedding(maxidx, self.out.weight * self.scale)
+        maxout = F.embedding(maxidx, self.out.weight * self.scale)     # N x T x B x D
         
         scores = matmul(outputs, maxout.transpose(2, 3))
-        scores = torch.exp((scores - scores.max().item()) / self.tau)  # temperature \lambda should be annealed?
-    
-        for t in range(T):
-            pass
+        scores = torch.exp((scores - scores.max().item()) / self.tau)  # temperature \tau should be annealed?
 
+        x, y, m = [outputs.new_zeros(B, T) for _ in range(3)]   # coord-x, coord-y, mask
+        for t in range(T):
+            m[:, t] = (y[:, t] == 0).long()
+            
+            
+            pass
 
         print(scores[0, 0])
 
@@ -570,8 +564,7 @@ class Decoder(nn.Module):
 
         # expanding
         for i in range(len(encoding)):
-            encoding[i] = encoding[i][:, None, :].expand(
-                B, W, T, C).contiguous().view(B * W, T, C)
+            encoding[i] = encoding[i][:, None, :].expand(B, W, T, C).contiguous().view(B * W, T, C)
         mask_src = mask_src[:, None, :].expand(B, W, T).contiguous().view(B * W, T)
 
         T *= self.length_ratio
@@ -585,7 +578,9 @@ class Decoder(nn.Module):
         # embedW = self.out.weight * math.sqrt(self.d_model)
         hiddens[0] = hiddens[0] + positional_encodings_like(hiddens[0])
         eos_yet = encoding[0].data.new(B, W).byte().zero_()  # batch x beamsize, all the sentences are not finished yet.
-        eos_mask = eos_yet.float().fill_(INF)[:, :, None].expand(B, W, W)  # --- big bug, logps < 0
+        eos_mask = eos_yet.float().fill_(INF)[:, :, None].expand(B, W, W).contiguous()  # --- BUG, logps < 0 assign INF here 
+                                                                                        # --- UPDATE: Aug 9, 2018: BUG again, expand needs contiguous
+                                                                                        # --- otherwise everything will become 0.
         eos_mask[:, :, 0] = 0  # batch x beam x beam
 
         for t in range(T):
@@ -618,10 +613,10 @@ class Decoder(nn.Module):
             
             # logps = logps * (1 - Variable(eos_yet.float()) * 1 / (t + 2)).pow(alpha) # -- bug
             logps = logps * (1 + Variable(eos_yet.float()) * 1 / (t + 1)).pow(alpha)
-            outs = outs.gather(1, topk_beam_inds[:, :, None].expand_as(outs))
+            outs = outs.gather(1, topk_beam_inds[:, :, None].expand_as(outs)).contiguous()
             outs[:, :, t + 1] = topk_token_inds
-            topk_beam_inds = topk_beam_inds[:, :, None, None].expand_as(
-                hiddens[0])
+            topk_beam_inds = topk_beam_inds[:, :, None, None].expand_as(hiddens[0]).contiguous()
+
             for i in range(len(hiddens)):
                 hiddens[i] = hiddens[i].gather(1, topk_beam_inds)
             eos_yet = eos_yet | (topk_token_inds.data == self.field.vocab.stoi['<eos>'])

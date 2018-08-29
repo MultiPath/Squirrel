@@ -207,16 +207,33 @@ class LayerNorm(nn.Module):
 
 class ResidualBlock(nn.Module):
 
-    def __init__(self, layer, d_model, drop_ratio, pos=0):
+    def __init__(self, layer, d_model, drop_ratio, pos=0, order='tdan'):
         super().__init__()
         self.layer = layer
         self.dropout = nn.Dropout(drop_ratio)
         self.layernorm = LayerNorm(d_model)
         self.pos = pos
+        self.order = order
 
     def forward(self, *x):
-        return self.layernorm(x[self.pos] + self.dropout(self.layer(*x)))
-        ## optional: add layernorm inside
+        y = x    
+        assert len(self.order) >= 4, 'at least 4 operations in one block'
+        assert self.order[0] == 't', 'we must start from transformation'
+        for c in self.order:
+            if c == 't':
+                y = self.layer(*y)
+            elif c == 'd':
+                y = self.dropout(y)
+            elif c == 'a':
+                y = x[self.pos] + y
+            elif c == 'n':
+                y = self.layernorm(y)
+            else:
+                raise NotImplementedError
+
+        return y
+        # return self.layernorm(x[self.pos] + self.dropout(self.layer(*x)))
+
 
 class HighwayBlock(nn.Module):
 
@@ -228,7 +245,7 @@ class HighwayBlock(nn.Module):
         self.layernorm = LayerNorm(d_model)
 
     def forward(self, *x):
-        g = F.sigmoid(self.gate(x[0])).expand_as(x[0])
+        g = torch.sigmoid(self.gate(x[0])).expand_as(x[0])
         return self.layernorm(x[0] * g + self.dropout(self.layer(*x)) * (1 - g))
 
 class Attention(nn.Module):
@@ -313,16 +330,16 @@ class FeedForward(nn.Module):
 
 class EncoderLayer(nn.Module):
 
-    def __init__(self, args, causal=False):
+    def __init__(self, args, causal=False, order='tdan'):
         super().__init__()
         self.selfattn = ResidualBlock(
             MultiHead2(
                 args.d_model, args.d_model, args.n_heads,
                 args.drop_ratio, causal),
-            args.d_model, args.drop_ratio)
+            args.d_model, args.drop_ratio, order=order)
         self.feedforward = ResidualBlock(
             FeedForward(args.d_model, args.d_hidden, args.drop_ratio),
-            args.d_model, args.drop_ratio)
+            args.d_model, args.drop_ratio, order=order)
 
     def forward(self, x, mask=None):
         return self.feedforward(self.selfattn(x, x, x, mask))
@@ -330,29 +347,28 @@ class EncoderLayer(nn.Module):
 
 class DecoderLayer(nn.Module):
 
-    def __init__(self, args, causal=True, positional=False, noisy=False):
+    def __init__(self, args, causal=True, positional=False, noisy=False, order='tdan'):
         super().__init__()
         self.positional = positional
         self.selfattn = ResidualBlock(
             MultiHead2(args.d_model, args.d_model, args.n_heads,
                     args.drop_ratio, causal),
-            args.d_model, args.drop_ratio)
+            args.d_model, args.drop_ratio, order=order)
 
         self.crossattn = ResidualBlock(
             MultiHead2(args.d_model, args.d_model, args.n_heads,
                     args.drop_ratio, noisy=noisy),  # only noisy when doing cross-attention
-            args.d_model, args.drop_ratio)
+            args.d_model, args.drop_ratio, order=order)
 
         if positional:
             self.pos_selfattn = ResidualBlock(
             MultiHead2(args.d_model, args.d_model, args.n_heads,   # positional attention (optional)
                     args.drop_ratio, causal),
-            args.d_model, args.drop_ratio, pos=2)
+            args.d_model, args.drop_ratio, pos=2, order=order)
 
         self.feedforward = ResidualBlock(
             FeedForward(args.d_model, args.d_hidden, args.drop_ratio),
-            args.d_model, args.drop_ratio)
-
+            args.d_model, args.drop_ratio, order=order)
     def forward(self, x, encoding, p=None, mask_src=None, mask_trg=None):
 
         x = self.selfattn(x, x, x, mask_trg)   #
@@ -406,7 +422,7 @@ class PryIO(IO):
         # TODO: experimental: just have a try?
         self.depth = args.pry_depth
         self.deconv = nn.ModuleList([nn.ConvTranspose1d(args.d_model, args.d_model, 2, 2) for _ in range(self.depth)])
-        self.tau = 1000
+        self.tau = 10
         # self.checker = Linear(args.d_model, args.d_model, bias=True)
         # self.wk = Linear(d_key,   d_key, bias=True)
 
@@ -423,23 +439,48 @@ class PryIO(IO):
 
     def check(self, outputs, block_outputs):
         N, T, B, D = block_outputs.size()
+        
         maxidx = self.out(block_outputs).max(-1)[1]
         maxout = F.embedding(maxidx, self.out.weight * self.scale)     # N x T x B x D
+        scores = matmul(outputs, maxout.transpose(2, 3)).view(N, -1)   # N x (T x B) 
+        x, y, m, a = [outputs.new_zeros(N, T + 1).long() for _ in range(4)]   # coord-x, coord-y, mask
         
-        scores = matmul(outputs, maxout.transpose(2, 3))
-        scores = torch.exp((scores - scores.max().item()) / self.tau)  # temperature \tau should be annealed?
+        for t in range(T): 
 
-        x, y, m = [outputs.new_zeros(B, T) for _ in range(3)]   # coord-x, coord-y, mask
-        for t in range(T):
-            m[:, t] = (y[:, t] == 0).long()
+            idx = torch.cat([x[:, t:t+1] * B + y[:, t:t+1], x.new_ones(N, 1) * t * B], 1)   # index on the 2D grid of scores.
+            scx = scores.gather(1, idx)                                                     # gathered scores on the 2D grid.
             
-            
-            pass
+            # Gumbel-softmax relaxiation
+            soft_accept = gumbel_softmax(scx, beta=1, tau=self.tau)                         # N x (T x B) x 2
+            hard_accept = soft_accept.max(-1)[1]                                            # N x (T x B)
 
-        print(scores[0, 0])
+            print(soft_accept.size())
+            print(soft_accept[0])
+            print(hard_accept.size())
+            print(hard_accept[0])
+
+            1/0
+
+            prob = torch.sigmoid((scx[:, 0] - scx[:, 1]) / self.tau)                        # action probability based on choices (accept or reject?)
+            accept = torch.bernoulli(prob).long()                                           # take an action
+            
+            y[:, t+1] = y[:, t] + accept                                                    # (be careful) maybe exceed the boundary
+            m[:, t]   = (y[:, t+1] < B).long()                                              # mask every step out-of-boundary
+            accept    = accept * m[:, t]                                                    # if out-of-boundary, then force reject.
+
+            y[:, t+1] = (y[:, t] + accept) * accept                                         # keep (accept) or reset (reject) ?
+            x[:, t+1] = x[:, t] * accept + (t + 1) * (1 - accept)                           # keep (accept) or jump  (reject) ?
+
+        # for t in range(T+1):
+        #     print('{}: ({}, {}) '.format(t, x[1, t], y[1, t]))
+        # print((x * B + y)[1, :T+1])
+        # print(N, T, B, D)
+    
+        new_mask = block_outputs.new_zeros(N, T * B).scatter_(1, (x * B + y)[:, :-1], 1).view(N, T, B).contiguous() # which word is selected in the end.
+
 
         1/0
-        pass
+        return new_mask
 
     def o(self, x):
         x = self.expand(x)
@@ -466,21 +507,33 @@ class Encoder(nn.Module):
 
     def __init__(self, field, args, causal=False):
         super().__init__()
-        
+
         self.layers = nn.ModuleList(
-            [EncoderLayer(args, causal) for i in range(args.n_layers)])
+            [EncoderLayer(args, causal, order=args.block_order) for i in range(args.n_layers)])
         self.dropout = nn.Dropout(args.drop_ratio)
+        
+        if args.normalize_emb:
+            self.layernorm = LayerNorm(args.d_model)
         self.field = field
         self.d_model = args.d_model
         self.share_embeddings = args.share_embeddings
+        self.normalize_emb = args.normalize_emb
+
+    def prepare_embedding(self, embedding):
+        embedding = self.dropout(embedding)
+        if self.normalize_emb:
+            embedding = self.layernorm(embedding)
+        return embedding
 
     def forward(self, x, mask=None):
 
         encoding = [x]
-        x = self.dropout(x)
+        x = self.prepare_embedding(x)
+        
         for layer in self.layers:
             x = layer(x, mask)
             encoding.append(x)
+
         return encoding
 
 
@@ -492,15 +545,20 @@ class Decoder(nn.Module):
         super().__init__()
 
         self.layers = nn.ModuleList(
-            [DecoderLayer(args, causal, positional, noisy)
+            [DecoderLayer(args, causal, positional, noisy, order=args.block_order)
             for i in range(args.n_layers)])
 
         self.dropout = nn.Dropout(args.drop_ratio)
+
+        if args.normalize_emb:
+            self.layernorm = LayerNorm(args.d_model)
+
         self.d_model = args.d_model
         self.field = field
         self.length_ratio = args.length_ratio
         self.positional = positional
         self.cross_attn_fashion = args.cross_attn_fashion
+        self.normalize_emb = args.normalize_emb
 
     def prepare_encoder(self, encoding):
         if self.cross_attn_fashion == 'reverse':
@@ -511,9 +569,18 @@ class Decoder(nn.Module):
             encoding = encoding[1:]
         return encoding
 
+    def prepare_embedding(self, embedding):
+        embedding = self.dropout(embedding)
+        if self.normalize_emb:
+            embedding = self.layernorm(embedding)
+        return embedding
+
     def forward(self, x, encoding, mask_src=None, mask_trg=None):
 
         x = self.dropout(x)
+        if self.normalize_emb:
+            x = self.layernorm(x)
+            
         encoding = self.prepare_encoder(encoding)
 
         for l, (layer, enc) in enumerate(zip(self.layers, encoding)):
@@ -532,12 +599,12 @@ class Decoder(nn.Module):
                     for l in range(len(self.layers) + 1)]
         # embedW = self.out.weight * math.sqrt(self.d_model)
         hiddens[0] = hiddens[0] + positional_encodings_like(hiddens[0])
-
         eos_yet = encoding[0].data.new(B).byte().zero_()
 
         for t in range(T):
             
-            hiddens[0][:, t] = self.dropout(hiddens[0][:, t] + io_dec.i(outs[:, t], pos=False))
+            # add dropout, etc.
+            hiddens[0][:, t] = self.prepare_embedding(hiddens[0][:, t] + io_dec.i(outs[:, t], pos=False))
 
             for l in range(len(self.layers)):
                 x = hiddens[l][:, :t+1]
@@ -575,7 +642,7 @@ class Decoder(nn.Module):
         logps = Variable(encoding[0].data.new(B, W).float().fill_(0))  # scores
         hiddens = [Variable(encoding[0].data.new(B, W, T, C).zero_())  # decoder states: batch x beamsize x len x h
                     for l in range(len(self.layers) + 1)]
-        # embedW = self.out.weight * math.sqrt(self.d_model)
+
         hiddens[0] = hiddens[0] + positional_encodings_like(hiddens[0])
         eos_yet = encoding[0].data.new(B, W).byte().zero_()  # batch x beamsize, all the sentences are not finished yet.
         eos_mask = eos_yet.float().fill_(INF)[:, :, None].expand(B, W, W).contiguous()  # --- BUG, logps < 0 assign INF here 
@@ -584,8 +651,8 @@ class Decoder(nn.Module):
         eos_mask[:, :, 0] = 0  # batch x beam x beam
 
         for t in range(T):
-            hiddens[0][:, :, t] = self.dropout(
-                hiddens[0][:, :, t] + io_dec.i(outs[:, :, t], pos=False))
+            hiddens[0][:, :, t] = self.prepare_embedding(hiddens[0][:, :, t] + io_dec.i(outs[:, :, t], pos=False))
+
             for l in range(len(self.layers)):
                 x = hiddens[l][:, :, :t + 1].contiguous().view(B * W, -1, C)
                 x = self.layers[l].selfattn(x[:, -1:, :], x, x)
@@ -719,7 +786,7 @@ class Transformer(nn.Module):
             # encoding
             encoding_outputs[0][:, t:t+1] = self.io_enc.i(inputs[:, t:t+1], pos=False) 
             encoding_outputs[0][:, t:t+1] += positional_encodings_like(encoding_outputs[0][:, t:t+1], t_enc)
-            encoding_outputs[0][:, t:t+1] = self.encoder.dropout(encoding_outputs[0][:, t:t+1])
+            encoding_outputs[0][:, t:t+1] = self.encoder.prepare_embedding(encoding_outputs[0][:, t:t+1])
 
             for l in range(self.args.n_layers):
                 encoding_outputs[l + 1][:, t:t+1] = self.encoder.layers[l].feedforward(
@@ -732,7 +799,8 @@ class Transformer(nn.Module):
             # decoding
             decoding_outputs[0][:, t:t+1] = self.io_dec.i(outputs[:, t:t+1], pos=False)
             decoding_outputs[0][:, t:t+1] += positional_encodings_like(decoding_outputs[0][:, t:t+1], t_dec)
-            decoding_outputs[0][:, t:t+1] = self.decoder.dropout(decoding_outputs[0][:, t:t+1])
+            decoding_outputs[0][:, t:t+1] = self.decoder.prepare_embedding(decoding_outputs[0][:, t:t+1])
+
 
             for l in range(self.args.n_layers):
                 x = decoding_outputs[l][:, :t+1]

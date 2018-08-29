@@ -162,13 +162,15 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
         iters += 1
         model.train()
 
-        def get_learning_rate(i, lr0=0.1, disable=False):
+        def get_learning_rate(i, disable=False):
             if not disable:
-                return lr0 * 10 / math.sqrt(args.d_model) * min(1 / math.sqrt(i), i / (args.warmup * math.sqrt(args.warmup)))
+                return min(max(1.0 / math.sqrt(args.d_model * i), 5e-5), i / (args.warmup * math.sqrt(args.d_model * args.warmup)))
+                # return 10 * lr0 / math.sqrt(args.d_model) * min(1 / math.sqrt(i), i / (args.warmup * math.sqrt(args.warmup)))
             return 0.00002
 
         opt.param_groups[0]['lr'] = get_learning_rate(iters, disable=args.disable_lr_schedule)
         opt.zero_grad()
+        
         
         info_str = 'training step = {}, lr={:.7f}, '.format(iters, opt.param_groups[0]['lr'])
         info = defaultdict(lambda:0)

@@ -53,7 +53,10 @@ parser.add_argument('--n_layers', type=int, default=6,     help='number of encod
 parser.add_argument('--n_heads',  type=int, default=8,     help='number of heads for multi-head attention')
 parser.add_argument('--drop_ratio', type=float, default=0.1, help='dropout ratio')
 
+
 # model ablation settings
+parser.add_argument('--block_order', type=str, default='tdan', choices=['tdan', 'tdna', 'tnda'])
+parser.add_argument('--normalize_emb', action='store_true', help='normalize embedding (IO)')
 parser.add_argument('--causal_enc', action='store_true', help='use unidirectional encoder (useful for real-time translation)')
 parser.add_argument('--encoder_lm', action='store_true', help='use unidirectional encoder with additional loss as a LM')
 parser.add_argument('--causal',   action='store_true', help='use causal attention')

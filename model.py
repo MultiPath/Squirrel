@@ -458,7 +458,6 @@ class PryIO(IO):
             print(soft_accept[0])
             print(hard_accept.size())
             print(hard_accept[0])
-
             1/0
 
             prob = torch.sigmoid((scx[:, 0] - scx[:, 1]) / self.tau)                        # action probability based on choices (accept or reject?)
@@ -475,7 +474,6 @@ class PryIO(IO):
         #     print('{}: ({}, {}) '.format(t, x[1, t], y[1, t]))
         # print((x * B + y)[1, :T+1])
         # print(N, T, B, D)
-    
         new_mask = block_outputs.new_zeros(N, T * B).scatter_(1, (x * B + y)[:, :-1], 1).view(N, T, B).contiguous() # which word is selected in the end.
 
 
@@ -748,6 +746,35 @@ class Transformer(nn.Module):
         if return_probs:
             return out, softmax(self.io_dec.o(out))
         return out
+
+    # All in All: forward function for training
+    def forward(self, batch, info=None):
+
+        if info is None:
+            info = defaultdict(lambda: 0)
+
+        source_inputs, source_outputs, source_masks, \
+        target_inputs, target_outputs, target_masks = self.prepare_data(batch)
+
+        info['sents']  += (target_inputs[:, 0] * 0 + 1).sum()
+        info['tokens'] += (target_masks != 0).sum()
+
+        # encoding
+        encoding_outputs = self.encoding(source_inputs, source_masks)
+
+        # Maximum Likelihood Training (with label smoothing trick)
+        decoding_outputs = self.decoding(encoding_outputs, source_masks, target_inputs, target_masks)        
+        loss  = self.io_dec.cost(target_outputs, target_masks, outputs=decoding_outputs, label_smooth=self.args.label_smooth)
+        info['MLE'] += loss
+
+        # Source side Language Model (optional, only works for causal-encoder)
+        if self.args.encoder_lm and self.args.causal_enc:
+            loss_lm = self.io_enc.cost(source_outputs, source_masks, outputs=encoding_outputs[-1])
+            info['LM'] += loss_lm
+            loss += loss_lm
+
+        return loss, info
+
 
     def simultaneous_decoding(self, input_stream, mask_stream, agent=None):
 

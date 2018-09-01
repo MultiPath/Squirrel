@@ -8,7 +8,6 @@ from torch.autograd import Variable
 
 from tqdm import tqdm, trange
 from model import Transformer, INF, TINY, softmax
-from utils import NormalField, ParallelDataset
 from utils import Metrics, Best, computeGLEU, computeBLEU, Batch, masked_sort
 from time import gmtime, strftime
 

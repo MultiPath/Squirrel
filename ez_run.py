@@ -13,8 +13,26 @@ import copy
 from ez_train import train_model
 from ez_decode import decode_model
 from model import Transformer, INF, TINY, softmax
-from utils import NormalField, LazyParallelDataset, ParallelDataset, merge_cache
 from time import gmtime, strftime
+from data_loader import DataLoader
+
+#=====START: ADDED FOR DISTRIBUTED======
+'''Add custom module for distributed'''
+
+try:
+    # from torch.nn.parallel.distributed import DistributedDataParallel as DDP
+    from apex.parallel import DistributedDataParallel as DDP
+except ImportError:
+    raise ImportError("Please install apex from https://www.github.com/nvidia/apex to run this example.")
+
+'''Import distributed data loader'''
+import torch.utils.data
+import torch.utils.data.distributed
+
+'''Import torch.distributed'''
+import torch.distributed as dist
+
+#=====END:   ADDED FOR DISTRIBUTED======
 
 
 # all the hyper-parameters
@@ -99,8 +117,43 @@ parser.add_argument('--resume',        action='store_true', help='when loading f
 parser.add_argument('--debug',       action='store_true', help='debug mode: no saving or tensorboard')
 parser.add_argument('--tensorboard', action='store_true', help='use TensorBoard')
 
+
+#======START: ADDED FOR DISTRIBUTED======
+'''
+Add some distributed options. For explanation of dist-url and dist-backend please see
+http://pytorch.org/tutorials/intermediate/dist_tuto.html
+--local_rank will be supplied by the Pytorch launcher wrapper (torch.distributed.launch)
+'''
+parser.add_argument("--local_rank", default=0, type=int)
+parser.add_argument("--distributed", default=False, type=bool)
+parser.add_argument("--world_size", default=1, type=int)
+
 # arguments (:)
 args = parser.parse_args()
+
+if 'WORLD_SIZE' in os.environ:
+    args.world_size = int(os.environ['WORLD_SIZE'])
+    args.distributed = args.world_size > 1
+
+
+if args.distributed:
+    '''Check that we are running with cuda, as distributed is only supported for cuda.'''
+    assert torch.cuda.is_available(), "Distributed mode requires running with CUDA."
+
+    '''
+    Set cuda device so everything is done on the right GPU.
+    THIS MUST BE DONE AS SOON AS POSSIBLE.
+    '''
+    torch.cuda.set_device(args.local_rank)
+
+    '''Initialize distributed communication'''
+    torch.distributed.init_process_group(backend='nccl', init_method='env://')
+
+else:
+    torch.cuda.set_device(args.gpu)
+
+#=====END:   ADDED FOR DISTRIBUTED======
+
 
 if not os.path.exists(args.workspace_prefix):
     os.mkdir(args.workspace_prefix)
@@ -108,24 +161,30 @@ if not os.path.exists(args.workspace_prefix):
 for d in ['models', 'runs', 'logs', 'decodes']:    # check the path
     if not os.path.exists(os.path.join(args.workspace_prefix, d)):
         os.mkdir(os.path.join(args.workspace_prefix, d))
+
 if args.prefix == '[time]':
     args.prefix = strftime("%m.%d_%H.%M.%S.", gmtime())
 
 # setup logger settings
 logger = logging.getLogger()
-logger.setLevel(logging.DEBUG)
-formatter = logging.Formatter('%(asctime)s %(levelname)s: - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
-fh = logging.FileHandler(os.path.join(args.workspace_prefix, 'logs', 'log-{}.txt'.format(args.prefix)))
-fh.setLevel(logging.DEBUG)
-fh.setFormatter(formatter)
+if args.local_rank == 0:
+    logger.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(asctime)s %(levelname)s: - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
-ch = logging.StreamHandler()
-ch.setLevel(logging.DEBUG)
-ch.setFormatter(formatter)
+    fh = logging.FileHandler(os.path.join(args.workspace_prefix, 'logs', 'log-{}.txt'.format(args.prefix)))
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(formatter)
 
-logger.addHandler(ch)
-logger.addHandler(fh)
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG)
+    ch.setFormatter(formatter)
+
+    logger.addHandler(ch)
+    logger.addHandler(fh)
+
+else:
+    logger.setLevel(logging.CRITICAL)
 
 # setup random seeds
 random.seed(args.seed)
@@ -134,110 +193,29 @@ torch.manual_seed(args.seed)
 torch.cuda.manual_seed_all(args.seed)
 
 # special for Pytorch 0.4
-args.device = "cuda:{}".format(args.gpu) if args.gpu > -1 else "cpu"
-
-# setup a data-field
-DataField = NormalField
-
-if not args.char:
-    tokenizer = lambda s: s.split() 
-else:
-    tokenizer = lambda s: list(s)
-    
-if args.remove_dec_eos:
-    TRG = DataField(batch_first=True, tokenize=tokenizer)
-else:
-    TRG = DataField(init_token='<init>', eos_token='<eos>', batch_first=True, tokenize=tokenizer)
-
-if args.share_embeddings:
-    SRC = TRG
-elif args.remove_enc_eos:
-    SRC = DataField(batch_first=True, tokenize=tokenizer)
-else:
-    SRC = DataField(init_token='<init>', eos_token='<eos>', batch_first=True, tokenize=tokenizer)
-    
-
-# read the dataset
-DatasetFunc = LazyParallelDataset if (args.load_lazy and args.mode != 'data') else ParallelDataset
-train_data, dev_data, test_data = DatasetFunc.splits(
-    path=os.path.join(args.data_prefix, args.dataset, args.src + '-' + args.trg) + '/', 
-    train=args.train_set, validation=args.dev_set, test=args.test_set, 
-    exts=('.src', '.trg'), fields=[('src', SRC), ('trg', TRG)])
-vocab_name = 'vocab.{}-{}.{}.{}.pt'.format(args.src, args.trg, 
-                                        's' if args.share_embeddings else 'n',
-                                        'c' if args.char else 'w')
-
-if args.mode == 'data':
-
-    # build vocabulary
-    if not args.share_embeddings:
-        SRC.build_vocab(train_data, dev_data, max_size=args.max_vocab_size)
-    TRG.build_vocab(train_data, dev_data, max_size=args.max_vocab_size)
-    
-    torch.save([SRC.vocab, TRG.vocab], os.path.join(args.data_prefix, args.dataset, args.src + '-' + args.trg, vocab_name))
-    logger.info('save the processed vocabulary, {} {}'.format(len(SRC.vocab), len(TRG.vocab)))
-    sys.exit(1)
+if args.distributed:
+    args.device = "cuda:{}".format(args.local_rank) 
 
 else:
-
-    # load vocabulary
-    assert os.path.exists(os.path.join(args.data_prefix, args.dataset, args.src + '-' + args.trg, vocab_name)), 'need to pre-compute the vocab'
-
-    logger.info('load saved vocabulary.')
-    src_vocab, trg_vocab = torch.load(os.path.join(args.data_prefix, args.dataset, args.src + '-' + args.trg, vocab_name))
-
-    SRC.vocab = src_vocab
-    TRG.vocab = trg_vocab
-
-args.__dict__.update({'trg_vocab': len(TRG.vocab), 'src_vocab': len(SRC.vocab)})
-
-# dynamic batching
-def dyn_batch_with_padding(new, i, sofar):
-    prev_max_len = sofar / (i - 1) if i > 1 else 0
-    return max(len(new.src), len(new.trg),  prev_max_len) * i
-
-def dyn_batch_with_overhead(new, i, sofar):
-    
-    def oh(x):
-        return x * (1 + 0.001 * x)
-
-    prev_max_len = sofar / (i - 1) if i > 1 else 0
-    return max(oh(len(new.src)), oh(len(new.trg)),  prev_max_len) * i
-
-def dyn_batch_without_padding(new, i, sofar):
-    return sofar + max(len(new.src), len(new.trg))
+    args.device = "cuda:{}".format(args.gpu) if args.gpu > -1 else "cpu"
 
 
-if args.batch_size == 1:  # speed-test: one sentence per batch.
-    batch_size_fn = lambda new, count, sofar: count
-else:
-    if not args.char:
-        #batch_size_fn = dyn_batch_without_padding
-        batch_size_fn = dyn_batch_with_padding
-        
-    else:
-        batch_size_fn = dyn_batch_with_overhead
 
+# # build vocabulary
+# if not args.share_embeddings:
+#     SRC.build_vocab(train_data, dev_data, max_size=args.max_vocab_size)
+# TRG.build_vocab(train_data, dev_data, max_size=args.max_vocab_size)
 
-# batch-iterator
-if train_data is not None:
-    logger.info("build the training set.")
-    train_real = data.BucketIterator(train_data, batch_size=args.batch_size, device=args.device,
-                                    batch_size_fn=batch_size_fn, train=True, 
-                                    repeat=None if args.mode == 'train' else False,
-                                    shuffle=(not args.load_lazy))
-if dev_data is not None:
-    logger.info("build the validation set.")
-    dev_real = data.BucketIterator(dev_data, batch_size=args.batch_size * 4, device=args.device,
-                                    batch_size_fn=batch_size_fn, train=False)
-    
-if test_data is not None: 
-    logger.info("build the testing set.")   
-    test_real = data.BucketIterator(test_data, batch_size=args.batch_size * 8, device=args.device,
-                                    batch_size_fn=batch_size_fn, train=False)
+# torch.save([SRC.vocab, TRG.vocab], os.path.join(args.data_prefix, args.dataset, args.src + '-' + args.trg, vocab_name))
+# logger.info('save the processed vocabulary, {} {}'.format(len(SRC.vocab), len(TRG.vocab)))
+# sys.exit(1)
+
 
 
 # ----------------------------------------------------------------------------------------------------------------- #
+
+# get dataloader:
+dataloader = DataLoader(args, logger)
 
 # model hyper-params:
 hparams = {}
@@ -266,7 +244,7 @@ logger.info(f'Starting with HPARAMS: {hp_str}')
 model_name = os.path.join(args.workspace_prefix, 'models', args.prefix + hp_str)
 
 # build the model
-model = Transformer(SRC, TRG, args)
+model = Transformer(dataloader.SRC, dataloader.TRG, args)
 logger.info(str(model))
 
 def count_parameters(model):
@@ -274,8 +252,8 @@ def count_parameters(model):
 logger.info("total trainable parameters: {}".format(format(count_parameters(model),',')))
 
 # use GPU 
-if args.gpu > -1:
-    model.to(torch.device(args.device))
+if torch.cuda.is_available():
+    model.cuda()
 
 # load pre-trained parameters
 if args.load_from is not None:
@@ -283,6 +261,17 @@ if args.load_from is not None:
         model.load_state_dict(torch.load(
             os.path.join(args.workspace_prefix, 'models', args.load_from + '.pt'),
             map_location=lambda storage, loc: storage.cuda()))  # load the pretrained models.
+
+#=====START: ADDED FOR DISTRIBUTED======
+'''
+Wrap model in our version of DistributedDataParallel.
+This must be done AFTER the model is converted to cuda.
+'''
+
+if args.distributed:
+    model = DDP(model)
+    
+#=====END:   ADDED FOR DISTRIBUTED======
 
 
 # additional information
@@ -298,7 +287,7 @@ logger.info(args_str)
 # ----------------------------------------------------------------------------------------------------------------- #
 if args.mode == 'train':
     logger.info('starting training')
-    train_model(args, model, train_real, dev_real)
+    train_model(args, model, dataloader.train, dataloader.dev)
 
 elif args.mode == 'test':
     logger.info('starting decoding from the pre-trained model, on the test set...')
@@ -312,6 +301,6 @@ elif args.mode == 'test':
              '{}.trg.{}'.format(args.test_set, name_suffix),
              '{}.dec.{}'.format(args.test_set, name_suffix)]
     with torch.no_grad():   
-        decode_model(args, model, test_real, evaluate=True, decoding_path=decoding_path, names=names)
+        decode_model(args, model, dataloader.test, evaluate=True, decoding_path=decoding_path, names=names)
 
 logger.info("done.")

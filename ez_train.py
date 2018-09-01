@@ -3,31 +3,19 @@ import numpy as np
 import math
 import time
 import time
+
 from collections import defaultdict
 from torch.autograd import Variable
 from tqdm import tqdm, trange
 from model import Transformer
-from utils import Metrics, Best, computeGLEU, computeBLEU
+from utils import Metrics, Best, computeGLEU, computeBLEU, export, debpe
+from utils import gather_tensor, reduce_tensor, reduce_dict
 
-# -- helper functions
-# def proc(x):
-#     if x < 1000:
-#         return str(x)
-#     if x < 1000000:
-#         return '{:.3f}K'.format(x / 1000.0)
-#     return '{:.3f}M'.format(x / 1000000.0)
+import torch.distributed as dist
 
-def export(x):
-    try:
-        with torch.cuda.device_of(x):
-            return x.data.cpu().float().mean()
-    except Exception:
-        return 0
-
-def debpe(x):
-    return x.replace('@@ ', '').split()
 
 def valid_model(args, model, dev, print_out=False):
+
     print_seqs = ['[sources]', '[targets]', '[decoded]']
     outputs = defaultdict(lambda:[])
 
@@ -85,7 +73,7 @@ def valid_model(args, model, dev, print_out=False):
 def train_model(args, model, train, dev, save_path=None, maxsteps=None):
 
     # record by tensorbard.
-    if args.tensorboard and (not args.debug):
+    if args.tensorboard and (not args.debug) and (args.local_rank == 0):
         from tensorboardX import SummaryWriter
         writer = SummaryWriter('{}/runs/{}'.format(args.workspace_prefix, args.prefix+args.hp_str))
 
@@ -109,8 +97,10 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
         save_path = args.model_name
 
     iters = offset
-    best = Best(max, 'corpus_bleu', 'sentence_gleu', 'i', model=model, opt=opt, path=save_path, gpu=args.gpu)
-    progressbar = tqdm(total=args.eval_every, desc='start training.')
+
+    if args.local_rank == 0:
+        best = Best(max, 'corpus_bleu', 'sentence_gleu', 'i', model=model, opt=opt, path=save_path, gpu=args.gpu)
+        progressbar = tqdm(total=args.eval_every, desc='start training.')
 
     # statistics
     total_tokens = 0
@@ -122,18 +112,18 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
     while True:
 
         # --- saving --- #
-        if iters % args.save_every == 1:
+        if (iters % args.save_every == 1) and (args.local_rank == 0): # saving only works for local-rank=0
             args.logger.info('save (back-up) checkpoints at iter={}'.format(iters))
             with torch.cuda.device(args.gpu):
                 torch.save(best.model.state_dict(), '{}_iter={}.pt'.format(args.model_name, iters))
                 torch.save([iters, best.opt.state_dict()], '{}_iter={}.pt.states'.format(args.model_name, iters))
 
         # --- validation --- #
-        if iters % args.eval_every == 1:
+        if (iters % args.eval_every == 1) and (args.local_rank == 0): # validation only works for local-rank=0
             progressbar.close()
 
             with torch.no_grad():
-                outputs_data = valid_model(args, model, dev, print_out=True)
+                outputs_data = valid_model(args, model.module if args.distributed else model, dev, print_out=True)
 
             if args.tensorboard and (not args.debug):
                 writer.add_scalar('dev/GLEU_sentence_', np.mean(outputs_data['gleu']), iters)
@@ -179,46 +169,30 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
         for inter_step in range(args.inter_size):
 
             batch = next(train)  # load the next batch of training data.
-
-            source_inputs, source_outputs, source_masks, \
-            target_inputs, target_outputs, target_masks = model.prepare_data(batch)
-            
-            info['sents']  += target_inputs.size(0)
-            info['tokens'] += (target_masks != 0).data.sum()
-            
-            # encoding
-            encoding_outputs = model.encoding(source_inputs, source_masks)
-
-            # Maximum Likelihood Training (with label smoothing trick)
-            decoding_outputs = model.decoding(encoding_outputs, source_masks, target_inputs, target_masks)        
-            loss  = model.io_dec.cost(target_outputs, target_masks, outputs=decoding_outputs, label_smooth=args.label_smooth)
-            info['MLE'] += export(loss)
-
-            # Source side Language Model (optional, only works for causal-encoder)
-            if args.encoder_lm and args.causal_enc:
-                loss_lm = model.io_enc.cost(source_outputs, source_masks, outputs=encoding_outputs[-1])
-                info['LM'] += export(loss_lm)
-                loss += loss_lm
-
+            loss, info_ = model(batch, info)
             loss = loss / args.inter_size
             loss.backward()
-            
-            #print(info)
+
 
         # multiple steps, one update
         opt.step()
         total_tokens += info['tokens']
 
-        info_str += '{} sents/{} tokens, total {} tokens, '.format(info['sents'], info['tokens'], format(total_tokens, ','))
-        info_str += 'MLE_loss={:.3f}, '.format(info['MLE'] / args.inter_size)
-        if args.encoder_lm and args.causal_enc:
-            info_str += 'ENCLM_loss={:.3f}, '.format(info['LM'] / args.inter_size)
+        if args.distributed:  # gather information from other workers.
+            reduce_dict(info)
 
-        if args.tensorboard and (not args.debug):
+        info = export(info)
+        info_str += '{} sents/{} tokens, total {} tokens, '.format(int(info['sents']), int(info['tokens']), format(total_tokens, ','))
+        info_str += 'MLE_loss={:.3f}, '.format(info['MLE'] / args.inter_size / args.world_size)
+        if args.encoder_lm and args.causal_enc:
+            info_str += 'ENCLM_loss={:.3f}, '.format(info['LM'] / args.inter_size / args.world_size)
+
+        if args.tensorboard and (not args.debug) and (args.local_rank == 0):
             writer.add_scalar('train/Loss', info['MLE'] / args.inter_size, iters)
             if args.encoder_lm and args.causal_enc:
                 writer.add_scalar('train/Enc_LM_loss', info['LM'] / args.inter_size)
         
-        progressbar.update(1)
-        progressbar.set_description(info_str)
+        if args.local_rank == 0:
+            progressbar.update(1)
+            progressbar.set_description(info_str)
 

@@ -1,7 +1,7 @@
 """
 -- "Lazy dataloader" for Squirrel --
 """
-
+import math
 import torch
 import torch.nn as nn
 import numpy as np
@@ -16,7 +16,7 @@ from collections import OrderedDict
 # ====================== Supportive Functions =========================================== #
 
 """" A Lazy text-reader """
-def lazy_reader(paths, fields, max_len=None, chache=16384):  # -- infinite lazy dataloader --
+def lazy_reader(paths, fields, max_len=None, buffer=16384):  # -- infinite lazy dataloader --
     examples = []
     out_step = 0
 
@@ -40,7 +40,8 @@ def lazy_reader(paths, fields, max_len=None, chache=16384):  # -- infinite lazy 
                     examples.append(lines)
                     out_step += 1
 
-                if (out_step % chache == 0) and (out_step > 0):    # pre-reading the dataset, and cached...
+                if (out_step % buffer == 0) and (out_step > 0):    # pre-reading the dataset, and cached...
+                    # examples = sorted(examples, key=lambda x: sum([len(xi.split()) for xi in x]) )
                     for it, example in enumerate(examples):
                         yield data.Example.fromlist(example, fields)
 
@@ -92,7 +93,7 @@ def fetch_pool(minibatch, data, batch_size, key, batch_size_fn=lambda new, count
     for p in fetch_batch(minibatch, data, batch_size * 100, batch_size_fn):
         microbatch = []
 
-        p_batch = fetch_batch(microbatch, sorted(p, key=key), batch_size, batch_size_fn)
+        p_batch = fetch_batch(microbatch, sorted(p, key=key), batch_size, batch_size_fn) 
         for b in random_shuffler(list(p_batch)):
             yield b
 
@@ -137,14 +138,14 @@ class Seuqence(data.Field):
 class ParallelDataset(datasets.TranslationDataset):
     """ Define a N-parallel dataset: supports abitriry numbers of input streams"""
 
-    def __init__(self, path=None, exts=None, fields=None, lazy=True, max_len=None, **kwargs):
+    def __init__(self, path=None, exts=None, fields=None, lazy=True, max_len=None, buffer=16384, **kwargs):
 
         assert len(exts) == len(fields), 'N parallel dataset must match'
         self.N = len(fields)
         paths = tuple(os.path.expanduser(path + x) for x in exts)
 
         if lazy:  # using lazy dataloader -- cannot be used to construct the vocabulary -- 
-            super(datasets.TranslationDataset, self).__init__(lazy_reader(paths, fields, max_len), fields, **kwargs)
+            super(datasets.TranslationDataset, self).__init__(lazy_reader(paths, fields, max_len, buffer=buffer), fields, **kwargs)
         else:
             super(datasets.TranslationDataset, self).__init__(full_reader(paths, fields, max_len), fields, **kwargs)
 
@@ -154,6 +155,25 @@ class ParallelDataset(datasets.TranslationDataset):
         val_data = None if validation is None else cls(path + validation, lazy=False, **kwargs)
         test_data = None if test is None else cls(path + test, lazy=False, **kwargs)
         return train_data, val_data, test_data
+
+class DistributedBatch(Batch):
+
+    def __init__(self, data=None, dataset=None, device=None, world_size=1, local_rank=0):
+        """Create a Batch from a list of examples."""
+        if data is not None:
+            big_batch_size = len(data)
+            mini_batch_size = int(math.ceil(big_batch_size / world_size))
+            data = data[mini_batch_size * local_rank: mini_batch_size * local_rank + mini_batch_size]
+
+            self.batch_size = len(data)
+            self.dataset = dataset
+            self.fields = dataset.fields.keys()  # copy field names
+
+            for (name, field) in dataset.fields.items():
+                if field is not None:
+                    batch = [getattr(x, name) for x in data]
+                    setattr(self, name, field.process(batch, device=device))
+
 
 
 """ A lazy verison of bucket iterator which supports saving unread minibatches. """
@@ -189,9 +209,9 @@ class LazyBucketIterator(data.BucketIterator):
                     continue
 
                 # --- distributed iterator ---
-                if self.distributed:
-                    if count % self.world_size != self.rank:
-                        continue
+                # if self.distributed:
+                #     if count % self.world_size != self.rank:
+                #         continue
 
                 self.iterations += 1
                 self._iterations_this_epoch += 1
@@ -201,7 +221,7 @@ class LazyBucketIterator(data.BucketIterator):
                     # relative to typical sort keys
                     minibatch.sort(key=self.sort_key, reverse=True)
 
-                yield Batch(minibatch, self.dataset, self.device)
+                yield DistributedBatch(minibatch, self.dataset, self.device, self.world_size, self.rank)
 
             if not self.repeat:
                 return
@@ -239,7 +259,8 @@ class DataLoader(object):
         train_data, dev_data, test_data = ParallelDataset.splits(
             path= data_path + '/', 
             train=args.train_set, validation=args.dev_set, test=args.test_set, 
-            exts=('.src', '.trg'), fields=[('src', SRC), ('trg', TRG)])
+            exts=('.src', '.trg'), fields=[('src', SRC), ('trg', TRG)],
+            buffer=16384 * args.world_size)
 
         # --- read the vocabulary -- #
         vocab_name = 'vocab.{}-{}.{}.{}.pt'.format(args.src, args.trg, 
@@ -268,7 +289,7 @@ class DataLoader(object):
             batch_size_fn = lambda new, count, sofar: count
 
         else:
-            batch_size_fn = dyn_batch_with_padding
+            batch_size_fn = dyn_batch_without_padding
 
         
         # --- build batch-iterator for Translation tasks. ---
@@ -276,7 +297,7 @@ class DataLoader(object):
         if train_data is not None:
             logger.info("build the training set.")
             self.train = LazyBucketIterator(train_data, 
-                                            batch_size=args.batch_size, 
+                                            batch_size=args.batch_size * args.world_size, 
                                             device=args.device,
                                             batch_size_fn=batch_size_fn, train=True, 
                                             repeat=None if args.mode == 'train' else False,

@@ -150,6 +150,7 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
 
         # --- training  --- #
         iters += 1
+        
         model.train()
 
         def get_learning_rate(i, disable=False):
@@ -167,12 +168,16 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
 
         # prepare the data
         for inter_step in range(args.inter_size):
-
+            t0 = time.time()
             batch = next(train)  # load the next batch of training data.
+            t1 = time.time()
+            
             loss, info_ = model(batch, info)
             loss = loss / args.inter_size
             loss.backward()
+            t2 = time.time()
 
+            # print('I am rank {}, inner={}: t1={}, t2={}, size={}'.format(args.local_rank, inter_step, t1-t0, t2-t1, batch.src.size()))
 
         # multiple steps, one update
         opt.step()
@@ -180,6 +185,7 @@ def train_model(args, model, train, dev, save_path=None, maxsteps=None):
 
         if args.distributed:  # gather information from other workers.
             reduce_dict(info)
+
 
         info = export(info)
         info_str += '{} sents/{} tokens, total {} tokens, '.format(int(info['sents']), int(info['tokens']), format(total_tokens, ','))

@@ -15,13 +15,14 @@ from ez_decode import decode_model
 from model import Transformer, INF, TINY, softmax
 from time import gmtime, strftime
 from data_loader import DataLoader
+from utils import Watcher
 
 #=====START: ADDED FOR DISTRIBUTED======
 '''Add custom module for distributed'''
 
 try:
-    # from torch.nn.parallel.distributed import DistributedDataParallel as DDP
-    from apex.parallel import DistributedDataParallel as DDP
+    from torch.nn.parallel.distributed import DistributedDataParallel as DDP
+    # from apex.parallel import DistributedDataParallel as DDP
 except ImportError:
     raise ImportError("Please install apex from https://www.github.com/nvidia/apex to run this example.")
 
@@ -60,6 +61,7 @@ parser.add_argument('--test_set', type=str, default=None,  help='which test set 
 
 
 # model basic settings
+parser.add_argument('--exp',    type=str, default='transformer', help='useless')
 parser.add_argument('--prefix', type=str, default='[time]',      help='prefix to denote the model, nothing or [time]')
 parser.add_argument('--params', type=str, default='customize', help='pamarater sets: james-iwslt, t2t-base')
 
@@ -81,12 +83,10 @@ parser.add_argument('--causal',   action='store_true', help='use causal attentio
 parser.add_argument('--cross_attn_fashion', type=str, default='forward', choices=['forward', 'reverse', 'last_layer'])
 parser.add_argument('--share_embeddings',     action='store_true', help='share embeddings between encoder and decoder')
 parser.add_argument('--positional_attention', action='store_true', help='incorporate positional information in key/value')
-parser.add_argument('--pry_io', action='store_true', help='(optional) multi-step prediction')
-parser.add_argument('--pry_depth', type=int, default=1, help='deconv depth used in pry_io')
+parser.add_argument('--multi_width', type=int, default=1, help='default not use multi-step prediction')
 
 # running setting
 parser.add_argument('--mode',    type=str, default='train',  help='train, test or data')  # "data": preprocessing and save vocabulary
-parser.add_argument('--gpu',     type=int, default=0,        help='GPU to use or -1 for CPU')
 parser.add_argument('--seed',    type=int, default=19920206, help='seed for randomness')
 
 # training
@@ -118,7 +118,6 @@ parser.add_argument('--debug',       action='store_true', help='debug mode: no s
 parser.add_argument('--tensorboard', action='store_true', help='use TensorBoard')
 
 
-#======START: ADDED FOR DISTRIBUTED======
 '''
 Add some distributed options. For explanation of dist-url and dist-backend please see
 http://pytorch.org/tutorials/intermediate/dist_tuto.html
@@ -136,55 +135,26 @@ if 'WORLD_SIZE' in os.environ:
     args.distributed = args.world_size > 1
 
 
+torch.cuda.set_device(args.local_rank)
 if args.distributed:
-    '''Check that we are running with cuda, as distributed is only supported for cuda.'''
-    assert torch.cuda.is_available(), "Distributed mode requires running with CUDA."
-
-    '''
-    Set cuda device so everything is done on the right GPU.
-    THIS MUST BE DONE AS SOON AS POSSIBLE.
-    '''
-    torch.cuda.set_device(args.local_rank)
-
-    '''Initialize distributed communication'''
     torch.distributed.init_process_group(backend='nccl', init_method='env://')
 
-else:
-    torch.cuda.set_device(args.gpu)
+if args.local_rank == 0:
+    if not os.path.exists(args.workspace_prefix):
+        os.mkdir(args.workspace_prefix)
 
-#=====END:   ADDED FOR DISTRIBUTED======
-
-
-if not os.path.exists(args.workspace_prefix):
-    os.mkdir(args.workspace_prefix)
-
-for d in ['models', 'runs', 'logs', 'decodes']:    # check the path
-    if not os.path.exists(os.path.join(args.workspace_prefix, d)):
-        os.mkdir(os.path.join(args.workspace_prefix, d))
+    for d in ['models', 'runs', 'logs', 'decodes']:    # check the path
+        if not os.path.exists(os.path.join(args.workspace_prefix, d)):
+            os.mkdir(os.path.join(args.workspace_prefix, d))
 
 if args.prefix == '[time]':
     args.prefix = strftime("%m.%d_%H.%M.%S.", gmtime())
 
-# setup logger settings
-logger = logging.getLogger()
+# setup watcher settings
+watcher = Watcher(rank=args.local_rank, 
+                  log_path=os.path.join(args.workspace_prefix, 
+                  'logs', 'log-{}.txt'.format(args.prefix)))
 
-if args.local_rank == 0:
-    logger.setLevel(logging.DEBUG)
-    formatter = logging.Formatter('%(asctime)s %(levelname)s: - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-
-    fh = logging.FileHandler(os.path.join(args.workspace_prefix, 'logs', 'log-{}.txt'.format(args.prefix)))
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(formatter)
-
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.DEBUG)
-    ch.setFormatter(formatter)
-
-    logger.addHandler(ch)
-    logger.addHandler(fh)
-
-else:
-    logger.setLevel(logging.CRITICAL)
 
 # setup random seeds
 random.seed(args.seed)
@@ -193,12 +163,7 @@ torch.manual_seed(args.seed)
 torch.cuda.manual_seed_all(args.seed)
 
 # special for Pytorch 0.4
-if args.distributed:
-    args.device = "cuda:{}".format(args.local_rank) 
-
-else:
-    args.device = "cuda:{}".format(args.gpu) if args.gpu > -1 else "cpu"
-
+args.device = "cuda:{}".format(args.local_rank) 
 
 
 # # build vocabulary
@@ -207,7 +172,7 @@ else:
 # TRG.build_vocab(train_data, dev_data, max_size=args.max_vocab_size)
 
 # torch.save([SRC.vocab, TRG.vocab], os.path.join(args.data_prefix, args.dataset, args.src + '-' + args.trg, vocab_name))
-# logger.info('save the processed vocabulary, {} {}'.format(len(SRC.vocab), len(TRG.vocab)))
+# watcher.info('save the processed vocabulary, {} {}'.format(len(SRC.vocab), len(TRG.vocab)))
 # sys.exit(1)
 
 
@@ -215,7 +180,7 @@ else:
 # ----------------------------------------------------------------------------------------------------------------- #
 
 # get dataloader:
-dataloader = DataLoader(args, logger)
+dataloader = DataLoader(args, watcher)
 
 # model hyper-params:
 hparams = {}
@@ -223,33 +188,36 @@ if args.params == 'james-iwslt':
     hparams = {'d_model': 278, 'd_hidden': 507, 'n_layers': 5,
                 'n_heads': 2, 'drop_ratio': 0.079, 'warmup': 746} # ~32
 elif args.params == 't2t-base':
-    logger.info('use default parameters of t2t-base')  # t2t-base, 512-2048-6
+    watcher.info('use default parameters of t2t-base')  # t2t-base, 512-2048-6
     hparams = {'d_model': 512, 'd_hidden': 2048, 'n_layers': 6,
                 'n_heads': 8, 'drop_ratio': 0.1, 'warmup': 16000} # ~32
 else:
-    logger.info("following the user setting.")
+    watcher.info("following the user setting.")
 
 
 args.__dict__.update(hparams)
 
 
-hp_str = (f"{args.dataset}_{args.params}_"
+hp_str = (f".{args.dataset}_{args.params}_"
           f"{args.src}_{args.trg}_"
           f"{'causal_' if args.causal_enc else ''}"
           f"{'lm_' if args.encoder_lm else ''}"
           f"{'c' if args.char else 'w'}_"
           f"{args.label_smooth}_"
-          f"{args.inter_size*args.batch_size}")
-logger.info(f'Starting with HPARAMS: {hp_str}')
+          f"{args.inter_size*args.batch_size*args.world_size}_"
+          f"{'M{}'.format(args.multi_width)} "
+          )
+
+watcher.info(f'Starting with HPARAMS: {hp_str}')
 model_name = os.path.join(args.workspace_prefix, 'models', args.prefix + hp_str)
 
 # build the model
 model = Transformer(dataloader.SRC, dataloader.TRG, args)
-logger.info(str(model))
+# watcher.info(str(model))
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
-logger.info("total trainable parameters: {}".format(format(count_parameters(model),',')))
+watcher.info("total trainable parameters: {}".format(format(count_parameters(model),',')))
 
 # use GPU 
 if torch.cuda.is_available():
@@ -257,50 +225,41 @@ if torch.cuda.is_available():
 
 # load pre-trained parameters
 if args.load_from is not None:
-    with torch.cuda.device(args.gpu):
+    with torch.cuda.device(args.local_rank):
         model.load_state_dict(torch.load(
             os.path.join(args.workspace_prefix, 'models', args.load_from + '.pt'),
             map_location=lambda storage, loc: storage.cuda()))  # load the pretrained models.
 
-#=====START: ADDED FOR DISTRIBUTED======
-'''
-Wrap model in our version of DistributedDataParallel.
-This must be done AFTER the model is converted to cuda.
-'''
 
 if args.distributed:
-    model = DDP(model)
-    
-#=====END:   ADDED FOR DISTRIBUTED======
+    model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank)
 
 
 # additional information
-args.__dict__.update({'model_name': model_name, 'hp_str': hp_str,  'logger': logger})
-
-# show
+args.__dict__.update({'model_name': model_name, 'hp_str': hp_str})
 args_str = ''
 for a in args.__dict__:
     args_str += '{}:\t{}\n'.format(a, args.__dict__[a])
-logger.info(args_str)
-
+watcher.info(args_str)
 
 # ----------------------------------------------------------------------------------------------------------------- #
 if args.mode == 'train':
-    logger.info('starting training')
-    train_model(args, model, dataloader.train, dataloader.dev)
+    watcher.info('starting training')
+    train_model(args, watcher, model, dataloader.train, dataloader.dev)
 
 elif args.mode == 'test':
-    logger.info('starting decoding from the pre-trained model, on the test set...')
-    assert args.load_from is not None, 'must decode from a pre-trained model.'
+    raise NotImplementedError
+    # watcher.info('starting decoding from the pre-trained model, on the test set...')
+    # assert args.load_from is not None, 'must decode from a pre-trained model.'
 
-    decoding_path = os.path.join(args.workspace_prefix, 'decodes', args.load_from)
-    if not os.path.exists(decoding_path):
-        os.mkdir(decoding_path)
-    name_suffix = 'b={}_a={}.txt'.format(args.beam_size, args.alpha)
-    names = ['{}.src.{}'.format(args.test_set, name_suffix), 
-             '{}.trg.{}'.format(args.test_set, name_suffix),
-             '{}.dec.{}'.format(args.test_set, name_suffix)]
-    with torch.no_grad():   
-        decode_model(args, model, dataloader.test, evaluate=True, decoding_path=decoding_path, names=names)
+    # decoding_path = os.path.join(args.workspace_prefix, 'decodes', args.load_from)
+    # if not os.path.exists(decoding_path):
+    #     os.mkdir(decoding_path)
+    # name_suffix = 'b={}_a={}.txt'.format(args.beam_size, args.alpha)
+    # names = ['{}.src.{}'.format(args.test_set, name_suffix), 
+    #          '{}.trg.{}'.format(args.test_set, name_suffix),
+    #          '{}.dec.{}'.format(args.test_set, name_suffix)]
+    # with torch.no_grad():   
+    #     decode_model(args, model, dataloader.test, evaluate=True, decoding_path=decoding_path, names=names)
 
-logger.info("done.")
+watcher.info("done.")

@@ -5,6 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import numpy as np
+import time
 import os
 import torch.distributed as dist
 
@@ -59,7 +60,7 @@ def full_reader(paths, fields, max_len=None):
         return examples
 
 """ batch fetcher """
-def fetch_batch(minibatch, data, batch_size, batch_size_fn=None):
+def fetch_batch(minibatch, data, batch_size, batch_size_fn=None, world_size=1, reserve=False):
     """Yield elements from data in chunks of batch_size.
     :: minibatch: a reference of list which the remaining of batches will always be there for fetching next time.
     """
@@ -69,19 +70,36 @@ def fetch_batch(minibatch, data, batch_size, batch_size_fn=None):
             return count
 
     size_so_far = 0
-    for ex in data:
-        minibatch.append(ex)
+    t0 = time.time()
+
+    if reserve:
+        reserved_minibatch = []
+
+    for it, ex in enumerate(data):
+        
+        if reserve and (it < world_size):
+            reserved_minibatch.append(ex)
+            continue
+
+        else:
+            minibatch.append(ex)
+        
         size_so_far = batch_size_fn(ex, len(minibatch), size_so_far)
-        if size_so_far == batch_size:
+        if (size_so_far == batch_size * world_size) and (len(minibatch) > world_size):        # make sure there is no empty batches coming out during testing.
             yield minibatch
             minibatch, size_so_far = [], 0
-
-        elif size_so_far > batch_size:
+            
+        elif (size_so_far > batch_size * world_size) and (len(minibatch) > (world_size + 1)): # make sure there is no empty batches coming out during testing.
             yield minibatch[:-1]
             minibatch, size_so_far = minibatch[-1:], batch_size_fn(ex, 1, 0)
+
+    if reserve:
+        minibatch += reserved_minibatch  # make sure there is no empty batches coming out during testing.
+        yield minibatch
+
     
 """ pool of batch fetcher """
-def fetch_pool(minibatch, data, batch_size, key, batch_size_fn=lambda new, count, sofar: count, random_shuffler=None):
+def fetch_pool(minibatch, data, batch_size, key, batch_size_fn=lambda new, count, sofar: count, random_shuffler=None, world_size=1):
     """Sort within buckets, then batch, then shuffle batches.
     Partitions data into chunks of size 100*batch_size, sorts examples within
     each chunk using sort_key, then batch these examples and shuffle the
@@ -93,7 +111,7 @@ def fetch_pool(minibatch, data, batch_size, key, batch_size_fn=lambda new, count
     for p in fetch_batch(minibatch, data, batch_size * 100, batch_size_fn):
         microbatch = []
 
-        p_batch = fetch_batch(microbatch, sorted(p, key=key), batch_size, batch_size_fn) 
+        p_batch = fetch_batch(microbatch, sorted(p, key=key), batch_size, batch_size_fn, world_size, False) 
         for b in random_shuffler(list(p_batch)):
             yield b
 
@@ -106,7 +124,7 @@ def fetch_pool(minibatch, data, batch_size, key, batch_size_fn=lambda new, count
 """ sequence data field """
 class Seuqence(data.Field):
 
-    def reverse(self, batch, char=False):
+    def reverse(self, batch, char=False, width=1, return_saved_time=False):
         if not self.batch_first:
             batch.t_()
 
@@ -124,14 +142,55 @@ class Seuqence(data.Field):
             return sentence
 
         batch = [trim(ex, self.eos_token) for ex in batch] # trim past frst eos
+
         def filter_special(tok):
             return tok not in (self.init_token, self.pad_token)
+        
+        def count(ex):
+            n_step = 0
+            n_pad  = 0
+            n_word = 0
 
-        if not char:
-            batch = [" ".join(filter(filter_special, ex)) for ex in batch]
+            filtered = []
+            for e in ex:
+                if e == self.pad_token:
+                    n_pad += 1
+                    if n_word > 0:
+                        n_step += 1
+                        n_word = 0
+                else:
+                    if n_word < (width - 1):
+                        n_word += 1
+                    else:
+                        n_word = 0
+                        n_step += 1
+
+                    filtered.append(e)
+            
+            saved_time = (n_step + (n_word == 0)) / (1 + len(filtered))
+            accuracy = len(filtered) / len(ex)
+            return filtered, saved_time, accuracy
+
+        if return_saved_time:
+            batch_filtered, saved_time, accuracy = [], [], []
+            for ex in batch:
+                b, s, a = count(ex)
+                batch_filtered.append(b)
+                saved_time.append(s)
+                accuracy.append(a)
+
         else:
-            batch = ["".join(filter(filter_special, ex)) for ex in batch]
-        return batch
+            batch_filtered = [list(filter(filter_special, ex)) for ex in batch]
+        
+        if not char:
+            output = [" ".join(ex) for ex in batch_filtered]
+        else:
+            output = ["".join(ex) for ex in batch_filtered]
+
+        if return_saved_time:
+            return output, saved_time, accuracy
+
+        return output
 
 
 """ parallel dataset. using the lazy loader for training """
@@ -156,34 +215,40 @@ class ParallelDataset(datasets.TranslationDataset):
         test_data = None if test is None else cls(path + test, lazy=False, **kwargs)
         return train_data, val_data, test_data
 
+
 class DistributedBatch(Batch):
 
     def __init__(self, data=None, dataset=None, device=None, world_size=1, local_rank=0):
         """Create a Batch from a list of examples."""
+        
         if data is not None:
             big_batch_size = len(data)
-            mini_batch_size = int(math.ceil(big_batch_size / world_size))
-            data = data[mini_batch_size * local_rank: mini_batch_size * local_rank + mini_batch_size]
-
+            mini_batch_size = int(math.floor(big_batch_size / world_size))
+            additional_size = int((big_batch_size -  mini_batch_size * world_size) > local_rank)
+            start_pos = (additional_size + mini_batch_size) * local_rank
+            end_pos = (additional_size + mini_batch_size) * (local_rank + 1)
+            data = data[start_pos: end_pos]
+            
             self.batch_size = len(data)
             self.dataset = dataset
             self.fields = dataset.fields.keys()  # copy field names
-
+            # print('big batch size', big_batch_size, mini_batch_size, self.batch_size, local_rank, 
+            #         mini_batch_size * local_rank, mini_batch_size * local_rank + mini_batch_size )
+            
             for (name, field) in dataset.fields.items():
                 if field is not None:
                     batch = [getattr(x, name) for x in data]
                     setattr(self, name, field.process(batch, device=device))
-
-
+                    
 
 """ A lazy verison of bucket iterator which supports saving unread minibatches. """
 class LazyBucketIterator(data.BucketIterator):
 
     def __init__(self, dataset, batch_size, sort_key=None, device=None,
-                 batch_size_fn=None, train=True, repeat=None, 
+                 batch_size_fn=None, train=True, repeat=None, sort=None,
                  sort_within_batch=False, distributed=False, rank=0, world_size=1):
         super().__init__(dataset, batch_size, sort_key, device, batch_size_fn, 
-                         train, repeat, shuffle=False, sort=False, sort_within_batch=sort_within_batch)
+                         train, repeat, shuffle=False, sort=sort, sort_within_batch=sort_within_batch)
         
         self.minibatch = []  # save unfinished batches.
         self.distributed = distributed
@@ -191,13 +256,18 @@ class LazyBucketIterator(data.BucketIterator):
         self.world_size = world_size
 
     def create_batches(self):
-        self.batches = fetch_pool(self.minibatch, self.data(), self.batch_size,
-                                    self.sort_key, self.batch_size_fn,
-                                    random_shuffler=self.random_shuffler)
+        if self.sort:
+            self.batches = fetch_batch([], self.data(), self.batch_size, self.batch_size_fn, self.world_size, True)
+        else:
+            self.batches = fetch_pool(self.minibatch, self.data(), self.batch_size,
+                                        self.sort_key, self.batch_size_fn,
+                                        random_shuffler=self.random_shuffler, world_size=self.world_size)
 
     # --- wrap the iterator --- 
     def __iter__(self):
+
         count = 0
+        t0 = time.time()
         while True:
             
             self.init_epoch()
@@ -297,7 +367,7 @@ class DataLoader(object):
         if train_data is not None:
             logger.info("build the training set.")
             self.train = LazyBucketIterator(train_data, 
-                                            batch_size=args.batch_size * args.world_size, 
+                                            batch_size=args.batch_size, 
                                             device=args.device,
                                             batch_size_fn=batch_size_fn, train=True, 
                                             repeat=None if args.mode == 'train' else False,
@@ -305,13 +375,22 @@ class DataLoader(object):
                                             distributed=args.distributed, 
                                             rank=args.local_rank, world_size=args.world_size)
         if dev_data is not None:
-            logger.info("build the validation set. (normal iterator is fine)")
-            self.dev = data.BucketIterator(dev_data, batch_size=args.batch_size * 4, device=args.device,
-                                            batch_size_fn=batch_size_fn, train=False)
+            logger.info("build the validation set.")
+            self.dev = LazyBucketIterator(dev_data, 
+                                            batch_size=args.batch_size, 
+                                            device=args.device,
+                                            batch_size_fn=batch_size_fn, train=False, 
+                                            repeat = False, 
+                                            sort_within_batch=True, 
+                                            distributed=args.distributed, 
+                                            rank=args.local_rank, world_size=args.world_size)
+
+            # self.dev = data.BucketIterator(dev_data, batch_size=args.batch_size * 2, device=args.device,
+            #                                 batch_size_fn=batch_size_fn, train=False)
             
         if test_data is not None: 
             logger.info("build the testing set. (normal iterator is fine)")   
-            self.test = data.BucketIterator(test_data, batch_size=args.batch_size * 8, device=args.device,
+            self.test = data.BucketIterator(test_data, batch_size=args.batch_size, device=args.device,
                                             batch_size_fn=batch_size_fn, train=False)
 
 

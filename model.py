@@ -1,6 +1,7 @@
 import torch
 import math
 
+from collections import defaultdict
 from abc import ABCMeta, abstractmethod
 from torch import nn
 from torch.nn import functional as F
@@ -261,8 +262,10 @@ class Attention(nn.Module):
     def forward(self, query, key, value=None, mask=None, beta=0, tau=1):
         dot_products = matmul(query, key.transpose(1, 2))   # batch x trg_len x trg_len
 
-        if query.dim() == 3 and self.causal and (query.size(1) == key.size(1)):
+        if query.dim() == 3 and self.causal: # and (query.size(1) == key.size(1)):
             tri = key.data.new(key.size(1), key.size(1)).fill_(1).triu(1) * INF
+            tri = tri[-query.size(1):]       # caual attention may work on non-square attention.
+            
             dot_products.data.sub_(tri.unsqueeze(0))
 
         if mask is not None:
@@ -369,6 +372,7 @@ class DecoderLayer(nn.Module):
         self.feedforward = ResidualBlock(
             FeedForward(args.d_model, args.d_hidden, args.drop_ratio),
             args.d_model, args.drop_ratio, order=order)
+
     def forward(self, x, encoding, p=None, mask_src=None, mask_trg=None):
 
         x = self.selfattn(x, x, x, mask_trg)   #
@@ -407,11 +411,11 @@ class IO(nn.Module):
             targets, outputs = with_mask(targets, outputs, masks.byte())
             return (self.o(outputs).max(-1)[1] == targets).float().tolist()
 
-    def reverse(self, outputs):
-        return self.field.reverse(outputs.data, self.args.char)
+    def reverse(self, outputs, **kwargs):
+        return self.field.reverse(outputs.data, self.args.char, **kwargs)
 
 
-class PryIO(IO):
+class MulIO(IO):
     """
         IO of navie multi-step prediction.
         For "out" mode, it predicts multiple words using deconv.
@@ -420,22 +424,23 @@ class PryIO(IO):
         super().__init__(field, args)
 
         # TODO: experimental: just have a try?
-        self.depth = args.pry_depth
-        self.deconv = nn.ModuleList([nn.ConvTranspose1d(args.d_model, args.d_model, 2, 2) for _ in range(self.depth)])
-        self.tau = 10
+        self.width = args.multi_width
+        self.rounter = nn.Linear(args.d_model, args.d_model * self.width)
+
+        # self.deconv = nn.ModuleList([nn.ConvTranspose1d(args.d_model, args.d_model, 2, 2) for _ in range(self.depth)])
+        # self.tau = 10
         # self.checker = Linear(args.d_model, args.d_model, bias=True)
         # self.wk = Linear(d_key,   d_key, bias=True)
 
     def expand(self, x):
         S = x.size()
-        x = x.view(-1, S[-1]).contiguous().unsqueeze(-1)
-
-        for i in range(self.depth):
-            x = self.deconv[i](x)
-            if i != (self.depth - 1):
-                x = F.relu(x)
-
-        return x.view(*S, -1).contiguous()
+        return self.rounter(x).view(*S, self.width).contiguous()
+        
+        # x = x.contiguous().view(-1, S[-1]).contiguous().unsqueeze(-1)
+        # for i in range(self.depth):
+        #     x = self.deconv[i](x)
+        #     if i != (self.depth - 1):
+        #         x = F.relu(x)
 
     def check(self, outputs, block_outputs):
         N, T, B, D = block_outputs.size()
@@ -480,20 +485,20 @@ class PryIO(IO):
         1/0
         return new_mask
 
-    def o(self, x):
+    def o(self, x, full=False):
         x = self.expand(x)
-        if x.dim() == 4:
-            x = x[:, :, :, 0] 
+        if not full:
+            if x.dim() == 4:
+                x = x[:, :, :, 0] 
+            else:
+                x = x[:, :, 0]
         else:
-            x = x[:, :, 0]
-
+            x = x.transpose(-1, -2)
         return self.out(x)
 
     def cost(self, targets, masks, outputs, label_smooth=0.0):
-        targets, masks = shift(targets, 2 ** self.depth - 1), shift(masks, 2 ** self.depth - 1)
-        block_outputs = self.expand(outputs).transpose(3, 2) # batch-size x seq-size x block-size x d_model
-
-        self.check(outputs, block_outputs)
+        targets, masks = shift(targets, self.width - 1), shift(masks, self.width - 1)
+        block_outputs = self.expand(outputs).transpose(3, 2) # batch_size x seq-size x block-size x d_model
 
         # print(targets.size(), masks.size(), outputs.size())
         targets, block_outputs = with_mask(targets, block_outputs, masks.byte())
@@ -588,7 +593,7 @@ class Decoder(nn.Module):
     def greedy(self, io_dec, encoding, mask_src=None, mask_trg=None):
 
         encoding = self.prepare_encoder(encoding)
-        B, T, C = encoding[0].size()  # batch-size, decoding-length, size
+        B, T, C = encoding[0].size()  # batch_size, decoding-length, size
         T *= self.length_ratio
 
         outs = Variable(encoding[0].data.new(B, T + 1).long().fill_(
@@ -697,8 +702,8 @@ class Transformer(nn.Module):
         self.encoder = Encoder(src, args, causal=args.causal_enc)
         self.decoder = Decoder(trg, args, causal=True)
         
-        if args.pry_io:
-            self.io_dec = PryIO(trg, args)
+        if args.multi_width > 1:
+            self.io_dec = MulIO(trg, args)
             self.io_enc = IO(src, args)
         else:
             self.io_dec = IO(trg, args)
@@ -710,6 +715,9 @@ class Transformer(nn.Module):
         self.fields = {'src': src, 'trg': trg}
         self.args = args
 
+        # decode or not:
+        self.decode = False
+        
     def prepare_masks(self, inputs):
         field, text = inputs
         if text.ndimension() == 2:  # index inputs
@@ -747,33 +755,60 @@ class Transformer(nn.Module):
             return out, softmax(self.io_dec.o(out))
         return out
 
-    # All in All: forward function for training
-    def forward(self, batch, info=None):
 
-        if info is None:
-            info = defaultdict(lambda: 0)
+    # All in All: forward function for training
+    def forward(self, batch, decoding=False, reverse=True):
+
+        #if info is None:
+        info = defaultdict(lambda: 0)
 
         source_inputs, source_outputs, source_masks, \
         target_inputs, target_outputs, target_masks = self.prepare_data(batch)
 
-        info['sents']  += (target_inputs[:, 0] * 0 + 1).sum()
-        info['tokens'] += (target_masks != 0).sum()
+        info['sents']  = (target_inputs[:, 0] * 0 + 1).sum()
+        info['tokens'] = (target_masks != 0).sum()
+
+        # in some extreme case.
+        if info['sents'] == 0:
+            return info
 
         # encoding
         encoding_outputs = self.encoding(source_inputs, source_masks)
 
-        # Maximum Likelihood Training (with label smoothing trick)
-        decoding_outputs = self.decoding(encoding_outputs, source_masks, target_inputs, target_masks)        
-        loss  = self.io_dec.cost(target_outputs, target_masks, outputs=decoding_outputs, label_smooth=self.args.label_smooth)
-        info['MLE'] += loss
+        if not decoding:
 
-        # Source side Language Model (optional, only works for causal-encoder)
-        if self.args.encoder_lm and self.args.causal_enc:
-            loss_lm = self.io_enc.cost(source_outputs, source_masks, outputs=encoding_outputs[-1])
-            info['LM'] += loss_lm
-            loss += loss_lm
+            # Maximum Likelihood Training (with label smoothing trick)
+            decoding_outputs = self.decoding(encoding_outputs, source_masks, target_inputs, target_masks)        
+            loss  = self.io_dec.cost(target_outputs, target_masks, outputs=decoding_outputs, label_smooth=self.args.label_smooth)
+            info['MLE'] = loss
 
-        return loss, info
+            # Source side Language Model (optional, only works for causal-encoder)
+            if self.args.encoder_lm and self.args.causal_enc:
+                loss_lm = self.io_enc.cost(source_outputs, source_masks, outputs=encoding_outputs[-1])
+                info['LM'] = loss_lm
+                loss += loss_lm
+            
+            info['loss'] = loss
+
+        else:
+            if self.args.multi_width > 1: # -- the newly introduced block-wise decoding -- 
+                decoding_outputs = self.blockwise_parallel_decoding(encoding_outputs, source_masks)
+            else:
+                decoding_outputs = self.decoding(encoding_outputs, source_masks, target_inputs, target_masks, decoding=True, return_probs=False)
+
+            if reverse:
+                source_outputs = self.io_enc.reverse(source_outputs)
+                target_outputs = self.io_dec.reverse(target_outputs)
+                decoding_outputs, saved_time, pred_acc = self.io_dec.reverse(decoding_outputs, width=self.args.multi_width, return_saved_time=True)
+                
+                info['saved_time'] = saved_time
+                info['pred_acc'] = pred_acc
+
+            info['src'] = source_outputs
+            info['trg'] = target_outputs
+            info['dec'] = decoding_outputs
+        
+        return info
 
 
     def simultaneous_decoding(self, input_stream, mask_stream, agent=None):
@@ -876,15 +911,97 @@ class Transformer(nn.Module):
 
         return output_stream[:, 1:]
         
-"""
--- re-implementation of "Block-wise Parallel Decoding for Deep Autoregressive Models" -- 
-"""
-class BlockwiseTransformer(Transformer):
+    def blockwise_parallel_decoding(self, encoding_outputs, mask_stream):
+        assert self.args.multi_width > 1, "block-wise parallel decoding only works for multi-step prediction."
 
-    def __init__(self, src, trg, args):
-        assert args.pry_io, "Block-wise Decoding requires a block-based decoder."
+        B, T0 = mask_stream.size()
+        N  = self.args.multi_width  # multi-step prediction
+        T1 = T0 * self.args.length_ratio
+        T2 = T1 * N
 
-        super().__init__(src, trg, args)
-    
-    
+        # --- encoding --- 
+        encoding_outputs = self.decoder.prepare_encoder(encoding_outputs)
+
+        # --- decoding ---
+
+        # prepare blanks
+        outputs = mask_stream.new_zeros(B, T2 + 1).long().fill_(self.fields['trg'].vocab.stoi['<init>'])
+        outputs_mask = mask_stream.new_zeros(B, T2 + 1)
+        decoding_outputs = [mask_stream.new_zeros(B, T2, self.args.d_model).float()
+                            for _ in range(self.args.n_layers + 1)]
+
+        t_dec = mask_stream.new_zeros(B, 1).long()           # head
+        paces = torch.arange(0, N, device=t_dec.get_device())
         
+        eos_yet = mask_stream.new_zeros(B, 1).byte()         # stopping mark
+
+        # start block-wise parallel decoding
+        outputs_mask[:, 0] = 1
+
+        for t in range(T1):
+
+            # 0. initialized step.
+            if t == 0:
+                offset = 1
+                pos = t_dec
+
+            else:
+                t = 1 + (t - 1) * N
+                offset = N
+                pos = t_dec + paces[None, :]
+
+            # 1. predict multiple words.
+            decoding_outputs[0][:, t: t+offset] = self.io_dec.i(outputs[:, t:t+offset], pos=False)
+            decoding_outputs[0][:, t: t+offset] += positional_encodings_like(decoding_outputs[0][:, t:t+offset], pos)
+            decoding_outputs[0][:, t: t+offset] = self.decoder.prepare_embedding(decoding_outputs[0][:, t:t+offset])
+
+            for l in range(self.args.n_layers):
+                x = decoding_outputs[l][:, :t+offset]
+                x = self.decoder.layers[l].selfattn(decoding_outputs[l][:, t:t+offset], x, x, outputs_mask[:, :t+offset])
+                decoding_outputs[l + 1][:, t:t+offset] = self.decoder.layers[l].feedforward(
+                    self.decoder.layers[l].crossattn(
+                        x, encoding_outputs[l], encoding_outputs[l], mask_stream))
+
+            curr_outputs = self.io_dec.o(decoding_outputs[-1][:, t:t+offset], full=True).max(-1)[1]
+            
+            # 2. check with the one-step guess 
+            if t == 0:
+                prev_outputs = curr_outputs.squeeze(1)
+                outputs[:, 1: N+1] = prev_outputs
+                t_dec = t_dec + 1   # <bos> is the step we always make first.
+
+            else:
+
+                hits = curr_outputs[:, :-1, 0] == prev_outputs[:, 1:]    # batch_size x (n_step - 1)
+                hits = torch.cat([hits.new_ones(B, 1), hits], 1)         # batch_size x n_step
+                new_mask = hits.cumprod(1)                               # batch_size x n_step
+                new_index = (new_mask - torch.cat(
+                    [new_mask[:, 1:], new_mask.new_zeros(B, 1)], 1)
+                    ).max(1)[1]#[:, None, None].expand(B, 1, N)
+                new_index_expanded = new_index[:, None, None].expand(B, 1, N)
+                new_outputs = curr_outputs.gather(1, new_index_expanded).squeeze(1) # batch_size x n_step
+                t_dec = t_dec + new_mask.sum(1, keepdim=True)              # how many steps you actually make
+
+                # 3. check prediction
+                new_outputs = new_outputs * (1 - eos_yet.long()) \
+                            + self.fields['trg'].vocab.stoi['<eos>'] * eos_yet.long()    # mask dead sentences.
+                is_eos = new_outputs[:, 0:1] == self.fields['trg'].vocab.stoi['<eos>'] 
+                
+                # fatol BUG here: <eos> may come-out earlier as you thought 
+                already_eos = prev_outputs.gather(1, new_index[:, None]) == self.fields['trg'].vocab.stoi['<eos>'] 
+
+                eos_yet = eos_yet | is_eos | already_eos  # check if sentence is dead.
+                
+                prev_outputs = new_outputs
+
+                # 4. make outputs   
+                outputs_mask[:, t: t+offset] = new_mask                              # make mask for previous output.
+                outputs_mask[:, t+offset: t+offset+1] = 1 - already_eos              # assume the inputs are correct.
+                outputs_mask[:, t+offset+1: t+offset*2] = 1 - is_eos | already_eos   # assume the inputs are correct.
+                outputs[:, t+offset: t+offset*2] = prev_outputs
+
+                if eos_yet.all():
+                    break
+
+        outputs = outputs * outputs_mask.long() + self.fields['trg'].vocab.stoi['<pad>'] * (1 - outputs_mask.long())
+        return outputs

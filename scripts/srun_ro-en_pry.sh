@@ -1,4 +1,8 @@
- python -m torch.distributed.launch --nproc_per_node=8 --master_port=23456 \
+ NUM_GPU=8
+ NUM_CPU=48
+
+ srun --gres=gpu:${NUM_GPU} -c ${NUM_CPU} -C volta --partition=dev --time=24:00:00 --pty \
+ python -m torch.distributed.launch --nproc_per_node=${NUM_GPU} --master_port=23456 \
                 ez_run.py \
                 --prefix [time] \
                 --mode train \
@@ -12,10 +16,16 @@
                 --workspace_prefix "/private/home/jgu/space/exp-20180907-block/" \
                 --params "t2t-base" \
                 --eval_every 500  \
-                --batch_size 2048 \
-                --inter_size 2 \
+                --batch_size  500 \
+                --inter_size 8 \
                 --label_smooth 0.1 \
                 --share_embeddings \
                 --tensorboard \
                 --cross_attn_fashion "forward" \
+                --warmup 4000 \
+                --multi_width 9 \
+                --debug \
+
+       
+            
 

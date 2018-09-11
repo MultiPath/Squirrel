@@ -3,6 +3,10 @@ import torch.nn as nn
 import numpy as np
 import os
 import torch.distributed as dist
+import time
+import pickle
+import operator
+import logging
 
 from torch.autograd import Variable
 from torchtext import data, datasets
@@ -11,9 +15,24 @@ from nltk.translate.gleu_score import sentence_gleu, corpus_gleu
 from bleu_score import corpus_bleu
 from contextlib import ExitStack
 from collections import OrderedDict
+from timeit import default_timer
+from functools import reduce
+from tqdm import tqdm, trange
+from tensorboardX import SummaryWriter
 
 INF = 1e10
 TINY = 1e-9
+
+
+def prod(factors):
+    return reduce(operator.mul, factors, 1)
+
+def item(tensor):
+    if hasattr(tensor, 'item'):
+        return tensor.item()
+    if hasattr(tensor, '__getitem__'):
+        return tensor[0]
+    return tensor
 
 def export(x):
     if isinstance(x, dict):
@@ -68,6 +87,23 @@ def computeGroupBLEU(outputs, targets, tokenizer=None, bra=10, maxmaxlen=80):
         print(corpus_bleu([[t] for t in targets_buckets[k]], [o for o in outputs_buckets[k]], emulate_multibleu=True))
 
 
+class Timer(object):
+    def __init__(self, verbose=False):
+        self.verbose = verbose
+        self.timer = default_timer
+        
+    def __enter__(self):
+        self.start = self.timer()
+        return self
+        
+    def __exit__(self, *args):
+        end = self.timer()
+        self.elapsed_secs = end - self.start
+        self.elapsed = self.elapsed_secs * 1000  # millisecs
+        if self.verbose:
+            print('elapsed time: %f ms' % self.elapsed)
+
+
 class Metrics:
 
     def __init__(self, name, *metrics):
@@ -115,6 +151,7 @@ class Metrics:
         self.count = 0
         self.metrics.update({metric: 0 for metric in self.metrics})
 
+
 class Best:
 
     def __init__(self, cmp_fn, *metrics, model=None, opt=None, path='', gpu=0):
@@ -155,39 +192,77 @@ class Best:
                         for metric, value in self.metrics.items()
                         if value is not None))
 
-class CacheExample(data.Example):
 
-    @classmethod
-    def fromsample(cls, data_lists, names):
-        ex = cls()
-        for data, name in zip(data_lists, names):
-            setattr(ex, name, data)
-        return ex
+class Watcher(logging.getLoggerClass()):
+    
+    def __init__(self, log_path=None, rank=0):  # local-rank is the most important term
+        super().__init__(name="watcher-transformer")
+        
+        self.rank = rank
+
+        self.progress_bar = None
+        self.best_tracker = None
+        self.tb_writer    = None
+        self.info_logger  = None
+
+        if self.rank == 0:
+        
+            formatter = logging.Formatter('%(asctime)s %(levelname)s: - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+            fh = logging.FileHandler(log_path)
+            fh.setLevel(logging.DEBUG)
+            fh.setFormatter(formatter)
+
+            ch = logging.StreamHandler()
+            ch.setLevel(logging.DEBUG)
+            ch.setFormatter(formatter)
+
+            self.addHandler(ch)
+            self.addHandler(fh)
+            self.setLevel(logging.DEBUG)
+
+        else:
+            self.setLevel(logging.CRITICAL)
+    
+    def info(self, msg, *args, **kwargs):
+        if self.rank == 0:
+            super().info(msg, *args, **kwargs)
 
 
-class Cache:
+    # ----- progress bar ---- #
+    def close_progress_bar(self):
+        if self.rank == 0:
+            if self.progress_bar is not None:
+                self.progressbar.close()
 
-    def __init__(self, size=10000, fileds=["src", "trg"]):
-        self.cache = []
-        self.maxsize = size
+    def set_progress_bar(self, steps=0):
+        if self.rank == 0:
+            self.progressbar = tqdm(total=steps, desc="start a new progress-bar", position=0)
 
-    def demask(self, data, mask):
-        with torch.cuda.device_of(data):
-            data = [d[:l] for d, l in zip(data.data.tolist(), mask.sum(1).long().tolist())]
-        return data
+    def step_progress_bar(self, info_str=None, step=1):
+        if self.rank == 0:
+            self.progressbar.update(step)
+            if info_str is not None:
+                self.progressbar.set_description(info_str)
 
-    def add(self, data_lists, masks, names):
-        data_lists = [self.demask(d, m) for d, m in zip(data_lists, masks)]
-        for data in zip(*data_lists):
-            self.cache.append(CacheExample.fromsample(data, names))
+    # ----- tensorboard ---- #
+    def set_tensorboard(self, path):
+        if self.rank == 0:
+            self.tb_writer = SummaryWriter(path)
+    
+    def add_tensorboard(self, name, value, iters):
+        if self.rank == 0:
+            self.tb_writer.add_scalar(name, value, iters)
 
-        if len(self.cache) >= self.maxsize:
-            self.cache = self.cache[-self.maxsize:]
+    # ----- best performance tracker ---- #
+    def set_best_tracker(self, model, opt, save_path, device, *names):
+        self.best_tracker = Best(max, *names, 'i', model=model, opt=opt, path=save_path, gpu=device)
+
+    def acc_best_tracker(self, iters, *values):
+        if self.rank == 0:
+            self.best_tracker.accumulate(*values, iters)
 
 
-# class Batch:
-#     def __init__(self, src=None, trg=None, dec=None):
-#         self.src, self.trg, self.dec = src, trg, dec
 
 def masked_sort(x, mask, dim=-1):
     x.data += ((1 - mask) * INF).long()
@@ -226,13 +301,60 @@ def gather_tensor(tensor, world_size=1):
 def reduce_tensor(tensor):
     rt = tensor.clone()
     dist.all_reduce(rt, op=dist.reduce_op.SUM)
-    return rt
+    return rt / dist.get_world_size()
 
 def reduce_dict(info_dict):
     for it in info_dict:
         p = info_dict[it].clone()
         dist.all_reduce(p, op=dist.reduce_op.SUM)
-        info_dict[it] = p
+        info_dict[it] = p / dist.get_world_size()
 
+def all_gather_list(data, max_size=16384):
+
+    """Gathers arbitrary data from all nodes into a list."""
+    world_size = torch.distributed.get_world_size()
+    if not hasattr(all_gather_list, '_in_buffer') or \
+            max_size != all_gather_list._in_buffer.size():
+        all_gather_list._in_buffer = torch.cuda.ByteTensor(max_size)
+        all_gather_list._out_buffers = [
+            torch.cuda.ByteTensor(max_size)
+            for i in range(world_size)
+        ]
+    in_buffer = all_gather_list._in_buffer
+    out_buffers = all_gather_list._out_buffers
+
+    enc = pickle.dumps(data)
+    enc_size = len(enc)
+    if enc_size + 3 > max_size:
+        raise ValueError('encoded data exceeds max_size: {}'.format(enc_size + 3))
+    
+    assert max_size < 255 * 255 * 256
+    in_buffer[0] = enc_size // (255 * 255)  # this encoding works for max_size < 16M
+    in_buffer[1] = (enc_size % (255 * 255)) // 255
+    in_buffer[2] = (enc_size % (255 * 255)) % 255
+    in_buffer[3:enc_size+3] = torch.ByteTensor(list(enc))
+
+    torch.distributed.all_gather(out_buffers, in_buffer.cuda())
+
+    result = []
+    for i in range(world_size):
+        out_buffer = out_buffers[i]
+        size = (255 * 255 * item(out_buffer[0])) + 255 * item(out_buffer[1]) + item(out_buffer[2])
+        result.append(
+            pickle.loads(bytes(out_buffer[3:size+3].tolist()))
+        )
+    return result
+
+def gather_dict(info_dict):
+    for w in info_dict:
+        new_v = []
+
+        for v in all_gather_list(info_dict[w], 2 ** 17):
+            if isinstance(v, list):
+                new_v += v
+            else:
+                new_v.append(v)
+
+        info_dict[w] = new_v
 
 #=====END:   ADDED FOR DISTRIBUTED======

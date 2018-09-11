@@ -18,6 +18,6 @@ python ez_run.py \
                 --share_embeddings \
                 --beam 5 --alpha 0.6 \
                 --causal_enc
-                # --debug
+                --debug
                 
 

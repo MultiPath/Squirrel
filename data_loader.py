@@ -123,7 +123,116 @@ def fetch_pool(minibatch, data, batch_size, key, batch_size_fn=lambda new, count
 
 """ sequence data field """
 class Seuqence(data.Field):
+    
+    def pad(self, minibatch):
+        """Pad a batch of examples using this field.
+        Pads to self.fix_length if provided, otherwise pads to the length of
+        the longest example in the batch. Prepends self.init_token and appends
+        self.eos_token if those attributes are not None. Returns a tuple of the
+        padded list and a list containing lengths of each example if
+        `self.include_lengths` is `True` and `self.sequential` is `True`, else just
+        returns the padded list. If `self.sequential` is `False`, no padding is applied.
+        """
+        minibatch = list(minibatch)
+        if not self.sequential:
+            return minibatch
+        if self.fix_length is None:
+            max_len = max(len(x) for x in minibatch)
+        else:
+            print(1/0)
+            
+#            max_len = self.fix_length + (
+#                self.init_token, self.eos_token).count(None) - 2
+        padded, lengths = [], []  
 
+        for x in minibatch:
+            x[0] = [self.init_token]+x[0]
+            x[-1] = x[-1] + [self.eos_token]
+            for i, word in enumerate(x):
+                x[i].append(' ')
+                
+            padded.append(x + [[self.pad_token]] * max(0, max_len - len(x)))
+            lengths.append(len(padded[-1]) - max(0, max_len - len(x)))
+            
+        if self.fix_length is None:
+            max_word = max(len(word) for sentence in padded for word in sentence)
+        else:
+            print(1/0)
+        
+        padded_word_all = []
+        for sentence in padded:
+            padded_word = []
+            for word in sentence:
+                padded_word.append(word+[self.pad_token] * max(0, max_word - len(word)))
+            padded_word_all.append(padded_word)  
+           
+        if self.include_lengths:
+            return (padded_word_all, lengths)
+        return padded_word_all
+    
+    def numericalize(self, arr, device=None):
+        """Turn a batch of examples that use this field into a Variable.
+        If the field has include_lengths=True, a tensor of lengths will be
+        included in the return value.
+        Arguments:
+            arr (List[List[str]], or tuple of (List[List[str]], List[int])):
+                List of tokenized and padded examples, or tuple of List of
+                tokenized and padded examples and List of lengths of each
+                example if self.include_lengths is True.
+            device (str or torch.device): A string or instance of `torch.device`
+                specifying which device the Variables are going to be created on.
+                If left as default, the tensors will be created on cpu. Default: None.
+        """
+        if self.include_lengths and not isinstance(arr, tuple):
+            raise ValueError("Field has include_lengths set to True, but "
+                             "input data is not a tuple of "
+                             "(data batch, batch lengths).")
+        
+        if isinstance(arr, tuple):
+            arr, lengths = arr
+            lengths = torch.tensor(lengths, dtype=self.dtype, device=device)
+        
+        if self.use_vocab:
+            if self.sequential:
+                arr = [[[self.vocab.stoi[char] for char in x] for x in ex] for ex in arr]
+            else:
+                print(1/0)
+                '''
+                arr = [self.vocab.stoi[x] for x in arr]
+                '''
+            if self.postprocessing is not None:
+                arr = self.postprocessing(arr, self.vocab)
+        else:
+            print(1/0)
+            '''
+            if self.dtype not in self.dtypes:
+                raise ValueError(
+                    "Specified Field dtype {} can not be used with "
+                    "use_vocab=False because we do not know how to numericalize it. "
+                    "Please raise an issue at "
+                    "https://github.com/pytorch/text/issues".format(self.dtype))
+            numericalization_func = self.dtypes[self.dtype]
+            # It doesn't make sense to explictly coerce to a numeric type if
+            # the data is sequential, since it's unclear how to coerce padding tokens
+            # to a numeric type.
+            if not self.sequential:
+                arr = [numericalization_func(x) if isinstance(x, six.string_types)
+                       else x for x in arr]
+            if self.postprocessing is not None:
+                arr = self.postprocessing(arr, None)
+            '''
+
+        var = torch.tensor(arr, dtype=self.dtype, device=device)
+
+        if self.sequential and not self.batch_first:
+            var.t_()
+        if self.sequential:
+            var = var.contiguous()
+
+        if self.include_lengths:
+            return var, lengths
+        return var
+    
     def reverse(self, batch, char=False, width=1, return_saved_time=False):
         if not self.batch_first:
             batch.t_()
@@ -306,7 +415,7 @@ class DataLoader(object):
         if not args.char:
             tokenizer = lambda s: s.split() 
         else:
-            tokenizer = lambda s: list(s)
+            tokenizer = lambda s: [list(word) for word in s.split()]
             
         if args.remove_dec_eos:
             TRG = Seuqence(batch_first=True, tokenize=tokenizer)

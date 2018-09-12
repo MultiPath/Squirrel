@@ -726,10 +726,28 @@ class Transformer(nn.Module):
             masks = (text.data[:, :, self.fields[field].vocab.stoi['<pad>']] != 1).float()
         return masks
 
+    def prepare_outputs(self, field, batch):
+        import pdb
+        pdb.set_trace()
+        
+        B, T, n = batch.size()
+        batch_flat = batch.view(B, -1).contiguous() 
+        char_mask = (batch_flat != self.fields[field].vocab.stoi['<pad>'])
+        char_mask_sum = char_mask.float().sum(-1)
+        T_char = int(char_mask_sum.max())
+        range_matrix = torch.range(start=0, end=T_char-1).cuda().unsqueeze(0).expand(B,-1).contiguous()
+        expand_mask = (range_matrix>=char_mask_sum.unsqueeze(1).expand(-1,T_char)).contiguous()
+        expanded_mask = torch.cat([char_mask, expand_mask], dim=-1)
+        expanded_batch_flat = torch.cat([batch_flat, expand_mask.new(expand_mask.size()).fill_(self.fields[field].vocab.stoi['<pad>']).long()], dim=-1)
+        batch_outputs = expanded_batch_flat[expanded_mask].view(B, -1).contiguous() 
+        return batch_outputs
+    
     def prepare_data(self, batch):
-        source_inputs, source_outputs = batch.src[:, :-1].contiguous(), batch.src[:, 1:].contiguous()
-        target_inputs, target_outputs = batch.trg[:, :-1].contiguous(), batch.trg[:, 1:].contiguous()
+        
+        source_inputs, source_outputs = batch.src.contiguous(), self.prepare_outputs('src', batch.src.contiguous())
+        target_inputs, target_outputs = batch.trg.contiguous(), self.prepare_outputs('trg', batch.trg.contiguous())
         source_masks, target_masks = self.prepare_masks(('src', source_outputs)), self.prepare_masks(('trg', target_outputs))
+        source_masks_inputs, target_masks_inputs = self.prepare_masks(('src', source_inputs)), self.prepare_masks(('trg', target_inputs))
         return source_inputs, source_outputs, source_masks, target_inputs, target_outputs, target_masks
 
     def encoding(self, encoder_inputs, encoder_masks):

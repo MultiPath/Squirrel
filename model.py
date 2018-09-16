@@ -109,13 +109,22 @@ def argmax(x):  # return the one-hot vectors
     x_hard = x_hard.view(*shape)
     return x_hard
 
-def shift(x, n = 3):
-    xs = [x.unsqueeze(-1)]
-    for i in range(1, n+1):
-        p = x.new_zeros(*x.size())
-        p[:, :-i] = x[:, i:]
-        xs.append(p.unsqueeze(-1))
-    return torch.cat(xs, -1)
+def cross_entropy_with_smooth(outputs, targets, label_smooth=0.1):
+    logits = log_softmax(outputs)
+    return F.nll_loss(logits, targets) * (1 - label_smooth) - logits.mean() * label_smooth
+
+def shift(x, n, right = False, value=0):
+    if x.dim() == 2:
+        x = x.unsqueeze(-1).expand(*x.size()[:2], n)
+    new_x = x.new_zeros(*x.size()) + value
+    new_x[:, :, 0] = x[:, :, 0]
+
+    for i in range(1, n):
+        if not right:
+            new_x[:, :-i, i] = x[:, i:, i]
+        else:
+            new_x[:, i:, i] = x[:, :-i, i]
+    return new_x
 
 # torch.matmul can't do (4, 3, 2) @ (4, 2) -> (4, 3)
 def matmul(x, y):
@@ -320,10 +329,13 @@ class MultiHead2(nn.Module):
 
 class FeedForward(nn.Module):
 
-    def __init__(self, d_model, d_hidden, drop_ratio=0.1):
+    def __init__(self, d_model, d_hidden, drop_ratio=0.1, d_output=None):
         super().__init__()
+        if d_output is None:
+            d_output = d_model
+
         self.linear1 = Linear(d_model, d_hidden)
-        self.linear2 = Linear(d_hidden, d_model)
+        self.linear2 = Linear(d_hidden, d_output)
         self.dropout = nn.Dropout(drop_ratio)
 
 
@@ -350,9 +362,8 @@ class EncoderLayer(nn.Module):
 
 class DecoderLayer(nn.Module):
 
-    def __init__(self, args, causal=True, positional=False, noisy=False, order='tdan'):
+    def __init__(self, args, causal=True, noisy=False, order='tdan'):
         super().__init__()
-        self.positional = positional
         self.selfattn = ResidualBlock(
             MultiHead2(args.d_model, args.d_model, args.n_heads,
                     args.drop_ratio, causal),
@@ -363,22 +374,13 @@ class DecoderLayer(nn.Module):
                     args.drop_ratio, noisy=noisy),  # only noisy when doing cross-attention
             args.d_model, args.drop_ratio, order=order)
 
-        if positional:
-            self.pos_selfattn = ResidualBlock(
-            MultiHead2(args.d_model, args.d_model, args.n_heads,   # positional attention (optional)
-                    args.drop_ratio, causal),
-            args.d_model, args.drop_ratio, pos=2, order=order)
-
         self.feedforward = ResidualBlock(
             FeedForward(args.d_model, args.d_hidden, args.drop_ratio),
             args.d_model, args.drop_ratio, order=order)
 
     def forward(self, x, encoding, p=None, mask_src=None, mask_trg=None):
 
-        x = self.selfattn(x, x, x, mask_trg)   #
-        if self.positional:
-            pos_encoding = positional_encodings_like(x)
-            x = self.pos_selfattn(pos_encoding, pos_encoding, x, mask_trg)  # positional attention
+        x = self.selfattn(x, x, x, mask_trg)   
         x = self.feedforward(self.crossattn(x, encoding, encoding, mask_src))
         return x
 
@@ -401,11 +403,13 @@ class IO(nn.Module):
     def o(self, x):
         return self.out(x)
 
-    def cost(self, targets, masks, outputs, label_smooth=0.0):
+    def cost(self, targets, masks, outputs, label_smooth=0.0, name=None):
+        loss = dict()
+        if name is None:
+            name = 'MLE'
         targets, outputs = with_mask(targets, outputs, masks.byte())
-        logits = log_softmax(self.o(outputs))
-        return F.nll_loss(logits, targets) * (1 - label_smooth) - logits.mean() * label_smooth
-
+        loss[name] = cross_entropy_with_smooth(self.o(outputs), targets, label_smooth)
+        
     def acc(self, targets, masks, outputs):
         with torch.cuda.device_of(targets):
             targets, outputs = with_mask(targets, outputs, masks.byte())
@@ -424,66 +428,14 @@ class MulIO(IO):
         super().__init__(field, args)
 
         # TODO: experimental: just have a try?
+        self.args = args
         self.width = args.multi_width
+        self.dyn = args.dyn
         self.rounter = nn.Linear(args.d_model, args.d_model * self.width)
-
-        # self.deconv = nn.ModuleList([nn.ConvTranspose1d(args.d_model, args.d_model, 2, 2) for _ in range(self.depth)])
-        # self.tau = 10
-        # self.checker = Linear(args.d_model, args.d_model, bias=True)
-        # self.wk = Linear(d_key,   d_key, bias=True)
+        self.predictor = FeedForward(args.d_model, args.d_hidden, d_output=2)
 
     def expand(self, x):
-        S = x.size()
-        return self.rounter(x).view(*S, self.width).contiguous()
-        
-        # x = x.contiguous().view(-1, S[-1]).contiguous().unsqueeze(-1)
-        # for i in range(self.depth):
-        #     x = self.deconv[i](x)
-        #     if i != (self.depth - 1):
-        #         x = F.relu(x)
-
-    def check(self, outputs, block_outputs):
-        N, T, B, D = block_outputs.size()
-        
-        maxidx = self.out(block_outputs).max(-1)[1]
-        maxout = F.embedding(maxidx, self.out.weight * self.scale)     # N x T x B x D
-        scores = matmul(outputs, maxout.transpose(2, 3)).view(N, -1)   # N x (T x B) 
-        x, y, m, a = [outputs.new_zeros(N, T + 1).long() for _ in range(4)]   # coord-x, coord-y, mask
-        
-        for t in range(T): 
-
-            idx = torch.cat([x[:, t:t+1] * B + y[:, t:t+1], x.new_ones(N, 1) * t * B], 1)   # index on the 2D grid of scores.
-            scx = scores.gather(1, idx)                                                     # gathered scores on the 2D grid.
-            
-            # Gumbel-softmax relaxiation
-            soft_accept = gumbel_softmax(scx, beta=1, tau=self.tau)                         # N x (T x B) x 2
-            hard_accept = soft_accept.max(-1)[1]                                            # N x (T x B)
-
-            print(soft_accept.size())
-            print(soft_accept[0])
-            print(hard_accept.size())
-            print(hard_accept[0])
-            1/0
-
-            prob = torch.sigmoid((scx[:, 0] - scx[:, 1]) / self.tau)                        # action probability based on choices (accept or reject?)
-            accept = torch.bernoulli(prob).long()                                           # take an action
-            
-            y[:, t+1] = y[:, t] + accept                                                    # (be careful) maybe exceed the boundary
-            m[:, t]   = (y[:, t+1] < B).long()                                              # mask every step out-of-boundary
-            accept    = accept * m[:, t]                                                    # if out-of-boundary, then force reject.
-
-            y[:, t+1] = (y[:, t] + accept) * accept                                         # keep (accept) or reset (reject) ?
-            x[:, t+1] = x[:, t] * accept + (t + 1) * (1 - accept)                           # keep (accept) or jump  (reject) ?
-
-        # for t in range(T+1):
-        #     print('{}: ({}, {}) '.format(t, x[1, t], y[1, t]))
-        # print((x * B + y)[1, :T+1])
-        # print(N, T, B, D)
-        new_mask = block_outputs.new_zeros(N, T * B).scatter_(1, (x * B + y)[:, :-1], 1).view(N, T, B).contiguous() # which word is selected in the end.
-
-
-        1/0
-        return new_mask
+        return self.rounter(x).view(*x.size(), self.width).contiguous()
 
     def o(self, x, full=False):
         x = self.expand(x)
@@ -496,14 +448,101 @@ class MulIO(IO):
             x = x.transpose(-1, -2)
         return self.out(x)
 
-    def cost(self, targets, masks, outputs, label_smooth=0.0):
-        targets, masks = shift(targets, self.width - 1), shift(masks, self.width - 1)
-        block_outputs = self.expand(outputs).transpose(3, 2) # batch_size x seq-size x block-size x d_model
+    def cost(self, targets, masks, outputs, label_smooth=0.0, name=None):
+        loss = dict()
+        if name is None:
+            name = 'MLE'
 
-        # print(targets.size(), masks.size(), outputs.size())
-        targets, block_outputs = with_mask(targets, block_outputs, masks.byte())
-        logits = log_softmax(self.out(block_outputs))
-        return F.nll_loss(logits, targets) * (1 - label_smooth) - logits.mean() * label_smooth
+        shifted_targets, shifted_masks = shift(targets, self.width), shift(masks, self.width)
+        block_outputs = self.expand(outputs).transpose(3, 2)    # batch_size x seq-size x block-size x d_model
+
+        if not self.dyn:
+            shifted_targets, block_outputs = with_mask(shifted_targets, block_outputs, shifted_masks.byte())
+            loss[name] = cross_entropy_with_smooth(self.out(block_outputs), targets, label_smooth)
+
+        else:   
+
+            # -- exact search for the best latent sequence using viterbi-decoding -- #
+            with torch.no_grad():
+                scores = log_softmax(self.out(block_outputs)).gather(
+                    -1, shifted_targets.unsqueeze(-1)).squeeze(-1)    # batch_size x seq-size x block-size
+                acceptance, new_masks = self.viterbi(scores, shifted_masks, self.args.constant_penalty)
+
+            # use another predictor to predict the beam-searched sequence!
+            predictions = self.predict(outputs)
+            acceptance, predictions = with_mask(acceptance, predictions, masks.byte())
+            loss['ACC'] = F.cross_entropy(predictions, acceptance)
+            loss['#SPEEDUP'] = acceptance.float().mean()
+
+            shifted_targets, block_outputs = with_mask(shifted_targets, block_outputs, new_masks.byte())
+            loss[name] = cross_entropy_with_smooth(self.out(block_outputs), shifted_targets, label_smooth)
+        
+        return loss
+
+    def predict(self, outputs):
+        return self.predictor(outputs)
+
+    def viterbi(self, scores, shifted_masks, c=0):
+        """
+        scores: loglikelihood
+        c: penalty for autoregressive decoding
+        """
+        batchsize, seqsize, blocksize = scores.size()
+
+        scores = shift(scores * shifted_masks, blocksize, right=True, value=-INF)  # right-shifting
+        scores[:, :, 0] = scores[:, :, 0] - c
+        
+        decisions = scores.new_zeros(batchsize, seqsize, blocksize).long() # all starts from 0
+        outputs   = scores.new_zeros(batchsize, seqsize, blocksize).add_(-INF)
+        outputs[:, 0, 0] = scores[:, 0, 0]
+
+        for t in range(1, seqsize):
+            
+            max_outputs, max_indx = outputs[:, t-1].max(1)
+            outputs[:, t, 0] = max_outputs + scores[:, t, 0]            # best score for reject
+            outputs[:, t, 1:] = outputs[:, t-1, :-1] + scores[:, t, 1:] # best score for accept 1,2,3,...
+
+            reject_decisions = decisions[:, :t].gather(2, max_indx[:, None, None].expand(batchsize, t, 1)) # best reject decision
+            decisions[:,  t, 1:] = decisions[:, t-1, :-1] + 1
+            decisions[:, :t, 1:] = decisions[:, :t,  :-1]
+            decisions[:,  t, :1] = 0
+            decisions[:, :t, :1] = reject_decisions
+            
+        best_outputs, best_indx = outputs[:, -1, :].max(1)
+        best_decision = decisions.gather(2, best_indx[:, None, None].expand(batchsize, seqsize, 1))
+
+        acceptance = (best_decision.squeeze(-1) != 0).long()
+        new_masks = scores.new_zeros(batchsize, seqsize, blocksize).scatter_(2, best_decision, 1)
+        new_masks = shift(new_masks, blocksize, right=False) * shifted_masks
+        return acceptance, new_masks
+
+    # def search(self, scores, K=8):
+    #     batchsize, seqsize, blocksize = scores.size()
+    #     scores = shift(scores, blocksize, right=True, value=-INF)  # right-shifting
+    #     scores = torch.cat([scores, scores.new_zeros(batchsize, seqsize, 1) - INF], dim=2)  # safely guard
+        
+    #     decisions = scores.new_zeros(batchsize, seqsize, K).long() # all starts from 0
+    #     outputs = scores[:, 0, :].gather(1, decisions[:, 0, :])
+    #     outputs[:, 1:].add_(-INF)
+        
+    #     for t in range(1, seqsize):
+    #         reject_outputs = outputs + scores[:, t, 0:1]
+    #         accept_outputs = outputs + scores[:, t, :].gather(1, decisions[:, t-1, :] + 1)
+            
+    #         new_outputs = torch.cat([reject_outputs, accept_outputs], 1)
+    #         decisions = torch.cat([decisions, decisions], 2)
+    #         decisions[:, t, K:] = decisions[:, t-1, K:] + 1
+
+    #         outputs, sorted_ind = new_outputs.topk(K, dim=1)
+    #         decisions = decisions.gather(2, sorted_ind[:, None, :].expand(batchsize, seqsize, K))
+
+    #     best_decision = decisions[:, :, 0]  
+    #     acceptance = (best_decision != 0).long()
+    #     new_mask = scores.new_zeros(batchsize, seqsize, blocksize).scatter_(2, best_decision.unsqueeze(-1), 1)
+    #     new_mask = shift(new_mask, blocksize, right=False)
+
+    #     return acceptance, new_mask
+
 
 
 class Encoder(nn.Module):
@@ -542,13 +581,12 @@ class Encoder(nn.Module):
 
 class Decoder(nn.Module):
 
-    def __init__(self, field, args, causal=True,
-                positional=False, noisy=False):
+    def __init__(self, field, args, causal=True, noisy=False):
 
         super().__init__()
 
         self.layers = nn.ModuleList(
-            [DecoderLayer(args, causal, positional, noisy, order=args.block_order)
+            [DecoderLayer(args, causal, noisy, order=args.block_order)
             for i in range(args.n_layers)])
 
         self.dropout = nn.Dropout(args.drop_ratio)
@@ -559,7 +597,6 @@ class Decoder(nn.Module):
         self.d_model = args.d_model
         self.field = field
         self.length_ratio = args.length_ratio
-        self.positional = positional
         self.cross_attn_fashion = args.cross_attn_fashion
         self.normalize_emb = args.normalize_emb
 
@@ -578,7 +615,7 @@ class Decoder(nn.Module):
             embedding = self.layernorm(embedding)
         return embedding
 
-    def forward(self, x, encoding, mask_src=None, mask_trg=None):
+    def forward(self, x, encoding=None, mask_src=None, mask_trg=None):
 
         x = self.dropout(x)
         if self.normalize_emb:
@@ -726,28 +763,10 @@ class Transformer(nn.Module):
             masks = (text.data[:, :, self.fields[field].vocab.stoi['<pad>']] != 1).float()
         return masks
 
-    def prepare_outputs(self, field, batch):
-        import pdb
-        pdb.set_trace()
-        
-        B, T, n = batch.size()
-        batch_flat = batch.view(B, -1).contiguous() 
-        char_mask = (batch_flat != self.fields[field].vocab.stoi['<pad>'])
-        char_mask_sum = char_mask.float().sum(-1)
-        T_char = int(char_mask_sum.max())
-        range_matrix = torch.range(start=0, end=T_char-1).cuda().unsqueeze(0).expand(B,-1).contiguous()
-        expand_mask = (range_matrix>=char_mask_sum.unsqueeze(1).expand(-1,T_char)).contiguous()
-        expanded_mask = torch.cat([char_mask, expand_mask], dim=-1)
-        expanded_batch_flat = torch.cat([batch_flat, expand_mask.new(expand_mask.size()).fill_(self.fields[field].vocab.stoi['<pad>']).long()], dim=-1)
-        batch_outputs = expanded_batch_flat[expanded_mask].view(B, -1).contiguous() 
-        return batch_outputs
-    
     def prepare_data(self, batch):
-        
-        source_inputs, source_outputs = batch.src.contiguous(), self.prepare_outputs('src', batch.src.contiguous())
-        target_inputs, target_outputs = batch.trg.contiguous(), self.prepare_outputs('trg', batch.trg.contiguous())
+        source_inputs, source_outputs = batch.src[:, :-1].contiguous(), batch.src[:, 1:].contiguous()
+        target_inputs, target_outputs = batch.trg[:, :-1].contiguous(), batch.trg[:, 1:].contiguous()
         source_masks, target_masks = self.prepare_masks(('src', source_outputs)), self.prepare_masks(('trg', target_outputs))
-        source_masks_inputs, target_masks_inputs = self.prepare_masks(('src', source_inputs)), self.prepare_masks(('trg', target_inputs))
         return source_inputs, source_outputs, source_masks, target_inputs, target_outputs, target_masks
 
     def encoding(self, encoder_inputs, encoder_masks):
@@ -797,16 +816,20 @@ class Transformer(nn.Module):
 
             # Maximum Likelihood Training (with label smoothing trick)
             decoding_outputs = self.decoding(encoding_outputs, source_masks, target_inputs, target_masks)        
-            loss  = self.io_dec.cost(target_outputs, target_masks, outputs=decoding_outputs, label_smooth=self.args.label_smooth)
-            info['MLE'] = loss
+            loss = self.io_dec.cost(target_outputs, target_masks, outputs=decoding_outputs, label_smooth=self.args.label_smooth)
+            
+            for w in loss:
+                info['L@' + w] = loss[w]
+                if w[0] != '#':
+                    info['loss'] = info['loss'] + loss[w]
 
             # Source side Language Model (optional, only works for causal-encoder)
             if self.args.encoder_lm and self.args.causal_enc:
                 loss_lm = self.io_enc.cost(source_outputs, source_masks, outputs=encoding_outputs[-1])
-                info['LM'] = loss_lm
-                loss += loss_lm
-            
-            info['loss'] = loss
+                for w in loss_lm:
+                    info['L@' + w] = loss[w]
+                    if w[0] != '#':
+                        info['loss'] = info['loss'] + loss[w]
 
         else:
             if self.args.multi_width > 1: # -- the newly introduced block-wise decoding -- 
@@ -989,8 +1012,14 @@ class Transformer(nn.Module):
                 t_dec = t_dec + 1   # <bos> is the step we always make first.
 
             else:
+                
+                if not self.args.dyn:
+                    # block-varying based on exact-matching
+                    hits = curr_outputs[:, :-1, 0] == prev_outputs[:, 1:]    # batch_size x (n_step - 1)
+                else:
+                    # dynamic block-wise based on my prediction.
+                    hits = self.io_dec.predict(decoding_outputs[-1][:, t:t+offset-1]).max(-1)[1]
 
-                hits = curr_outputs[:, :-1, 0] == prev_outputs[:, 1:]    # batch_size x (n_step - 1)
                 hits = torch.cat([hits.new_ones(B, 1), hits], 1)         # batch_size x n_step
                 new_mask = hits.cumprod(1)                               # batch_size x n_step
                 new_index = (new_mask - torch.cat(
@@ -1022,4 +1051,4 @@ class Transformer(nn.Module):
                     break
 
         outputs = outputs * outputs_mask.long() + self.fields['trg'].vocab.stoi['<pad>'] * (1 - outputs_mask.long())
-        return outputs
+        return outputs[:, 1:]

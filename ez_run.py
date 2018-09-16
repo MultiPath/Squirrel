@@ -73,7 +73,6 @@ parser.add_argument('--n_layers', type=int, default=6,     help='number of encod
 parser.add_argument('--n_heads',  type=int, default=8,     help='number of heads for multi-head attention')
 parser.add_argument('--drop_ratio', type=float, default=0.1, help='dropout ratio')
 
-
 # model ablation settings
 parser.add_argument('--block_order', type=str, default='tdan', choices=['tdan', 'tdna', 'tnda'])
 parser.add_argument('--normalize_emb', action='store_true', help='normalize embedding (IO)')
@@ -82,8 +81,15 @@ parser.add_argument('--encoder_lm', action='store_true', help='use unidirectiona
 parser.add_argument('--causal',   action='store_true', help='use causal attention')
 parser.add_argument('--cross_attn_fashion', type=str, default='forward', choices=['forward', 'reverse', 'last_layer'])
 parser.add_argument('--share_embeddings',     action='store_true', help='share embeddings between encoder and decoder')
-parser.add_argument('--positional_attention', action='store_true', help='incorporate positional information in key/value')
+
+# Char-Word Attention
+parser.add_argument('--self_char_attention', action='store_true', help='(experimental) two-level char attention, then word level attention.')
+
+# MS-decoder: blockwise parallel decoding 
 parser.add_argument('--multi_width', type=int, default=1, help='default not use multi-step prediction')
+parser.add_argument('--dyn', action='store_true', help='dynamic block-wse decoding (experimental)')
+parser.add_argument('--constant_penalty', type=float, default=0)
+
 
 # running setting
 parser.add_argument('--mode',    type=str, default='train',  help='train, test or data')  # "data": preprocessing and save vocabulary
@@ -190,7 +196,7 @@ if args.params == 'james-iwslt':
 elif args.params == 't2t-base':
     watcher.info('use default parameters of t2t-base')  # t2t-base, 512-2048-6
     hparams = {'d_model': 512, 'd_hidden': 2048, 'n_layers': 6,
-                'n_heads': 8, 'drop_ratio': 0.1, 'warmup': 16000} # ~32
+                'n_heads': 8, 'drop_ratio': 0.1, 'warmup': 4000} # ~32
 else:
     watcher.info("following the user setting.")
 
@@ -205,7 +211,7 @@ hp_str = (f".{args.dataset}_{args.params}_"
           f"{'c' if args.char else 'w'}_"
           f"{args.label_smooth}_"
           f"{args.inter_size*args.batch_size*args.world_size}_"
-          f"{'M{}'.format(args.multi_width)} "
+          f"{'M{}'.format(args.multi_width)}"
           )
 
 watcher.info(f'Starting with HPARAMS: {hp_str}')
@@ -223,17 +229,15 @@ watcher.info("total trainable parameters: {}".format(format(count_parameters(mod
 if torch.cuda.is_available():
     model.cuda()
 
+if args.distributed:
+    model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank)
+
 # load pre-trained parameters
 if args.load_from is not None:
     with torch.cuda.device(args.local_rank):
         model.load_state_dict(torch.load(
             os.path.join(args.workspace_prefix, 'models', args.load_from + '.pt'),
             map_location=lambda storage, loc: storage.cuda()))  # load the pretrained models.
-
-
-if args.distributed:
-    model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank)
-
 
 # additional information
 args.__dict__.update({'model_name': model_name, 'hp_str': hp_str})

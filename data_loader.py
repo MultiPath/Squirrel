@@ -123,7 +123,80 @@ def fetch_pool(minibatch, data, batch_size, key, batch_size_fn=lambda new, count
 
 """ sequence data field """
 class Seuqence(data.Field):
-    
+
+    def reverse(self, batch, char=False, width=1, return_saved_time=False):
+        if not self.batch_first:
+            batch.t_()
+
+        with torch.cuda.device_of(batch):
+            batch = batch.tolist()
+
+        batch = [[self.vocab.itos[ind] for ind in ex] for ex in batch] # denumericalize
+
+        def trim(s, t):
+            sentence = []
+            for w in s:
+                if w == t:
+                    break
+                sentence.append(w)
+            return sentence
+
+        batch = [trim(ex, self.eos_token) for ex in batch] # trim past frst eos
+
+        def filter_special(tok):
+            return tok not in (self.init_token, self.pad_token)
+        
+        def count(ex):
+            n_step = 0
+            n_pad  = 0
+            n_word = 0
+
+            filtered = []
+            for e in ex:
+                if e == self.pad_token:
+                    n_pad += 1
+                    if n_word > 0:
+                        n_step += 1
+                        n_word = 0
+                else:
+                    if n_word < (width - 1):
+                        n_word += 1
+                    else:
+                        n_word = 0
+                        n_step += 1
+
+                    filtered.append(e)
+            
+            saved_time = (n_step + (n_word == 0)) / (1 + len(filtered))
+            accuracy = len(filtered) / (len(ex) + 1e-9)
+            return filtered, saved_time, accuracy
+
+        if return_saved_time:
+            batch_filtered, saved_time, accuracy = [], [], []
+            for ex in batch:
+                b, s, a = count(ex)
+                batch_filtered.append(b)
+                saved_time.append(s)
+                accuracy.append(a)
+
+        else:
+            batch_filtered = [list(filter(filter_special, ex)) for ex in batch]
+        
+        if not char:
+            output = [" ".join(ex) for ex in batch_filtered]
+        else:
+            output = ["".join(ex) for ex in batch_filtered]
+
+        if return_saved_time:
+            return output, saved_time, accuracy
+
+        return output
+
+
+class Sequence2D(Seuqence):
+    """
+    A new field to transform input into 2D space.
+    """
     def pad(self, minibatch):
         """Pad a batch of examples using this field.
         Pads to self.fix_length if provided, otherwise pads to the length of
@@ -139,10 +212,8 @@ class Seuqence(data.Field):
         if self.fix_length is None:
             max_len = max(len(x) for x in minibatch)
         else:
-            print(1/0)
-            
-#            max_len = self.fix_length + (
-#                self.init_token, self.eos_token).count(None) - 2
+            raise NotImplementedError
+
         padded, lengths = [], []  
 
         for x in minibatch:
@@ -157,7 +228,7 @@ class Seuqence(data.Field):
         if self.fix_length is None:
             max_word = max(len(word) for sentence in padded for word in sentence)
         else:
-            print(1/0)
+            raise NotImplementedError
         
         padded_word_all = []
         for sentence in padded:
@@ -203,24 +274,7 @@ class Seuqence(data.Field):
             if self.postprocessing is not None:
                 arr = self.postprocessing(arr, self.vocab)
         else:
-            print(1/0)
-            '''
-            if self.dtype not in self.dtypes:
-                raise ValueError(
-                    "Specified Field dtype {} can not be used with "
-                    "use_vocab=False because we do not know how to numericalize it. "
-                    "Please raise an issue at "
-                    "https://github.com/pytorch/text/issues".format(self.dtype))
-            numericalization_func = self.dtypes[self.dtype]
-            # It doesn't make sense to explictly coerce to a numeric type if
-            # the data is sequential, since it's unclear how to coerce padding tokens
-            # to a numeric type.
-            if not self.sequential:
-                arr = [numericalization_func(x) if isinstance(x, six.string_types)
-                       else x for x in arr]
-            if self.postprocessing is not None:
-                arr = self.postprocessing(arr, None)
-            '''
+            raise NotImplementedError
 
         var = torch.tensor(arr, dtype=self.dtype, device=device)
 
@@ -232,74 +286,6 @@ class Seuqence(data.Field):
         if self.include_lengths:
             return var, lengths
         return var
-    
-    def reverse(self, batch, char=False, width=1, return_saved_time=False):
-        if not self.batch_first:
-            batch.t_()
-
-        with torch.cuda.device_of(batch):
-            batch = batch.tolist()
-
-        batch = [[self.vocab.itos[ind] for ind in ex] for ex in batch] # denumericalize
-
-        def trim(s, t):
-            sentence = []
-            for w in s:
-                if w == t:
-                    break
-                sentence.append(w)
-            return sentence
-
-        batch = [trim(ex, self.eos_token) for ex in batch] # trim past frst eos
-
-        def filter_special(tok):
-            return tok not in (self.init_token, self.pad_token)
-        
-        def count(ex):
-            n_step = 0
-            n_pad  = 0
-            n_word = 0
-
-            filtered = []
-            for e in ex:
-                if e == self.pad_token:
-                    n_pad += 1
-                    if n_word > 0:
-                        n_step += 1
-                        n_word = 0
-                else:
-                    if n_word < (width - 1):
-                        n_word += 1
-                    else:
-                        n_word = 0
-                        n_step += 1
-
-                    filtered.append(e)
-            
-            saved_time = (n_step + (n_word == 0)) / (1 + len(filtered))
-            accuracy = len(filtered) / len(ex)
-            return filtered, saved_time, accuracy
-
-        if return_saved_time:
-            batch_filtered, saved_time, accuracy = [], [], []
-            for ex in batch:
-                b, s, a = count(ex)
-                batch_filtered.append(b)
-                saved_time.append(s)
-                accuracy.append(a)
-
-        else:
-            batch_filtered = [list(filter(filter_special, ex)) for ex in batch]
-        
-        if not char:
-            output = [" ".join(ex) for ex in batch_filtered]
-        else:
-            output = ["".join(ex) for ex in batch_filtered]
-
-        if return_saved_time:
-            return output, saved_time, accuracy
-
-        return output
 
 
 """ parallel dataset. using the lazy loader for training """
@@ -415,7 +401,7 @@ class DataLoader(object):
         if not args.char:
             tokenizer = lambda s: s.split() 
         else:
-            tokenizer = lambda s: [list(word) for word in s.split()]
+            tokenizer = lambda s: list(s)
             
         if args.remove_dec_eos:
             TRG = Seuqence(batch_first=True, tokenize=tokenizer)

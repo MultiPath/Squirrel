@@ -37,7 +37,7 @@ def valid_model(args, watcher, model, dev, print_out=False):
             else:
                 outputs[key] += [dev_outputs[key]]
 
-        if print_out and (j < 5):
+        if print_out and (j < 10):
             watcher.info("{}: {}".format('source', dev_outputs['src'][0]))
             watcher.info("{}: {}".format('target', dev_outputs['trg'][0]))
             watcher.info("{}: {}".format('decode', dev_outputs['dec'][0]))
@@ -99,7 +99,7 @@ def train_model(args, watcher, model, train, dev, save_path=None, maxsteps=None)
     while True:
 
         # --- saving --- #
-        if False: # (iters % args.save_every == 0) and (args.local_rank == 0): # saving only works for local-rank=0
+        if (iters % args.save_every == 0) and (args.local_rank == 0): # saving only works for local-rank=0
             # watcher.info('save (back-up) checkpoints at iter={}'.format(iters))
             with torch.cuda.device(args.local_rank):
                 torch.save(watcher.best_tracker.model.state_dict(), '{}_iter={}.pt'.format(args.model_name, iters))
@@ -111,7 +111,7 @@ def train_model(args, watcher, model, train, dev, save_path=None, maxsteps=None)
             watcher.close_progress_bar()
 
             with torch.no_grad():
-                outputs_data = valid_model(args, watcher, model, dev, print_out=False)
+                outputs_data = valid_model(args, watcher, model, dev, print_out=True)
 
             if args.tensorboard and (not args.debug):
                 if len(outputs_data['tb_data']) > 0:
@@ -180,13 +180,10 @@ def train_model(args, watcher, model, train, dev, save_path=None, maxsteps=None)
                     int(info['tokens']), 
                     int(info['tokens'] / train_timer.elapsed_secs))
 
-        info_str += 'MLE_loss={:.3f}, '.format(info['MLE'] / args.world_size / args.inter_size)
-        if args.encoder_lm and args.causal_enc:
-            info_str += 'ENCLM_loss={:.3f}, '.format(info['LM'] / args.world_size / args.inter_size)
-
-        if args.tensorboard and (not args.debug):
-            watcher.add_tensorboard('train/Loss', info['MLE'] / args.world_size / args.inter_size, iters)
-            if args.encoder_lm and args.causal_enc:
-                watcher.add_tensorboard('train/Enc_LM_loss', info['LM'] / args.world_size / args.inter_size, iters)
+        for keyword in info:
+            if keyword[:2] == 'L@':
+                info_str += '{}={:.3f}, '.format(keyword, info[keyword] / args.world_size / args.inter_size)
+                if args.tensorboard and (not args.debug):
+                    watcher.add_tensorboard('train/{}'.format(keyword), info[keyword] / args.world_size / args.inter_size, iters)
         
         watcher.step_progress_bar(info_str=info_str)

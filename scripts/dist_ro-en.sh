@@ -1,4 +1,4 @@
- python -m torch.distributed.launch --nproc_per_node=8 --master_port=23456 \
+ python -m torch.distributed.launch --nproc_per_node=2 --master_port=23456 \
                 ez_run.py \
                 --prefix [time] \
                 --mode train \
@@ -9,7 +9,7 @@
                 --dev_set   "dev.bpe"   \
                 --test_set  "test.bpe"  \
                 --load_lazy \
-                --workspace_prefix "/private/home/jgu/space/exp-20180907-block/" \
+                --workspace_prefix "/private/home/jgu/space/char_debug/" \
                 --params "t2t-base" \
                 --eval_every 500  \
                 --batch_size 2048 \
@@ -18,4 +18,4 @@
                 --share_embeddings \
                 --tensorboard \
                 --cross_attn_fashion "forward" \
-
+                --debug

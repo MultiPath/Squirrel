@@ -291,33 +291,256 @@ class Attention(nn.Module):
         # return the attention results
         return matmul(self.dropout(probs), value)
 
+    
+class AttentionChar(nn.Module):
+
+    def __init__(self, d_key, drop_ratio, causal, noisy=False):
+        super().__init__()
+        self.scale = math.sqrt(d_key)
+        self.dropout = nn.Dropout(drop_ratio)
+        self.causal = causal
+        self.noisy  = noisy
+        self.p_attn = None
+
+    def forward(self, query, key, value=None, mask=None, beta=0, tau=1):
+        dot_products = matmul(query, key.transpose(1, 2))   # batch x trg_len x trg_len
+
+        if query.dim() == 3 and self.causal: # and (query.size(1) == key.size(1)):
+            tri = key.data.new(key.size(1), key.size(1)).fill_(1).triu(1) * INF
+            tri = tri[-query.size(1):]       # caual attention may work on non-square attention.
+            
+            dot_products.data.sub_(tri.unsqueeze(0))
+
+        if mask is not None:
+            if dot_products.dim() == 2:
+                assert mask.dim() == 2, "only works on 2D masks"
+                dot_products.data -= ((1 - mask) * INF)
+            else:
+                if mask.dim() == 2:
+                    dot_products.data -= ((1 - mask[:, None, :]) * INF)
+                else:
+                    dot_products.data -= ((1 - mask) * INF)
+
+        if value is None:
+            return dot_products
+
+        logits = dot_products / self.scale
+        if (not self.noisy): # or (not self.training):
+            probs = softmax(logits)
+        else:
+            probs = gumbel_softmax(logits, beta=beta, tau=tau)
+        self.p_attn = probs
+
+        # return the attention results
+        return matmul(self.dropout(probs), value)
+    
+class AttentionWord(nn.Module):
+
+    def __init__(self, d_key, drop_ratio, causal, noisy=False):
+        super().__init__()
+        self.scale = math.sqrt(d_key)
+        self.dropout = nn.Dropout(drop_ratio)
+        self.causal = causal
+        self.noisy  = noisy
+        self.p_attn = None
+
+    def forward(self, query, key, value=None, mask=None, mask_query_2=None, beta=0, tau=1):
+        dot_products = matmul(query, key.transpose(1, 2))   # batch x trg_len x trg_len_key
+
+        if query.dim() == 3 and self.causal: # and (query.size(1) == key.size(1)):
+
+            B, T_trg, T_key_w = dot_products.size() #14
+            B, T_key_w_q, T_char =  mask_query_2.size() #11
+            '''
+            tri = key.data.new(*dot_products.size()).fill_(1).contiguous().view(B, T_key_w_q, T_char, T_key_w)
+            new_mask = mask_query_2.sum(-1).view(-1)
+            tri_new = tri.contiguous().view(B*T_key_w_q, T_char, T_key_w)
+            mask_range = torch.range(start=0, end=T_key_w-1)[None,:].expand(B, -1).contiguous().view(-1)
+            new_mask_char = new_mask.data.new(B, T_key_w_q,T_key_w).fill_(0)
+            tri_new[:new_mask, :mask_range]=0.
+            tri = tri_new.view(B, T_key_w_q, T_char, T_key_w)
+                   # caual attention may work on non-square attention.
+            '''
+
+            
+            
+            ######################## have problem###############################
+            tri = torch.range(start=0, end=T_key_w-1)[None,None,:].cuda().expand(B, T_trg, -1).contiguous()
+
+#            tri_seed = key.data.new(T_key_w, T_key_w_q).fill_(1).triu()[None,:,:].expand(B,-1,-1).contiguous()
+            mask_range = torch.range(start=0, end=T_key_w-1)[None,:, None].cuda().expand(B, -1, T_char).contiguous()
+            new_mask = (mask_query_2*mask_range[:,:T_key_w_q,:]).view(B, -1)
+            tri_new = (tri<new_mask.unsqueeze(-1)).float()
+            ######################## have problem###############################
+
+            '''
+            tri = key.data.new(*dot_products.size()).fill_(1).contiguous().view(B, T_key_w_q, T_char, T_key_w)
+            new_mask = mask_query_2.sum(-1).view(-1).long()
+            tri_new = tri.contiguous().view(B*T_key_w_q, T_char, T_key_w)
+            tri_seed = key.data.new(T_key_w, T_key_w_q).fill_(1).triu()[None,:,None,:].expand(B,-1,-1).contiguous().view(B*T_key_w, T_char, T_key_w_q)
+            tri_new[:, :new_mask, :]= tri_seed[:, new_mask]
+            tri = tri_new.view(B, T_key_w_q, T_char, T_key_w)
+            '''
+            dot_products.data.sub_((1.0-tri_new)*INF)
+
+        if mask is not None:
+            if dot_products.dim() == 2:
+                assert mask.dim() == 2, "only works on 2D masks"
+                dot_products.data -= ((1 - mask) * INF)
+            else:
+                if mask.dim() == 2:
+                    dot_products.data -= ((1 - mask[:, None, :]) * INF)
+                else:
+                    dot_products.data -= ((1 - mask) * INF)
+
+        if value is None:
+            return dot_products
+
+        logits = dot_products / self.scale
+        if (not self.noisy): # or (not self.training):
+            probs = softmax(logits)
+        else:
+            probs = gumbel_softmax(logits, beta=beta, tau=tau)
+        self.p_attn = probs
+
+        # return the attention results
+        return matmul(self.dropout(probs), value)
+    
 class MultiHead2(nn.Module):
 
     def __init__(self, d_key, d_value, n_heads, drop_ratio=0.1, causal=False, noisy=False):
         super().__init__()
-        self.attention = Attention(d_key, drop_ratio, causal=causal, noisy=noisy)
+        self.attention_char = AttentionChar(d_key, drop_ratio, causal=causal, noisy=noisy)
+        self.attention_word = AttentionWord(d_key, drop_ratio, causal=causal, noisy=noisy)
+
         self.wq = Linear(d_key,   d_key, bias=True)
         self.wk = Linear(d_key,   d_key, bias=True)
         self.wv = Linear(d_value, d_value, bias=True)
         self.wo = Linear(d_value, d_key, bias=True)
         self.n_heads = n_heads
+        self.wq_w = Linear(d_key,   d_key, bias=True)
+        self.wk_w = Linear(d_key,   d_key, bias=True)
+        self.wv_w = Linear(d_value, d_value, bias=True)
+        self.causal = causal
+#        self.wo_w = Linear(d_value, d_key, bias=True)
+    def prepare_word_level_key(self, batch, mask):
 
-    def forward(self, query, key, value, mask=None, beta=0, tau=1):
+        B, T, n, d = batch.size()
+        batch_flat = batch.view(B, -1, d).contiguous() 
+        mask_flat = mask.view(B, -1).contiguous() 
+        mask_sum = mask_flat.float().sum(-1)
+        T_char = int(mask_sum.max())
+        range_matrix = torch.range(start=0, end=T_char-1).cuda().unsqueeze(0).expand(B,-1).contiguous()
+        expand_mask = (range_matrix>=mask_sum.unsqueeze(1).expand(-1,T_char)).contiguous()
+        expanded_mask = torch.cat([mask_flat, expand_mask.float()], dim=-1)
+        expanded_mask2 = torch.cat([mask_flat, expand_mask.float().zero_()], dim=-1)
+        expanded_batch_flat = torch.cat([batch_flat, expand_mask.float().new(expand_mask.size()).fill_(0.).unsqueeze(2).expand(-1,-1,d)], dim=1)
+        batch_outputs = expanded_batch_flat[expanded_mask.byte()].view(B, -1, d).contiguous() 
+        final_mask = expanded_mask2[expanded_mask.byte()].view(B, -1).contiguous() 
+        return batch_outputs, final_mask
+    
+    def forward(self, query, key, value, mask=None, mask_query=None, beta=0, tau=1):
+
         query, key, value = self.wq(query), self.wk(key), self.wv(value)   # B x T x D
-        B, Tq, D = query.size()
-        _, Tk, _ = key.size()
+        B, Tq, Tq_char, D = query.size()
+        _, Tk,Tk_char, _ = key.size()
+        _, Tv,Tv_char, _ = value.size()
         N = self.n_heads
 
         # reshape query-key-value for multi-head attention
-        query, key, value = (x.contiguous().view(B, -1, N, D//N).transpose(2, 1).contiguous().view(B*N, -1, D//N) for x in (query, key, value))
+        query_char, key_char, value_char = query.view(B*Tq, Tq_char, -1), key.view(B*Tk, Tk_char, -1), value.view(B*Tv, Tv_char, -1)
+        
+        query_char = query_char.contiguous().view(B*Tq, -1, N, D//N).transpose(1, 2).contiguous().view(B*Tq*N, -1, D//N)
+        key_char = key_char.contiguous().view(B*Tk, -1, N, D//N).transpose(1, 2).contiguous().view(B*Tk*N, -1, D//N)
+        value_char = value_char.contiguous().view(B*Tv, -1, N, D//N).transpose(1, 2).contiguous().view(B*Tv*N, -1, D//N)
+
         if mask is not None:
-            mask = mask[:, None, :].expand(B, N, Tk).contiguous().view(B*N, -1)
+            mask_char = mask[1].view(B*Tk, Tk_char)
+            mask_char = mask_char[:, None, :].expand(B*Tk, N, Tk_char).contiguous().view(B*Tk*N, -1)
+        
+        outputs_char = self.attention_char(query_char, key_char, value_char, mask_char, beta, tau)  # (B x n) x T x (D/n)
+        outputs_char = outputs_char.contiguous().view(B*Tq, N, -1, D//N).transpose(2, 1).contiguous().view(B, Tq, -1, D)
+                
+        key_word_level, final_mask = self.prepare_word_level_key(outputs_char, mask_query[2])
+        
 
-        outputs = self.attention(query, key, value, mask, beta, tau)  # (B x n) x T x (D/n)
-        outputs = outputs.contiguous().view(B, N, -1, D//N).transpose(2, 1).contiguous().view(B, -1, D)
-        return self.wo(outputs)
+        
+        query_w, key_w, value_w = self.wq_w(outputs_char), self.wk_w(key_word_level), self.wv_w(key_word_level)   # B x T x D
+        B, Tq, Tq_char, D = query_w.size()
+        _, Tk, _ = key_w.size()
+        _, Tv, _ = value_w.size()
+        N = self.n_heads
 
+        # reshape query-key-value for multi-head attention
+        query_w = query_w.view(B, Tq*Tq_char, -1)
+        
+        query_w = query_w.contiguous().view(B, -1, N, D//N).transpose(1, 2).contiguous().view(B*N, -1, D//N)
+        key_w = key_w.contiguous().view(B, -1, N, D//N).transpose(1, 2).contiguous().view(B*N, -1, D//N)
+        value_w = value_w.contiguous().view(B, -1, N, D//N).transpose(1, 2).contiguous().view(B*N, -1, D//N)
 
+        if final_mask is not None:
+
+            final_mask = final_mask[:, None, :].expand(B, N, Tk).contiguous().view(B*N, -1)
+            mask_query_whitespace_2 = mask_query[2][:, None, :, :].expand(B, N, Tq, -1).contiguous().view(B*N, Tq, -1)
+            mask_query_2 = mask_query[1][:, None, :, :].expand(B, N, Tq, -1).contiguous().view(B*N, Tq, -1)
+        outputs_w = self.attention_word(query_w, key_w, value_w, final_mask, mask_query_2, beta, tau)  # (B x n) x T x (D/n)
+        outputs_w = outputs_w.contiguous().view(B, N, -1, D//N).transpose(2, 1).contiguous().view(B, Tq*Tq_char,D)
+        outputs = outputs_w.view(B, Tq, Tq_char,D)* (mask_query[1]-mask_query[2])[:,:,:,None]+ outputs_char* mask_query[2][:,:,:,None]
+        return self.wo(outputs) 
+       
+class MultiHead2_cross(nn.Module):
+
+    def __init__(self, d_key, d_value, n_heads, drop_ratio=0.1, causal=False, noisy=False):
+        super().__init__()
+        self.attention_word = AttentionWord(d_key, drop_ratio, causal=causal, noisy=noisy)
+        self.n_heads = n_heads
+        self.wq_w = Linear(d_key,   d_key, bias=True)
+        self.wk_w = Linear(d_key,   d_key, bias=True)
+        self.wv_w = Linear(d_value, d_value, bias=True)
+        self.causal = causal
+        self.wo_w = Linear(d_value, d_key, bias=True)
+    def prepare_word_level_key(self, batch, mask):
+
+        B, T, n, d = batch.size()
+        batch_flat = batch.view(B, -1, d).contiguous() 
+        mask_flat = mask.view(B, -1).contiguous() 
+        mask_sum = mask_flat.float().sum(-1)
+        T_char = int(mask_sum.max())
+        range_matrix = torch.range(start=0, end=T_char-1).cuda().unsqueeze(0).expand(B,-1).contiguous()
+        expand_mask = (range_matrix>=mask_sum.unsqueeze(1).expand(-1,T_char)).contiguous()
+        expanded_mask = torch.cat([mask_flat, expand_mask.float()], dim=-1)
+        expanded_mask2 = torch.cat([mask_flat, expand_mask.float().zero_()], dim=-1)
+        expanded_batch_flat = torch.cat([batch_flat, expand_mask.float().new(expand_mask.size()).fill_(0.).unsqueeze(2).expand(-1,-1,d)], dim=1)
+        batch_outputs = expanded_batch_flat[expanded_mask.byte()].view(B, -1, d).contiguous() 
+        final_mask = expanded_mask2[expanded_mask.byte()].view(B, -1).contiguous() 
+        return batch_outputs, final_mask
+    
+    def forward(self, query, key, value, mask=None, mask_query=None, beta=0, tau=1):
+                
+        key_word_level, final_mask = self.prepare_word_level_key(key, mask[2])
+        query_w, key_w, value_w = self.wq_w(query), self.wk_w(key_word_level), self.wv_w(key_word_level)   # B x T x D
+        
+        B, Tq, Tq_char, D = query_w.size()
+        _, Tk, _ = key_w.size()
+        _, Tv, _ = value_w.size()
+        N = self.n_heads
+
+        # reshape query-key-value for multi-head attention
+        query_w = query_w.view(B, Tq*Tq_char, -1)
+        
+        query_w = query_w.contiguous().view(B, -1, N, D//N).transpose(1, 2).contiguous().view(B*N, -1, D//N)
+        key_w = key_w.contiguous().view(B, -1, N, D//N).transpose(1, 2).contiguous().view(B*N, -1, D//N)
+        value_w = value_w.contiguous().view(B, -1, N, D//N).transpose(1, 2).contiguous().view(B*N, -1, D//N)
+
+        if final_mask is not None:
+            final_mask = final_mask[:, None, :].expand(B, N, Tk).contiguous().view(B*N, -1)
+            mask_query_whitespace_2 = mask_query[2][:, None, :, :].expand(B, N, Tq, -1).contiguous().view(B*N, Tq, -1)
+            mask_query_2 = mask_query[1][:, None, :, :].expand(B, N, Tq, -1).contiguous().view(B*N, Tq, -1)
+        outputs_w = self.attention_word(query_w, key_w, value_w, final_mask, mask_query_2, beta, tau)  # (B x n) x T x (D/n)
+        outputs_w = outputs_w.contiguous().view(B, N, -1, D//N).transpose(2, 1).contiguous().view(B, Tq*Tq_char,D)
+        outputs = outputs_w.view(B, Tq, Tq_char,D)* (mask_query[1]-mask_query[2])[:,:,:,None]+ query* mask_query[2][:,:,:,None]
+        return self.wo_w(outputs) 
+    
 class FeedForward(nn.Module):
 
     def __init__(self, d_model, d_hidden, drop_ratio=0.1):
@@ -345,7 +568,7 @@ class EncoderLayer(nn.Module):
             args.d_model, args.drop_ratio, order=order)
 
     def forward(self, x, mask=None):
-        return self.feedforward(self.selfattn(x, x, x, mask))
+        return self.feedforward(self.selfattn(x, x, x, mask, mask))
 
 
 class DecoderLayer(nn.Module):
@@ -359,7 +582,7 @@ class DecoderLayer(nn.Module):
             args.d_model, args.drop_ratio, order=order)
 
         self.crossattn = ResidualBlock(
-            MultiHead2(args.d_model, args.d_model, args.n_heads,
+            MultiHead2_cross(args.d_model, args.d_model, args.n_heads,
                     args.drop_ratio, noisy=noisy),  # only noisy when doing cross-attention
             args.d_model, args.drop_ratio, order=order)
 
@@ -375,11 +598,12 @@ class DecoderLayer(nn.Module):
 
     def forward(self, x, encoding, p=None, mask_src=None, mask_trg=None):
 
-        x = self.selfattn(x, x, x, mask_trg)   #
+        x = self.selfattn(x, x, x, mask_trg, mask_trg)   #
         if self.positional:
             pos_encoding = positional_encodings_like(x)
             x = self.pos_selfattn(pos_encoding, pos_encoding, x, mask_trg)  # positional attention
-        x = self.feedforward(self.crossattn(x, encoding, encoding, mask_src))
+
+        x = self.feedforward(self.crossattn(x, encoding, encoding, mask_src, mask_trg))
         return x
 
 
@@ -393,22 +617,39 @@ class IO(nn.Module):
         self.scale = math.sqrt(args.d_model)
 
     def i(self, x, pos=True):
-        x = F.embedding(x, self.out.weight * self.scale)
+        B, T, T_char = x.size()
+        x_flat = x.view(B*T, -1).contiguous()       
+        x_flat = F.embedding(x_flat, self.out.weight * self.scale).view(B, T, T_char, -1).contiguous()
         if pos:
-            x += positional_encodings_like(x)
-        return x
+            x_flat += positional_encodings_like(x_flat[:,:,0,:])[:,:,None,:]+positional_encodings_like(x_flat[:,0,:,:])[:,None,:,:]
+        return x_flat
 
     def o(self, x):
         return self.out(x)
-
+    
+    def prepare_outputs(self, batch, mask):        
+        B, T, n, d = batch.size()
+        batch_flat = batch.view(B, -1, d).contiguous() 
+        mask_flat = mask.view(B, -1).contiguous() 
+        mask_sum = mask_flat.float().sum(-1)
+        T_char = int(mask_sum.max())
+        range_matrix = torch.range(start=0, end=T_char-1).cuda().unsqueeze(0).expand(B,-1).contiguous()
+        expand_mask = (range_matrix>=mask_sum.unsqueeze(1).expand(-1,T_char)).contiguous()
+        expanded_mask = torch.cat([mask_flat, expand_mask.float()], dim=-1)
+        expanded_batch_flat = torch.cat([batch_flat, expand_mask.float().new(expand_mask.size()).fill_(0.).unsqueeze(2).expand(-1,-1,d)], dim=1)
+        batch_outputs = expanded_batch_flat[expanded_mask.byte()].view(B, -1, d).contiguous() 
+        return batch_outputs
+    
     def cost(self, targets, masks, outputs, label_smooth=0.0):
-        targets, outputs = with_mask(targets, outputs, masks.byte())
+
+        outputs = self.prepare_outputs(outputs, masks[1])
+        targets, outputs = with_mask(targets, outputs, masks[0].byte())
         logits = log_softmax(self.o(outputs))
         return F.nll_loss(logits, targets) * (1 - label_smooth) - logits.mean() * label_smooth
 
     def acc(self, targets, masks, outputs):
         with torch.cuda.device_of(targets):
-            targets, outputs = with_mask(targets, outputs, masks.byte())
+            targets, outputs = with_mask(targets, outputs, masks[0].byte())
             return (self.o(outputs).max(-1)[1] == targets).float().tolist()
 
     def reverse(self, outputs, **kwargs):
@@ -529,7 +770,7 @@ class Encoder(nn.Module):
         return embedding
 
     def forward(self, x, mask=None):
-
+        
         encoding = [x]
         x = self.prepare_embedding(x)
         
@@ -726,9 +967,17 @@ class Transformer(nn.Module):
             masks = (text.data[:, :, self.fields[field].vocab.stoi['<pad>']] != 1).float()
         return masks
 
+    def prepare_masks_inputs(self, inputs):
+        field, text = inputs
+        masks = (text.data != self.fields[field].vocab.stoi['<pad>']).float()
+        return masks
+    
+    def prepare_whitespace_masks_inputs(self, inputs):
+        field, text = inputs
+        masks = (text.data == self.fields[field].vocab.stoi[' ']).float()
+        return masks
+    
     def prepare_outputs(self, field, batch):
-        import pdb
-        pdb.set_trace()
         
         B, T, n = batch.size()
         batch_flat = batch.view(B, -1).contiguous() 
@@ -747,8 +996,10 @@ class Transformer(nn.Module):
         source_inputs, source_outputs = batch.src.contiguous(), self.prepare_outputs('src', batch.src.contiguous())
         target_inputs, target_outputs = batch.trg.contiguous(), self.prepare_outputs('trg', batch.trg.contiguous())
         source_masks, target_masks = self.prepare_masks(('src', source_outputs)), self.prepare_masks(('trg', target_outputs))
-        source_masks_inputs, target_masks_inputs = self.prepare_masks(('src', source_inputs)), self.prepare_masks(('trg', target_inputs))
-        return source_inputs, source_outputs, source_masks, target_inputs, target_outputs, target_masks
+        source_masks_inputs, target_masks_inputs = self.prepare_masks_inputs(('src', source_inputs)), self.prepare_masks_inputs(('trg', target_inputs))
+        source_whitespace_masks_inputs, target_whitespace_masks_inputs = self.prepare_whitespace_masks_inputs(('src', source_inputs)), self.prepare_whitespace_masks_inputs(('trg', target_inputs))
+        
+        return source_inputs, source_outputs, (source_masks, source_masks_inputs, source_whitespace_masks_inputs), target_inputs, target_outputs, (target_masks, target_masks_inputs, target_whitespace_masks_inputs)
 
     def encoding(self, encoder_inputs, encoder_masks):
         return self.encoder(self.io_enc.i(encoder_inputs, pos=True), encoder_masks)
@@ -784,7 +1035,7 @@ class Transformer(nn.Module):
         target_inputs, target_outputs, target_masks = self.prepare_data(batch)
 
         info['sents']  = (target_inputs[:, 0] * 0 + 1).sum()
-        info['tokens'] = (target_masks != 0).sum()
+        info['tokens'] = (target_masks[1] != 0).sum()
 
         # in some extreme case.
         if info['sents'] == 0:

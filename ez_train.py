@@ -106,7 +106,7 @@ def train_model(args, watcher, model, train, dev, save_path=None, maxsteps=None)
                 torch.save([iters, watcher.best_tracker.opt.state_dict()], '{}_iter={}.pt.states'.format(args.model_name, iters))
 
         # --- validation --- #
-        if (iters % args.eval_every == 0): # and (args.local_rank == 0):
+        if (iters % args.eval_every == 10000000): # and (args.local_rank == 0):
 
             watcher.close_progress_bar()
 

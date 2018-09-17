@@ -13,7 +13,7 @@
                 --workspace_prefix "/data1/workspace/ro-en-character-dist/" \
                 --params "t2t-base" \
                 --eval_every 500  \
-                --batch_size 1200 \
+                --batch_size 300 \
                 --inter_size 4 \
                 --label_smooth 0.1 \
                 --share_embeddings \

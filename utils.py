@@ -8,6 +8,7 @@ import pickle
 import operator
 import logging
 
+
 from torch.autograd import Variable
 from torchtext import data, datasets
 from torchtext.data.batch import Batch
@@ -19,6 +20,9 @@ from timeit import default_timer
 from functools import reduce
 from tqdm import tqdm, trange
 from tensorboardX import SummaryWriter
+from termcolor import colored
+
+COLORS = ['red', 'green', 'yellow', 'blue', 'white', 'magenta', 'cyan']
 
 INF = 1e10
 TINY = 1e-9
@@ -85,6 +89,23 @@ def computeGroupBLEU(outputs, targets, tokenizer=None, bra=10, maxmaxlen=80):
 
     for k in range(nums):
         print(corpus_bleu([[t] for t in targets_buckets[k]], [o for o in outputs_buckets[k]], emulate_multibleu=True))
+
+
+def colored_seq(seq, bound, char=False):
+    seq = seq.split() if not char else seq
+    new_seq = []
+    c_id = 0
+
+    for k, w in enumerate(seq):
+        if bound[k] == 0:
+            c_id = (c_id + 1) % len(COLORS)
+
+        new_seq.append(colored(w, COLORS[c_id]))
+    
+    if not char:
+        return ' '.join(new_seq)
+    else:
+        return ''.join(new_seq)
 
 
 class Timer(object):

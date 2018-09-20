@@ -152,32 +152,42 @@ class Seuqence(data.Field):
             n_word = 0
 
             filtered = []
+            decision = []
+
             for e in ex:
                 if e == self.pad_token:
                     n_pad += 1
                     if n_word > 0:
                         n_step += 1
                         n_word = 0
+
                 else:
                     if n_word < (width - 1):
                         n_word += 1
+                        
                     else:
                         n_word = 0
                         n_step += 1
+                    
+                    if n_word == 1:
+                        decision.append(0)
+                    else:
+                        decision.append(1)
 
                     filtered.append(e)
             
             saved_time = (n_step + (n_word == 0)) / (1 + len(filtered))
             accuracy = len(filtered) / (len(ex) + 1e-9)
-            return filtered, saved_time, accuracy
+            return filtered, saved_time, accuracy, decision
 
         if return_saved_time:
-            batch_filtered, saved_time, accuracy = [], [], []
+            batch_filtered, saved_time, accuracy, decisions = [], [], [], []
             for ex in batch:
-                b, s, a = count(ex)
+                b, s, a, d = count(ex)
                 batch_filtered.append(b)
                 saved_time.append(s)
                 accuracy.append(a)
+                decisions.append(d)
 
         else:
             batch_filtered = [list(filter(filter_special, ex)) for ex in batch]
@@ -188,7 +198,7 @@ class Seuqence(data.Field):
             output = ["".join(ex) for ex in batch_filtered]
 
         if return_saved_time:
-            return output, saved_time, accuracy
+            return output, saved_time, accuracy, decisions
 
         return output
 
@@ -209,19 +219,24 @@ class Sequence2D(Seuqence):
         minibatch = list(minibatch)
         if not self.sequential:
             return minibatch
+
         if self.fix_length is None:
-            max_len = max(len(x) for x in minibatch)
+            max_len = max(len(x) for x in minibatch) + 2
         else:
             raise NotImplementedError
 
         padded, lengths = [], []  
 
         for x in minibatch:
-            x[0] = [self.init_token]+x[0]
-            x[-1] = x[-1] + [self.eos_token]
+            
+            # adding space before <bos> and <eos>
             for i, word in enumerate(x):
                 x[i].append(' ')
-                
+
+            # adding <bos> and <eos>
+            x = [[self.init_token]] + x + [[self.eos_token]]
+
+            # adding sentence pads
             padded.append(x + [[self.pad_token]] * max(0, max_len - len(x)))
             lengths.append(len(padded[-1]) - max(0, max_len - len(x)))
             
@@ -234,7 +249,10 @@ class Sequence2D(Seuqence):
         for sentence in padded:
             padded_word = []
             for word in sentence:
-                padded_word.append(word+[self.pad_token] * max(0, max_word - len(word)))
+                # put "space" "<bos>" "<eos>" to the end.
+                # adding word pads.
+                padded_word.append(word[:-1] + [self.pad_token] * max(0, max_word - len(word)) + word[-1:])
+            
             padded_word_all.append(padded_word)  
            
         if self.include_lengths:
@@ -400,20 +418,28 @@ class DataLoader(object):
         # --- setup data field --- #
         if not args.char:
             tokenizer = lambda s: s.split() 
+            Field = Seuqence
         else:
-            tokenizer = lambda s: list(s)
-            
+            if not args.c2:
+                tokenizer = lambda s: list(s)
+                Field = Seuqence
+            else:    
+                assert args.char, "2D grid inputs only works at Character-Level"
+                
+                tokenizer = lambda s: [list(word) for word in s.split()]
+                Field = Sequence2D
+
         if args.remove_dec_eos:
-            TRG = Seuqence(batch_first=True, tokenize=tokenizer)
+            TRG = Field(batch_first=True, tokenize=tokenizer)
         else:
-            TRG = Seuqence(init_token='<init>', eos_token='<eos>', batch_first=True, tokenize=tokenizer)
+            TRG = Field(init_token='<init>', eos_token='<eos>', batch_first=True, tokenize=tokenizer)
 
         if args.share_embeddings:
             SRC = TRG
         elif args.remove_enc_eos:
-            SRC = Seuqence(batch_first=True, tokenize=tokenizer)
+            SRC = Field(batch_first=True, tokenize=tokenizer)
         else:
-            SRC = Seuqence(init_token='<init>', eos_token='<eos>', batch_first=True, tokenize=tokenizer)
+            SRC = Field(init_token='<init>', eos_token='<eos>', batch_first=True, tokenize=tokenizer)
 
         self.SRC, self.TRG = SRC, TRG
 

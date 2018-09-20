@@ -13,6 +13,8 @@ import copy
 from ez_train import train_model
 from ez_decode import decode_model
 from model import Transformer, INF, TINY, softmax
+from model_c import TransformerC
+
 from time import gmtime, strftime
 from data_loader import DataLoader
 from utils import Watcher
@@ -44,9 +46,12 @@ parser.add_argument('--data_prefix', type=str, default='/data0/data/transformer_
 parser.add_argument('--workspace_prefix', type=str, default='./') 
 
 parser.add_argument('--dataset',     type=str, default='iwslt', help='"flickr" or "iwslt"')
-parser.add_argument('--char', action='store_true', help='if --char enabled, character-based model are used.')
 parser.add_argument('--src', type=str, default='en', help='source language marker')
 parser.add_argument('--trg', type=str, default='de', help='target language marker')
+
+# character-level Transformer
+parser.add_argument('--char',   action='store_true', help='if --char enabled, character-based model are used.')
+parser.add_argument('--c2', action='store_true', help='(experimental) used for input the 2D-char box.')
 
 parser.add_argument('--max_len',      type=int, default=None,  help='limit the train set sentences to this many tokens')
 parser.add_argument('--max_vocab_size', type=int, default=50000, help='max vocabulary size')
@@ -87,7 +92,9 @@ parser.add_argument('--self_char_attention', action='store_true', help='(experim
 
 # MS-decoder: blockwise parallel decoding 
 parser.add_argument('--multi_width', type=int, default=1, help='default not use multi-step prediction')
-parser.add_argument('--dyn', action='store_true', help='dynamic block-wse decoding (experimental)')
+parser.add_argument('--dyn', type=float, default=0.0, help='dynamic block-wse decoding (experimental)')
+parser.add_argument('--random_path', action='store_true', help='use a random path, instead of dynamic block-wse decoding (experimental)')
+parser.add_argument('--exact_match', action='store_true', help='match with the 1-step model in dynamic block-wse decoding (experimental)')
 parser.add_argument('--constant_penalty', type=float, default=0)
 
 
@@ -121,6 +128,7 @@ parser.add_argument('--resume',        action='store_true', help='when loading f
 
 # debugging
 parser.add_argument('--debug',       action='store_true', help='debug mode: no saving or tensorboard')
+parser.add_argument('--no_valid',    action='store_true', help='debug mode: no validation')
 parser.add_argument('--tensorboard', action='store_true', help='use TensorBoard')
 
 
@@ -217,6 +225,11 @@ hp_str = (f".{args.dataset}_{args.params}_"
 watcher.info(f'Starting with HPARAMS: {hp_str}')
 model_name = os.path.join(args.workspace_prefix, 'models', args.prefix + hp_str)
 
+# -------- 
+if args.c2:
+    Transformer = TransformerC  # Fully character-level model with 2D inputs (experi)
+# --------
+
 # build the model
 model = Transformer(dataloader.SRC, dataloader.TRG, args)
 # watcher.info(str(model))
@@ -241,9 +254,10 @@ if args.load_from is not None:
 
 # additional information
 args.__dict__.update({'model_name': model_name, 'hp_str': hp_str})
-args_str = ''
-for a in args.__dict__:
-    args_str += '{}:\t{}\n'.format(a, args.__dict__[a])
+args_str = '\n'.join(['{}:\t{}'.format(a, b) for a, b in sorted(args.__dict__.items(), key=lambda x: x[0])])
+
+# for a in args.__dict__:
+#     args_str += '{}:\t{}\n'.format(a, args.__dict__[a])
 watcher.info(args_str)
 
 # ----------------------------------------------------------------------------------------------------------------- #

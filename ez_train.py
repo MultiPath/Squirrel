@@ -40,7 +40,13 @@ def valid_model(args, watcher, model, dev, print_out=False):
         if print_out and (j < 10):
             watcher.info("{}: {}".format('source', dev_outputs['src'][0]))
             watcher.info("{}: {}".format('target', dev_outputs['trg'][0]))
-            watcher.info("{}: {}".format('decode', dev_outputs['dec'][0]))
+
+            if args.multi_width > 1:
+                watcher.info("{}: {}".format('decode', colored_seq(dev_outputs['dec'][0], dev_outputs['decisions'][0])))
+            else:
+                watcher.info("{}: {}".format('decode', dev_outputs['dec'][0]))
+
+
             watcher.info('------------------------------------------------------------------')
 
         info_str = 'Validation: sentences={}, gleu={:.3f}'.format(sum(outputs['sents']), np.mean(outputs['gleu']))
@@ -106,7 +112,7 @@ def train_model(args, watcher, model, train, dev, save_path=None, maxsteps=None)
                 torch.save([iters, watcher.best_tracker.opt.state_dict()], '{}_iter={}.pt.states'.format(args.model_name, iters))
 
         # --- validation --- #
-        if (iters % args.eval_every == 0): # and (args.local_rank == 0):
+        if (iters % args.eval_every == 0) and (not args.no_valid): # and (args.local_rank == 0):
 
             watcher.close_progress_bar()
 

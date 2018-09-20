@@ -1,4 +1,4 @@
- python -m torch.distributed.launch --nproc_per_node=2 --master_port=23456 \
+ python -m torch.distributed.launch --nproc_per_node=1 --master_port=23456 \
                 ez_run.py \
                 --prefix [time] \
                 --mode train \
@@ -10,7 +10,7 @@
                 --test_set  "test"  \
                 --load_lazy \
                 --char \
-                --workspace_prefix "/private/home/jgu/space/char_debug/" \
+                --workspace_prefix "/private/home/jgu/space/char_debug2/" \
                 --params "t2t-base" \
                 --eval_every 500  \
                 --batch_size 3072 \
@@ -19,5 +19,4 @@
                 --share_embeddings \
                 --tensorboard \
                 --cross_attn_fashion "forward" \
-                
-                #--debug
+                --debug

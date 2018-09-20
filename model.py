@@ -7,7 +7,7 @@ from torch import nn
 from torch.nn import functional as F
 from torch.autograd import Variable, Function
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
-from utils import computeGLEU, masked_sort, unsorted
+from utils import computeGLEU, masked_sort, unsorted, colored_seq
 
 INF = 1e10
 TINY = 1e-9
@@ -109,9 +109,18 @@ def argmax(x):  # return the one-hot vectors
     x_hard = x_hard.view(*shape)
     return x_hard
 
-def cross_entropy_with_smooth(outputs, targets, label_smooth=0.1):
+def cross_entropy_with_smooth(outputs, targets, label_smooth=0.1, reweight=None):
     logits = log_softmax(outputs)
-    return F.nll_loss(logits, targets) * (1 - label_smooth) - logits.mean() * label_smooth
+
+    if reweight is None:
+        return F.nll_loss(logits, targets) * (1 - label_smooth) - logits.mean() * label_smooth
+    else:
+        
+        nll_loss = (F.nll_loss(logits, targets, reduction='none') * reweight).mean()
+        return nll_loss * (1 - label_smooth) - logits.mean() * label_smooth
+
+
+
 
 def shift(x, n, right = False, value=0):
     if x.dim() == 2:
@@ -320,7 +329,10 @@ class MultiHead2(nn.Module):
         # reshape query-key-value for multi-head attention
         query, key, value = (x.contiguous().view(B, -1, N, D//N).transpose(2, 1).contiguous().view(B*N, -1, D//N) for x in (query, key, value))
         if mask is not None:
-            mask = mask[:, None, :].expand(B, N, Tk).contiguous().view(B*N, -1)
+            if mask.dim() == 2:
+                mask = mask[:, None, :].expand(B, N, Tk).contiguous().view(B*N, -1)
+            else:
+                mask = mask[:, None, :, :].expand(B, N, Tq, Tk).contiguous().view(B * N, Tq, Tk)
 
         outputs = self.attention(query, key, value, mask, beta, tau)  # (B x n) x T x (D/n)
         outputs = outputs.contiguous().view(B, N, -1, D//N).transpose(2, 1).contiguous().view(B, -1, D)
@@ -410,6 +422,8 @@ class IO(nn.Module):
         targets, outputs = with_mask(targets, outputs, masks.byte())
         loss[name] = cross_entropy_with_smooth(self.o(outputs), targets, label_smooth)
         
+        return loss
+
     def acc(self, targets, masks, outputs):
         with torch.cuda.device_of(targets):
             targets, outputs = with_mask(targets, outputs, masks.byte())
@@ -433,6 +447,7 @@ class MulIO(IO):
         self.dyn = args.dyn
         self.rounter = nn.Linear(args.d_model, args.d_model * self.width)
         self.predictor = FeedForward(args.d_model, args.d_hidden, d_output=2)
+        self.printer_param = [50 * self.args.inter_size, 0]
 
     def expand(self, x):
         return self.rounter(x).view(*x.size(), self.width).contiguous()
@@ -449,6 +464,10 @@ class MulIO(IO):
         return self.out(x)
 
     def cost(self, targets, masks, outputs, label_smooth=0.0, name=None):
+        
+        # some internal printing setup
+        self.printer_param[1] += 1
+
         loss = dict()
         if name is None:
             name = 'MLE'
@@ -456,9 +475,9 @@ class MulIO(IO):
         shifted_targets, shifted_masks = shift(targets, self.width), shift(masks, self.width)
         block_outputs = self.expand(outputs).transpose(3, 2)    # batch_size x seq-size x block-size x d_model
 
-        if not self.dyn:
+        if self.dyn == 0:
             shifted_targets, block_outputs = with_mask(shifted_targets, block_outputs, shifted_masks.byte())
-            loss[name] = cross_entropy_with_smooth(self.out(block_outputs), targets, label_smooth)
+            loss[name] = cross_entropy_with_smooth(self.out(block_outputs), shifted_targets, label_smooth)
 
         else:   
 
@@ -466,32 +485,45 @@ class MulIO(IO):
             with torch.no_grad():
                 scores = log_softmax(self.out(block_outputs)).gather(
                     -1, shifted_targets.unsqueeze(-1)).squeeze(-1)    # batch_size x seq-size x block-size
-                acceptance, new_masks = self.viterbi(scores, shifted_masks, self.args.constant_penalty)
+                acceptance, new_masks = self.viterbi(scores, shifted_masks, self.args.constant_penalty, random=self.args.random_path)
+
+            # visualize the paths
+            if self.printer_param[1] % self.printer_param[0] == 1:
+                print('rank{} sample:\t'.format(self.args.local_rank), 
+                    colored_seq(self.field.reverse(targets)[0], acceptance[0, :].cpu().tolist()))
 
             # use another predictor to predict the beam-searched sequence!
             predictions = self.predict(outputs)
             acceptance, predictions = with_mask(acceptance, predictions, masks.byte())
             loss['ACC'] = F.cross_entropy(predictions, acceptance)
-            loss['#SPEEDUP'] = acceptance.float().mean()
+            loss['#SPEEDUP'] = 1 / (1 - acceptance.float().mean() + 1e-9)
 
-            shifted_targets, block_outputs = with_mask(shifted_targets, block_outputs, new_masks.byte())
-            loss[name] = cross_entropy_with_smooth(self.out(block_outputs), shifted_targets, label_smooth)
+            if self.dyn == 1:
+                shifted_targets, block_outputs = with_mask(shifted_targets, block_outputs, new_masks.byte())
+                loss[name] = cross_entropy_with_smooth(self.out(block_outputs), shifted_targets, label_smooth)
+            else:
+                new_masks = new_masks[shifted_masks.byte()]
+                shifted_targets, block_outputs = with_mask(shifted_targets, block_outputs, shifted_masks.byte())
+                loss[name] = cross_entropy_with_smooth(self.out(block_outputs), shifted_targets, label_smooth, self.dyn * new_masks + 1 - self.dyn)
         
         return loss
 
     def predict(self, outputs):
         return self.predictor(outputs)
 
-    def viterbi(self, scores, shifted_masks, c=0):
+    def viterbi(self, scores, shifted_masks, c=0, random=False):
         """
         scores: loglikelihood
         c: penalty for autoregressive decoding
         """
         batchsize, seqsize, blocksize = scores.size()
 
-        scores = shift(scores * shifted_masks, blocksize, right=True, value=-INF)  # right-shifting
         scores[:, :, 0] = scores[:, :, 0] - c
-        
+        if random:
+            scores = torch.rand_like(scores)
+
+        scores = shift(scores * shifted_masks, blocksize, right=True, value=-INF)  # right-shifting
+
         decisions = scores.new_zeros(batchsize, seqsize, blocksize).long() # all starts from 0
         outputs   = scores.new_zeros(batchsize, seqsize, blocksize).add_(-INF)
         outputs[:, 0, 0] = scores[:, 0, 0]
@@ -499,6 +531,7 @@ class MulIO(IO):
         for t in range(1, seqsize):
             
             max_outputs, max_indx = outputs[:, t-1].max(1)
+
             outputs[:, t, 0] = max_outputs + scores[:, t, 0]            # best score for reject
             outputs[:, t, 1:] = outputs[:, t-1, :-1] + scores[:, t, 1:] # best score for accept 1,2,3,...
 
@@ -759,7 +792,7 @@ class Transformer(nn.Module):
         field, text = inputs
         if text.ndimension() == 2:  # index inputs
             masks = (text.data != self.fields[field].vocab.stoi['<pad>']).float()
-        else:                         # one-hot vector inputs
+        else:                       # one-hot vector inputs
             masks = (text.data[:, :, self.fields[field].vocab.stoi['<pad>']] != 1).float()
         return masks
 
@@ -773,7 +806,7 @@ class Transformer(nn.Module):
         return self.encoder(self.io_enc.i(encoder_inputs, pos=True), encoder_masks)
 
     def decoding(self, encoding_outputs, encoder_masks, decoder_inputs, decoder_masks,
-                 decoding=False, beam=1, alpha=0.6, return_probs=False):
+                decoding=False, beam=1, alpha=0.6, return_probs=False):
 
         if (return_probs and decoding) or (not decoding):
             out = self.decoder(self.io_dec.i(decoder_inputs, pos=True), encoding_outputs, encoder_masks, decoder_masks)
@@ -840,10 +873,11 @@ class Transformer(nn.Module):
             if reverse:
                 source_outputs = self.io_enc.reverse(source_outputs)
                 target_outputs = self.io_dec.reverse(target_outputs)
-                decoding_outputs, saved_time, pred_acc = self.io_dec.reverse(decoding_outputs, width=self.args.multi_width, return_saved_time=True)
+                decoding_outputs, saved_time, pred_acc, decisions = self.io_dec.reverse(decoding_outputs, width=self.args.multi_width, return_saved_time=True)
                 
                 info['saved_time'] = saved_time
                 info['pred_acc'] = pred_acc
+                info['decisions'] = decisions
 
             info['src'] = source_outputs
             info['trg'] = target_outputs
@@ -1013,7 +1047,7 @@ class Transformer(nn.Module):
 
             else:
                 
-                if not self.args.dyn:
+                if self.args.dyn == 0 or self.args.exact_match:
                     # block-varying based on exact-matching
                     hits = curr_outputs[:, :-1, 0] == prev_outputs[:, 1:]    # batch_size x (n_step - 1)
                 else:

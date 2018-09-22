@@ -28,6 +28,7 @@ class Message(namedlist('Message', ['data1d', 'mask1d', 'data2d', 'mask2d',
         
         if len(self.data1d.size()) == 3:  # include model dimension
             d_model = self.data1d.size(-1)
+            
             self.data2d = self.data1d.new_zeros(self.batch_size * self.max_num_word * self.max_size_word, d_model)
             # self.data2d.resize_(self.batch_size * self.max_num_word * self.max_size_word, d_model).zero_()
             self.data2d[self.idx2d] = self.data1d.view(-1, d_model)[self.idx1d]
@@ -148,7 +149,8 @@ class EncoderC(Encoder):
             message = layer(message)
             encoding.append(message.data2d)
 
-        return encoding
+        message.data2d = encoding
+        return message
 
 class DecoderC(Decoder):
 
@@ -169,16 +171,65 @@ class DecoderC(Decoder):
         self.cross_attn_fashion = args.cross_attn_fashion
         self.normalize_emb = args.normalize_emb
 
-    def forward(self, message, all_enc=None, enc_mask=None):
+    def forward(self, message, source_message):
         message.data1d = self.prepare_embedding(message.data1d)
         message.to2d_()
             
-        all_enc = self.prepare_encoder(all_enc)
-        for l, (layer, enc) in enumerate(zip(self.layers, all_enc)):
-            message = layer(message, enc, enc_mask)
+        source_message.data2d = self.prepare_encoder(source_message.data2d)
+        for l, layer in enumerate(self.layers):
+            message = layer(message, source_message.data2d[l], source_message.mask2d)
 
         return message
 
+    def greedy(self, io_dec, source_message):  # direct 1D decoding for characters.
+
+        batch_size, max_num_word, max_size_word, max_num_char = \
+        source_message.batch_size, source_message.max_num_word, source_message.max_size_word, source_message.max_num_char
+        d_model = self.d_model
+
+        source_message.data2d = self.prepare_encoder(source_message.data2d)
+        max_num_char_decoded = max_num_char * self.length_ratio
+
+        char_mask = source_message.data2d[0].new_zeros(batch_size, max_num_char_decoded + 1)
+        word_mask = char_mask.new_zeros(batch_size, max_num_char_decoded + 1)
+        char_mask[:, 0] = 1
+        word_mask[:, 0] = 1
+
+        outputs = char_mask.new_zeros(batch_size, max_num_char_decoded + 1).long().fill_(self.field.vocab.stoi['<init>'])
+        word_hiddens = [char_mask.new_zeros(batch_size, max_num_char_decoded, d_model) for _ in range(len(self.layers) + 1)]
+        char_hiddens = [char_mask.new_zeros(batch_size, max_num_char_decoded, d_model) for _ in range(len(self.layers))]
+        
+        word_hiddens[0] = word_hiddens[0] + positional_encodings_like(word_hiddens[0])
+        eos_yet = char_mask.new_zeros(batch_size).byte()
+
+        for t in range(max_num_char_decoded):
+
+            # add dropout, etc.
+            word_hiddens[0][:, t] = self.prepare_embedding(word_hiddens[0][:, t] + io_dec.i(outputs[:, t], pos=False))
+
+            for l in range(len(self.layers)):
+                char_hiddens[l][:, t:t+1] = self.layers[l].selfcharattn(word_hiddens[l][:, t:t+1], word_hiddens[l][:, :t+1], word_hiddens[l][:, :t+1], char_mask[:, :t+1])   
+                word_hiddens[l + 1][:, t] = \
+                self.layers[l].feedforward(
+                    self.layers[l].crosswordattn(
+                        self.layers[l].selfwordattn(char_hiddens[l][:, t:t+1], char_hiddens[l][:, :t+1], char_hiddens[l][:, :t+1], word_mask[:, :t+1]), 
+                        source_message.data2d[l][:, :, -1], source_message.data2d[l][:, :, -1], source_message.mask2d[:, :, -1]))[:, 0]
+
+            _, preds = io_dec.o(word_hiddens[-1][:, t]).max(-1)
+
+            preds[eos_yet] = self.field.vocab.stoi['<pad>']
+            eos_yet = eos_yet | (preds == self.field.vocab.stoi['<eos>'])
+            outputs[:, t + 1] = preds
+
+            # fixing the mask
+            char_mask = char_mask * (1 - ((outputs[:, t:t+1] == self.field.vocab.stoi['<init>']) | (outputs[:, t:t+1] == self.field.vocab.stoi[' '])).float())  # flush-out char masks
+            char_mask[:, t + 1] = 1
+            word_mask[:, t + 1] = (outputs[:, t + 1] == self.field.vocab.stoi[' ']).float()
+
+            if eos_yet.all():
+                break
+
+        return outputs[:, 1:t+2]
 
 
 class TransformerC(Transformer):
@@ -257,17 +308,21 @@ class TransformerC(Transformer):
         message.to2d_()
         return self.encoder(message)
 
-    def decoding(self, message, all_enc, enc_mask, decoding=False, beam=1, alpha=0.6, return_probs=False):
+    def decoding(self, message, source_message, decoding=False, beam=1, alpha=0.6, return_probs=False):
 
         if (return_probs and decoding) or (not decoding):
             message.data1d = self.io_dec.i(message.data1d, pos=True)
             message.to2d_()
-            message = self.decoder(message, all_enc, enc_mask)
+            message = self.decoder(message, source_message)
 
         if decoding:
-            raise NotImplementedError
-
-        return message.data1d
+            if beam == 1:  # greedy decoding
+                output = self.decoder.greedy(self.io_dec, source_message)
+            else:
+                raise NotImplementedError
+            return output
+        
+        return message
 
 
     def forward(self, batch, decoding=False, reverse=True):
@@ -276,17 +331,17 @@ class TransformerC(Transformer):
         info = defaultdict(lambda: 0)
 
         source_message, target_message = self.prepare_data(batch)
+        source_outputs1d = source_message.data1d[:, 1:] 
         target_outputs1d = target_message.data1d[:, 1:]
         target_masks1d   = target_message.mask1d[:, :-1]
 
         info['sents']  = (source_message.data1d[:, 0] * 0 + 1).sum()
         info['tokens'] = (target_message.mask1d != 0).sum()
 
-        encoding_outputs = self.encoding(source_message)
+        source_message = self.encoding(source_message)
         if not decoding:
-            decoding_outputs = self.decoding(target_message, encoding_outputs, source_message.mask2d)[:, :-1]  
-            print(target_outputs1d.size(), target_masks1d.size(), decoding_outputs.size())
-            loss = self.io_dec.cost(target_outputs1d, target_masks1d, outputs=decoding_outputs, label_smooth=self.args.label_smooth)
+            target_message = self.decoding(target_message, source_message)
+            loss = self.io_dec.cost(target_outputs1d, target_masks1d, outputs=target_message.data1d[:, :-1], label_smooth=self.args.label_smooth)
             
             for w in loss:
                 info['L@' + w] = loss[w]
@@ -294,6 +349,15 @@ class TransformerC(Transformer):
                     info['loss'] = info['loss'] + loss[w]
         else:
 
-            raise NotImplementedError
-        
+            decode_outputs1d = self.decoding(target_message, source_message, decoding=True, return_probs=False)
+            
+            if reverse:
+                source_outputs1d = self.io_enc.reverse(source_outputs1d)
+                target_outputs1d = self.io_dec.reverse(target_outputs1d)
+                decode_outputs1d = self.io_dec.reverse(decode_outputs1d)
+
+            info['src'] = source_outputs1d
+            info['trg'] = target_outputs1d
+            info['dec'] = decode_outputs1d
+                
         return info

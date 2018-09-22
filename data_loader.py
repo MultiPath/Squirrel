@@ -254,7 +254,7 @@ class Sequence2D(Seuqence):
                 padded_word.append(word[:-1] + [self.pad_token] * max(0, max_word - len(word)) + word[-1:])
             
             padded_word_all.append(padded_word)  
-           
+        
         if self.include_lengths:
             return (padded_word_all, lengths)
         return padded_word_all
@@ -274,8 +274,8 @@ class Sequence2D(Seuqence):
         """
         if self.include_lengths and not isinstance(arr, tuple):
             raise ValueError("Field has include_lengths set to True, but "
-                             "input data is not a tuple of "
-                             "(data batch, batch lengths).")
+                            "input data is not a tuple of "
+                            "(data batch, batch lengths).")
         
         if isinstance(arr, tuple):
             arr, lengths = arr
@@ -285,10 +285,8 @@ class Sequence2D(Seuqence):
             if self.sequential:
                 arr = [[[self.vocab.stoi[char] for char in x] for x in ex] for ex in arr]
             else:
-                print(1/0)
-                '''
-                arr = [self.vocab.stoi[x] for x in arr]
-                '''
+                raise NotImplementedError
+
             if self.postprocessing is not None:
                 arr = self.postprocessing(arr, self.vocab)
         else:
@@ -358,10 +356,10 @@ class DistributedBatch(Batch):
 class LazyBucketIterator(data.BucketIterator):
 
     def __init__(self, dataset, batch_size, sort_key=None, device=None,
-                 batch_size_fn=None, train=True, repeat=None, sort=None,
-                 sort_within_batch=False, distributed=False, rank=0, world_size=1):
+                batch_size_fn=None, train=True, repeat=None, sort=None,
+                sort_within_batch=False, distributed=False, rank=0, world_size=1):
         super().__init__(dataset, batch_size, sort_key, device, batch_size_fn, 
-                         train, repeat, shuffle=False, sort=sort, sort_within_batch=sort_within_batch)
+                        train, repeat, shuffle=False, sort=sort, sort_within_batch=sort_within_batch)
         
         self.minibatch = []  # save unfinished batches.
         self.distributed = distributed
@@ -418,15 +416,20 @@ class DataLoader(object):
         # --- setup data field --- #
         if not args.char:
             tokenizer = lambda s: s.split() 
+            sort_key = None
             Field = Seuqence
+
         else:
             if not args.c2:
                 tokenizer = lambda s: list(s)
+                sort_key = None
                 Field = Seuqence
             else:    
                 assert args.char, "2D grid inputs only works at Character-Level"
                 
                 tokenizer = lambda s: [list(word) for word in s.split()]
+                sort_key  = lambda ex: data.interleave_keys(sum([len(a) for a in ex.src]), 
+                                                            sum([len(b) for b in ex.trg]))
                 Field = Sequence2D
 
         if args.remove_dec_eos:
@@ -475,13 +478,18 @@ class DataLoader(object):
 
         def dyn_batch_without_padding(new, i, sofar):
             return sofar + max(len(new.src), len(new.trg))
+        
+        def dyn_batch_char2d(new, i, sofar):
+            return sofar + max(sum([len(a) for a in new.src]), sum([len(b) for b in new.trg]))
 
         if args.batch_size == 1:  # speed-test: one sentence per batch.
             batch_size_fn = lambda new, count, sofar: count
 
         else:
-            batch_size_fn = dyn_batch_without_padding
-
+            if args.char and args.c2:
+                batch_size_fn = dyn_batch_with_padding # dyn_batch_char2d
+            else:
+                batch_size_fn = dyn_batch_without_padding
         
         # --- build batch-iterator for Translation tasks. ---
         self.train, self.dev, self.test = None, None, None
@@ -490,6 +498,7 @@ class DataLoader(object):
             self.train = LazyBucketIterator(train_data, 
                                             batch_size=args.batch_size, 
                                             device=args.device,
+                                            sort_key=sort_key,
                                             batch_size_fn=batch_size_fn, train=True, 
                                             repeat=None if args.mode == 'train' else False,
                                             sort_within_batch=True, 
@@ -500,6 +509,7 @@ class DataLoader(object):
             self.dev = LazyBucketIterator(dev_data, 
                                             batch_size=args.batch_size, 
                                             device=args.device,
+                                            sort_key=sort_key,
                                             batch_size_fn=batch_size_fn, train=False, 
                                             repeat = False, 
                                             sort_within_batch=True, 

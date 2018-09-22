@@ -232,7 +232,7 @@ if args.c2:
 
 # build the model
 model = Transformer(dataloader.SRC, dataloader.TRG, args)
-# watcher.info(str(model))
+watcher.info(str(model))
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)

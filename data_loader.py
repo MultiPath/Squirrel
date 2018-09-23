@@ -9,12 +9,21 @@ import time
 import os
 import torch.distributed as dist
 
-from torchtext import data, datasets
+from torchtext import data, datasets, vocab
 from torchtext.data.batch import Batch
 from contextlib import ExitStack
 from collections import OrderedDict
 
-# ====================== Supportive Functions =========================================== #
+# ====================== Helper Functions =========================================== #
+
+""" Byte-level Transformation """
+def str2byte(string):
+    byte = string.encode('utf-8').hex()
+    return [byte[k: k+2] for k in range(0, len(byte), 2)]
+
+def byte2str(byte):
+    return bytes.fromhex(''.join(byte)).decode('utf-8')
+
 
 """" A Lazy text-reader """
 def lazy_reader(paths, fields, max_len=None, buffer=16384):  # -- infinite lazy dataloader --
@@ -124,7 +133,12 @@ def fetch_pool(minibatch, data, batch_size, key, batch_size_fn=lambda new, count
 """ sequence data field """
 class Seuqence(data.Field):
 
-    def reverse(self, batch, char=False, width=1, return_saved_time=False):
+    def __init__(self, reverse_tokenize, **kwargs):
+        super().__init__(**kwargs)
+        self.reverse_tokenizer = reverse_tokenize
+
+
+    def reverse(self, batch, width=1, return_saved_time=False):
         if not self.batch_first:
             batch.t_()
 
@@ -155,6 +169,9 @@ class Seuqence(data.Field):
             decision = []
 
             for e in ex:
+                if e == self.init_token:
+                    continue
+
                 if e == self.pad_token:
                     n_pad += 1
                     if n_word > 0:
@@ -191,12 +208,8 @@ class Seuqence(data.Field):
 
         else:
             batch_filtered = [list(filter(filter_special, ex)) for ex in batch]
-        
-        if not char:
-            output = [" ".join(ex) for ex in batch_filtered]
-        else:
-            output = ["".join(ex) for ex in batch_filtered]
 
+        output = [self.reverse_tokenizer(ex) for ex in batch_filtered]
         if return_saved_time:
             return output, saved_time, accuracy, decisions
 
@@ -413,39 +426,45 @@ class DataLoader(object):
 
     def __init__(self, args, logger):
 
-        # --- setup data field --- #
-        if not args.char:
-            tokenizer = lambda s: s.split() 
-            sort_key = None
-            Field = Seuqence
+        # -- default setting -- #
+        tokenizer = lambda s: s.split() 
+        revserse_tokenizer = lambda ex: " ".join(ex)
+        sort_key = None
+        Field = Seuqence
+        
+        if args.base == 'byte':
+            tokenizer = str2byte
+            revserse_tokenizer = byte2str
 
-        else:
+        elif args.base == 'char':
             if not args.c2:
                 tokenizer = lambda s: list(s)
-                sort_key = None
-                Field = Seuqence
+                revserse_tokenizer = lambda ex: "".join(ex)
+
             else:    
-                assert args.char, "2D grid inputs only works at Character-Level"
+                assert args.base == 'char', "2D grid inputs only works at Character-Level"
                 
                 tokenizer = lambda s: [list(word) for word in s.split()]
+                revserse_tokenizer = lambda ex: "".join(ex)
                 sort_key  = lambda ex: data.interleave_keys(sum([len(a) for a in ex.src]), 
                                                             sum([len(b) for b in ex.trg]))
                 Field = Sequence2D
 
+        # ----------------------- #
+
         if args.remove_dec_eos:
-            TRG = Field(batch_first=True, tokenize=tokenizer)
+            TRG = Field(batch_first=True, tokenize=tokenizer, reverse_tokenize=revserse_tokenizer)
         else:
-            TRG = Field(init_token='<init>', eos_token='<eos>', batch_first=True, tokenize=tokenizer)
+            TRG = Field(init_token='<init>', eos_token='<eos>', batch_first=True, tokenize=tokenizer, reverse_tokenize=revserse_tokenizer)
 
         if args.share_embeddings:
             SRC = TRG
         elif args.remove_enc_eos:
-            SRC = Field(batch_first=True, tokenize=tokenizer)
+            SRC = Field(batch_first=True, tokenize=tokenizer, reverse_tokenize=revserse_tokenizer)
         else:
-            SRC = Field(init_token='<init>', eos_token='<eos>', batch_first=True, tokenize=tokenizer)
+            SRC = Field(init_token='<init>', eos_token='<eos>', batch_first=True, tokenize=tokenizer, reverse_tokenize=revserse_tokenizer)
 
         self.SRC, self.TRG = SRC, TRG
-
 
         data_path = os.path.join(args.data_prefix, args.dataset, args.src + '-' + args.trg)
 
@@ -457,17 +476,23 @@ class DataLoader(object):
             buffer=16384 * args.world_size)
 
         # --- read the vocabulary -- #
-        vocab_name = 'vocab.{}-{}.{}.{}.pt'.format(args.src, args.trg, 
-                                                's' if args.share_embeddings else 'n',
-                                                'c' if args.char else 'w')
+        if args.base != 'byte':
 
-        logger.info('load saved vocabulary.')
-        assert os.path.exists(os.path.join(data_path, vocab_name)), 'need to pre-compute the vocab'
-        src_vocab, trg_vocab = torch.load(os.path.join(data_path, vocab_name))
+            vocab_name = 'vocab.{}-{}.{}.{}.pt'.format(args.src, args.trg, 
+                                                    's' if args.share_embeddings else 'n',
+                                                    'c' if args.base == 'char' else 'w')
+            logger.info('load saved vocabulary.')
 
-        SRC.vocab = src_vocab
-        TRG.vocab = trg_vocab
-
+            assert os.path.exists(os.path.join(data_path, vocab_name)), 'need to pre-compute the vocab'
+            src_vocab, trg_vocab = torch.load(os.path.join(data_path, vocab_name))
+            
+            SRC.vocab = src_vocab
+            TRG.vocab = trg_vocab
+        
+        else:
+            SRC.build_vocab([["{0:x}".format(a)] for a in range(256)])
+            TRG.build_vocab([["{0:x}".format(a)] for a in range(256)])
+    
         args.__dict__.update({'trg_vocab': len(TRG.vocab), 'src_vocab': len(SRC.vocab)})
 
         # --- dynamic batching function -- #
@@ -484,12 +509,8 @@ class DataLoader(object):
 
         if args.batch_size == 1:  # speed-test: one sentence per batch.
             batch_size_fn = lambda new, count, sofar: count
-
         else:
-            if args.char and args.c2:
-                batch_size_fn = dyn_batch_with_padding # dyn_batch_char2d
-            else:
-                batch_size_fn = dyn_batch_without_padding
+            batch_size_fn = dyn_batch_without_padding
         
         # --- build batch-iterator for Translation tasks. ---
         self.train, self.dev, self.test = None, None, None

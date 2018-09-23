@@ -159,8 +159,8 @@ class Metrics:
     def __repr__(self):
         return (f"{self.name}: " +
                 ', '.join(f'{metric}: {getattr(self, metric):.3f}'
-                          for metric, value in self.metrics.items()
-                          if value is not 0))
+                        for metric, value in self.metrics.items()
+                        if value is not 0))
 
     def tensorboard(self, expt, i):
         for metric in self.metrics:
@@ -200,7 +200,6 @@ class Best:
                 if self.opt is not None:
                     torch.save([self.i, self.opt.state_dict()], self.path + '.states')
                 os.remove(self.path + '.temp')
-
 
     def __getattr__(self, key):
         if key in self.metrics:

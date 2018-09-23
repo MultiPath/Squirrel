@@ -2,7 +2,7 @@ NUM_GPU=8
 NUM_CPU=48
 
 srun --gres=gpu:${NUM_GPU} -c ${NUM_CPU} -C volta --partition=dev --time=24:00:00 --mem 256GB --pty \
- python -m torch.distributed.launch --nproc_per_node=${NUM_GPU} --master_port=23456 \
+python -m torch.distributed.launch --nproc_per_node=${NUM_GPU} --master_port=23456 \
                 ez_run.py \
                 --prefix [time] \
                 --mode train \
@@ -17,16 +17,17 @@ srun --gres=gpu:${NUM_GPU} -c ${NUM_CPU} -C volta --partition=dev --time=24:00:0
                 --workspace_prefix "/private/home/jgu/space/char_debug/" \
                 --params "t2t-base" \
                 --eval_every 500  \
-                --batch_size 3072 \
+                --batch_size 512 \
                 --inter_size 8 \
                 --label_smooth 0.1 \
                 --share_embeddings \
                 --tensorboard \
                 --cross_attn_fashion "forward" \
                 --warmup 4000 \
-                --load_from 09.14_17.49.51..wmt16_t2t-base_ro_en_c_0.1_196608_M1 \
-                --resume
-
+                --debug --c2
+                
+                #--resume
+                #--load_from 09.14_17.49.51..wmt16_t2t-base_ro_en_c_0.1_196608_M1 \
                 #--debug
                 # --pry_io \
                 # --pry_depth 2

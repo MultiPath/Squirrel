@@ -9,7 +9,7 @@ python -m torch.distributed.launch --nproc_per_node=${1} --master_port=23456 \
                 --dev_set   "dev"   \
                 --test_set  "test"  \
                 --load_lazy \
-                --base "char" \
+                --base "byte" \
                 --workspace_prefix "/private/home/jgu/space/${2}/" \
                 --params "t2t-base" \
                 --eval_every 500  \
@@ -19,4 +19,3 @@ python -m torch.distributed.launch --nproc_per_node=${1} --master_port=23456 \
                 --share_embeddings \
                 --tensorboard \
                 --cross_attn_fashion "forward" \
-                

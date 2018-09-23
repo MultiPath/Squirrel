@@ -9,6 +9,7 @@ import argparse
 import sys
 import os
 import copy
+import json
 
 from ez_train import train_model
 from ez_decode import decode_model
@@ -26,7 +27,7 @@ try:
     from torch.nn.parallel.distributed import DistributedDataParallel as DDP
     # from apex.parallel import DistributedDataParallel as DDP
 except ImportError:
-    raise ImportError("Please install apex from https://www.github.com/nvidia/apex to run this example.")
+    raise ImportError("Please install torch 0.4.1")
 
 '''Import distributed data loader'''
 import torch.utils.data
@@ -49,8 +50,8 @@ parser.add_argument('--dataset',     type=str, default='iwslt', help='"flickr" o
 parser.add_argument('--src', type=str, default='en', help='source language marker')
 parser.add_argument('--trg', type=str, default='de', help='target language marker')
 
-# character-level Transformer
-parser.add_argument('--char',   action='store_true', help='if --char enabled, character-based model are used.')
+# character/byte-level Transformer
+parser.add_argument('--base', type=str, default='bpe', choices=['byte', 'char', 'bpe', 'word'])
 parser.add_argument('--c2', action='store_true', help='(experimental) used for input the 2D-char box.')
 
 parser.add_argument('--max_len',      type=int, default=None,  help='limit the train set sentences to this many tokens')
@@ -64,7 +65,6 @@ parser.add_argument('--train_set', type=str, default=None,  help='which train se
 parser.add_argument('--dev_set', type=str, default=None,  help='which dev set to use')
 parser.add_argument('--test_set', type=str, default=None,  help='which test set to use')
 
-
 # model basic settings
 parser.add_argument('--exp',    type=str, default='transformer', help='useless')
 parser.add_argument('--prefix', type=str, default='[time]',      help='prefix to denote the model, nothing or [time]')
@@ -73,7 +73,7 @@ parser.add_argument('--params', type=str, default='customize', help='pamarater s
 # customize
 parser.add_argument('--d_model',  type=int, default=512,   help='basic parameter of the model size')
 parser.add_argument('--d_hidden', type=int, default=2048,  help='used in feedforward network')
-parser.add_argument('--warmup',   type=int, default=16000, help='warming-up steps during training')
+parser.add_argument('--warmup',   type=int, default=4000,  help='warming-up steps during training')
 parser.add_argument('--n_layers', type=int, default=6,     help='number of encoder-decoder')
 parser.add_argument('--n_heads',  type=int, default=8,     help='number of heads for multi-head attention')
 parser.add_argument('--drop_ratio', type=float, default=0.1, help='dropout ratio')
@@ -86,9 +86,6 @@ parser.add_argument('--encoder_lm', action='store_true', help='use unidirectiona
 parser.add_argument('--causal',   action='store_true', help='use causal attention')
 parser.add_argument('--cross_attn_fashion', type=str, default='forward', choices=['forward', 'reverse', 'last_layer'])
 parser.add_argument('--share_embeddings',     action='store_true', help='share embeddings between encoder and decoder')
-
-# Char-Word Attention
-parser.add_argument('--self_char_attention', action='store_true', help='(experimental) two-level char attention, then word level attention.')
 
 # MS-decoder: blockwise parallel decoding 
 parser.add_argument('--multi_width', type=int, default=1, help='default not use multi-step prediction')
@@ -141,60 +138,26 @@ parser.add_argument("--local_rank", default=0, type=int)
 parser.add_argument("--distributed", default=False, type=bool)
 parser.add_argument("--world_size", default=1, type=int)
 
+# load pre_saved arguments
+parser.add_argument("--json", default=None, type=str)
+
 # arguments (:)
-args = parser.parse_args()
+args = parser.parse_args() 
+if args.local_rank == 0:
+    if not os.path.exists(args.workspace_prefix):
+        os.mkdir(args.workspace_prefix)
+
+    for d in ['models', 'runs', 'logs', 'decodes', 'settings']:    # check the path
+        if not os.path.exists(os.path.join(args.workspace_prefix, d)):
+            os.mkdir(os.path.join(args.workspace_prefix, d))
+
 
 if 'WORLD_SIZE' in os.environ:
     args.world_size = int(os.environ['WORLD_SIZE'])
     args.distributed = args.world_size > 1
 
-
-torch.cuda.set_device(args.local_rank)
-if args.distributed:
-    torch.distributed.init_process_group(backend='nccl', init_method='env://')
-
-if args.local_rank == 0:
-    if not os.path.exists(args.workspace_prefix):
-        os.mkdir(args.workspace_prefix)
-
-    for d in ['models', 'runs', 'logs', 'decodes']:    # check the path
-        if not os.path.exists(os.path.join(args.workspace_prefix, d)):
-            os.mkdir(os.path.join(args.workspace_prefix, d))
-
 if args.prefix == '[time]':
     args.prefix = strftime("%m.%d_%H.%M.%S.", gmtime())
-
-# setup watcher settings
-watcher = Watcher(rank=args.local_rank, 
-                  log_path=os.path.join(args.workspace_prefix, 
-                  'logs', 'log-{}.txt'.format(args.prefix)))
-
-
-# setup random seeds
-random.seed(args.seed)
-np.random.seed(args.seed)
-torch.manual_seed(args.seed)
-torch.cuda.manual_seed_all(args.seed)
-
-# special for Pytorch 0.4
-args.device = "cuda:{}".format(args.local_rank) 
-
-
-# # build vocabulary
-# if not args.share_embeddings:
-#     SRC.build_vocab(train_data, dev_data, max_size=args.max_vocab_size)
-# TRG.build_vocab(train_data, dev_data, max_size=args.max_vocab_size)
-
-# torch.save([SRC.vocab, TRG.vocab], os.path.join(args.data_prefix, args.dataset, args.src + '-' + args.trg, vocab_name))
-# watcher.info('save the processed vocabulary, {} {}'.format(len(SRC.vocab), len(TRG.vocab)))
-# sys.exit(1)
-
-
-
-# ----------------------------------------------------------------------------------------------------------------- #
-
-# get dataloader:
-dataloader = DataLoader(args, watcher)
 
 # model hyper-params:
 hparams = {}
@@ -202,41 +165,74 @@ if args.params == 'james-iwslt':
     hparams = {'d_model': 278, 'd_hidden': 507, 'n_layers': 5,
                 'n_heads': 2, 'drop_ratio': 0.079, 'warmup': 746} # ~32
 elif args.params == 't2t-base':
-    watcher.info('use default parameters of t2t-base')  # t2t-base, 512-2048-6
     hparams = {'d_model': 512, 'd_hidden': 2048, 'n_layers': 6,
-                'n_heads': 8, 'drop_ratio': 0.1, 'warmup': 4000} # ~32
+                'n_heads': 8, 'drop_ratio': 0.1, 'warmup': 4000}  # ~32
 else:
-    watcher.info("following the user setting.")
-
+    pass
 
 args.__dict__.update(hparams)
 
+# model name
+hp_str = (  f".{args.dataset}_{args.params}_"
+            f"{args.src}_{args.trg}_"
+            f"{'causal_' if args.causal_enc else ''}"
+            f"{'lm_' if args.encoder_lm else ''}"
+            f"{args.base}_"
+            f"{args.label_smooth}_"
+            f"{args.inter_size*args.batch_size*args.world_size}_"
+            f"{'M{}'.format(args.multi_width)}"
+        )
 
-hp_str = (f".{args.dataset}_{args.params}_"
-          f"{args.src}_{args.trg}_"
-          f"{'causal_' if args.causal_enc else ''}"
-          f"{'lm_' if args.encoder_lm else ''}"
-          f"{'c' if args.char else 'w'}_"
-          f"{args.label_smooth}_"
-          f"{args.inter_size*args.batch_size*args.world_size}_"
-          f"{'M{}'.format(args.multi_width)}"
-          )
 
-watcher.info(f'Starting with HPARAMS: {hp_str}')
 model_name = os.path.join(args.workspace_prefix, 'models', args.prefix + hp_str)
+args.__dict__.update({'model_name': model_name, 'hp_str': hp_str})
 
-# -------- 
-if args.c2:
-    Transformer = TransformerC  # Fully character-level model with 2D inputs (experi)
-# --------
+# load arguments if provided
+if args.json is not None:
+    saved_args = json.load(open(os.path.join(args.workspace_prefix, 'settings', args.json)))
+    saved_args['local_rank'] = args.local_rank
+    saved_args['prefix'] = args.prefix
+
+    args.__dict__.update(saved_args)
+
+else:
+    if args.local_rank == 0:
+        with open(os.path.join(args.workspace_prefix, 'settings', args.prefix + hp_str + '.json'), 'w') as outfile:
+            json.dump(vars(args), outfile)
+
+# ========================================================================================= #
+
+# special for Pytorch 0.4
+args.device = "cuda:{}".format(args.local_rank) 
+
+# setup multi-gpu
+torch.cuda.set_device(args.local_rank)
+if args.distributed:
+    torch.distributed.init_process_group(backend='nccl', init_method='env://')
+
+# setup random seeds
+random.seed(args.seed)
+np.random.seed(args.seed)
+torch.manual_seed(args.seed)
+torch.cuda.manual_seed_all(args.seed)
+
+# setup watcher settings
+watcher = Watcher(rank=args.local_rank, log_path=os.path.join(args.workspace_prefix, 'logs', 'log-{}.txt'.format(args.prefix)))
+watcher.info('\n'.join(['{}:\t{}'.format(a, b) for a, b in sorted(args.__dict__.items(), key=lambda x: x[0])]))
+watcher.info(f'Starting with HPARAMS: {hp_str}')
+
+# ========================================================================================================== #
+
+# get the dataloader
+dataloader = DataLoader(args, watcher)
 
 # build the model
 model = Transformer(dataloader.SRC, dataloader.TRG, args)
-watcher.info(str(model))
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 watcher.info("total trainable parameters: {}".format(format(count_parameters(model),',')))
+watcher.info("Vocabulary size: {}/{}.".format(len(dataloader.SRC.vocab), len(dataloader.TRG.vocab)))
 
 # use GPU 
 if torch.cuda.is_available():
@@ -252,15 +248,7 @@ if args.load_from is not None:
             os.path.join(args.workspace_prefix, 'models', args.load_from + '.pt'),
             map_location=lambda storage, loc: storage.cuda()))  # load the pretrained models.
 
-# additional information
-args.__dict__.update({'model_name': model_name, 'hp_str': hp_str})
-args_str = '\n'.join(['{}:\t{}'.format(a, b) for a, b in sorted(args.__dict__.items(), key=lambda x: x[0])])
-
-# for a in args.__dict__:
-#     args_str += '{}:\t{}\n'.format(a, args.__dict__[a])
-watcher.info(args_str)
-
-# ----------------------------------------------------------------------------------------------------------------- #
+# start running
 if args.mode == 'train':
     watcher.info('starting training')
     train_model(args, watcher, model, dataloader.train, dataloader.dev)

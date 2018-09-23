@@ -430,7 +430,7 @@ class IO(nn.Module):
             return (self.o(outputs).max(-1)[1] == targets).float().tolist()
 
     def reverse(self, outputs, **kwargs):
-        return self.field.reverse(outputs.data, self.args.char, **kwargs)
+        return self.field.reverse(outputs.data, **kwargs)
 
 
 class MulIO(IO):
@@ -828,7 +828,7 @@ class Transformer(nn.Module):
 
     # All in All: forward function for training
     def forward(self, batch, decoding=False, reverse=True):
-
+        
         #if info is None:
         info = defaultdict(lambda: 0)
 

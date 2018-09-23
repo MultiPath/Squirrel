@@ -62,10 +62,10 @@ def valid_model(args, watcher, model, dev, print_out=False):
     watcher.info("The dev-set corpus BLEU = {}".format(outputs['corpus_bleu']))
     
     # record for tensorboard:
-    outputs['tb_data'] = [('dev/BLEU', outputs['corpus_bleu']), 
-                          ('dev/GLEU', np.mean(outputs['gleu'])),
-                          ('dev/SPEEDUP', outputs['speed_up']),
-                          ('dev/PREDLEN', outputs['pred_len'])]
+    outputs['tb_data'] = [  ('dev/BLEU', outputs['corpus_bleu']), 
+                            ('dev/GLEU', np.mean(outputs['gleu'])),
+                            ('dev/SPEEDUP', outputs['speed_up']),
+                            ('dev/PREDLEN', outputs['pred_len'])]
 
     return outputs
 
@@ -106,13 +106,13 @@ def train_model(args, watcher, model, train, dev, save_path=None, maxsteps=None)
 
         # --- saving --- #
         if (iters % args.save_every == 0) and (args.local_rank == 0): # saving only works for local-rank=0
-            # watcher.info('save (back-up) checkpoints at iter={}'.format(iters))
+            watcher.info('save (back-up) checkpoints at iter={}'.format(iters))
             with torch.cuda.device(args.local_rank):
                 torch.save(watcher.best_tracker.model.state_dict(), '{}_iter={}.pt'.format(args.model_name, iters))
                 torch.save([iters, watcher.best_tracker.opt.state_dict()], '{}_iter={}.pt.states'.format(args.model_name, iters))
 
         # --- validation --- #
-        if (iters % args.eval_every == args.eval_every - 1) and (not args.no_valid): # and (args.local_rank == 0):
+        if (iters % args.eval_every == 0) and (not args.no_valid): # and (args.local_rank == 0):
 
             watcher.close_progress_bar()
 

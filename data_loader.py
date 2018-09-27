@@ -6,8 +6,9 @@ import torch
 import torch.nn as nn
 import numpy as np
 import time
-import os
+import os, sys
 import torch.distributed as dist
+import logging
 
 from torchtext import data, datasets, vocab
 from torchtext.data.batch import Batch
@@ -22,7 +23,11 @@ def str2byte(string):
     return [byte[k: k+2] for k in range(0, len(byte), 2)]
 
 def byte2str(byte):
-    return bytes.fromhex(''.join(byte)).decode('utf-8')
+    try:
+        output = bytes.fromhex(''.join(byte)).decode('utf-8')
+    except Exception as e:
+        output = ''
+    return output
 
 
 """" A Lazy text-reader """
@@ -69,7 +74,7 @@ def full_reader(paths, fields, max_len=None):
         return examples
 
 """ batch fetcher """
-def fetch_batch(minibatch, data, batch_size, batch_size_fn=None, world_size=1, reserve=False):
+def fetch_batch(data, batch_size, batch_size_fn=None, world_size=1, reserve=False):
     """Yield elements from data in chunks of batch_size.
     :: minibatch: a reference of list which the remaining of batches will always be there for fetching next time.
     """
@@ -81,6 +86,7 @@ def fetch_batch(minibatch, data, batch_size, batch_size_fn=None, world_size=1, r
     size_so_far = 0
     t0 = time.time()
 
+    minibatch = []
     if reserve:
         reserved_minibatch = []
 
@@ -104,11 +110,11 @@ def fetch_batch(minibatch, data, batch_size, batch_size_fn=None, world_size=1, r
 
     if reserve:
         minibatch += reserved_minibatch  # make sure there is no empty batches coming out during testing.
-        yield minibatch
+    yield minibatch
 
     
 """ pool of batch fetcher """
-def fetch_pool(minibatch, data, batch_size, key, batch_size_fn=lambda new, count, sofar: count, random_shuffler=None, world_size=1):
+def fetch_pool(data, batch_size, key, batch_size_fn=lambda new, count, sofar: count, random_shuffler=None, world_size=1):
     """Sort within buckets, then batch, then shuffle batches.
     Partitions data into chunks of size 100*batch_size, sorts examples within
     each chunk using sort_key, then batch these examples and shuffle the
@@ -117,15 +123,10 @@ def fetch_pool(minibatch, data, batch_size, key, batch_size_fn=lambda new, count
     if random_shuffler is None:
         random_shuffler = random.shuffle
 
-    for p in fetch_batch(minibatch, data, batch_size * 100, batch_size_fn):
-        microbatch = []
-
-        p_batch = fetch_batch(microbatch, sorted(p, key=key), batch_size, batch_size_fn, world_size, False) 
+    for p in fetch_batch(data, batch_size * 100, batch_size_fn):
+        p_batch = fetch_batch(sorted(p, key=key), batch_size, batch_size_fn, world_size, True) 
         for b in random_shuffler(list(p_batch)):
             yield b
-
-        minibatch += microbatch # collect remaining mini-batches.
-
 
 
 # ====================== Supportive Functions =========================================== #
@@ -333,8 +334,8 @@ class ParallelDataset(datasets.TranslationDataset):
             super(datasets.TranslationDataset, self).__init__(full_reader(paths, fields, max_len), fields, **kwargs)
 
     @classmethod
-    def splits(cls, path, train=None, validation=None, test=None, **kwargs):
-        train_data = None if train is None else cls(path + train, lazy=True, **kwargs)
+    def splits(cls, path, train=None, validation=None, test=None, lazy=True, **kwargs):
+        train_data = None if train is None else cls(path + train, lazy=lazy, **kwargs)
         val_data = None if validation is None else cls(path + validation, lazy=False, **kwargs)
         test_data = None if test is None else cls(path + test, lazy=False, **kwargs)
         return train_data, val_data, test_data
@@ -348,9 +349,16 @@ class DistributedBatch(Batch):
         if data is not None:
             big_batch_size = len(data)
             mini_batch_size = int(math.floor(big_batch_size / world_size))
-            additional_size = int((big_batch_size -  mini_batch_size * world_size) > local_rank)
-            start_pos = (additional_size + mini_batch_size) * local_rank
-            end_pos = (additional_size + mini_batch_size) * (local_rank + 1)
+            additional_size = int(big_batch_size -  mini_batch_size * world_size)
+
+            start_pos = local_rank if additional_size > local_rank else additional_size
+            start_pos = start_pos + local_rank * mini_batch_size
+            end_pos = (local_rank + 1) if additional_size > (local_rank + 1) else additional_size
+            end_pos = end_pos + (local_rank + 1) * mini_batch_size
+
+
+            # start_pos = (additional_size + mini_batch_size) * local_rank
+            # end_pos = (additional_size + mini_batch_size) * (local_rank + 1)
             data = data[start_pos: end_pos]
             
             self.batch_size = len(data)
@@ -374,18 +382,17 @@ class LazyBucketIterator(data.BucketIterator):
         super().__init__(dataset, batch_size, sort_key, device, batch_size_fn, 
                         train, repeat, shuffle=False, sort=sort, sort_within_batch=sort_within_batch)
         
-        self.minibatch = []  # save unfinished batches.
+        # self.minibatch = []  # save unfinished batches.
         self.distributed = distributed
         self.rank = rank
         self.world_size = world_size
 
     def create_batches(self):
         if self.sort:
-            self.batches = fetch_batch([], self.data(), self.batch_size, self.batch_size_fn, self.world_size, True)
+            self.batches = fetch_batch(self.data(), self.batch_size, self.batch_size_fn, self.world_size, True)
         else:
-            self.batches = fetch_pool(self.minibatch, self.data(), self.batch_size,
-                                        self.sort_key, self.batch_size_fn,
-                                        random_shuffler=self.random_shuffler, world_size=self.world_size)
+            self.batches = fetch_pool(self.data(), self.batch_size, self.sort_key, self.batch_size_fn,
+                                    random_shuffler=self.random_shuffler, world_size=self.world_size)
 
     # --- wrap the iterator --- 
     def __iter__(self):
@@ -424,7 +431,10 @@ class LazyBucketIterator(data.BucketIterator):
 # ========================= DataLoader for Distributed Transformer ==================================== #
 class DataLoader(object):
 
-    def __init__(self, args, logger):
+    def __init__(self, args, logger=None, build_vocab=False, vocab_file=None):
+
+        if logger is None:
+            logger = logging.getLogger()
 
         # -- default setting -- #
         tokenizer = lambda s: s.split() 
@@ -466,28 +476,60 @@ class DataLoader(object):
 
         self.SRC, self.TRG = SRC, TRG
 
-        data_path = os.path.join(args.data_prefix, args.dataset, args.src + '-' + args.trg)
+        pair = args.src + '-' + args.trg
+        data_path = os.path.join(args.data_prefix, args.dataset, pair)
+        exts=('.src', '.trg')
+        reverse = False
 
-        # --- setup dataset --- #
+        if not os.path.exists(data_path):
+
+            # translation in a reverse direction #
+            pair = args.trg + '-' + args.src
+            data_path = os.path.join(args.data_prefix, args.dataset, pair)
+            exts=('.trg', '.src')
+            reverse = True
+            
+            if not os.path.exists(data_path):
+                raise NotImplementedError
+            
+
+        # --- setup dataset (no lazy mode when building the vocab) --- #
         train_data, dev_data, test_data = ParallelDataset.splits(
-            path= data_path + '/', 
+            path= data_path + '/', lazy=(not build_vocab),
             train=args.train_set, validation=args.dev_set, test=args.test_set, 
-            exts=('.src', '.trg'), fields=[('src', SRC), ('trg', TRG)],
+            exts=exts, fields=[('src', SRC), ('trg', TRG)],
             buffer=16384 * args.world_size)
+
+        logger.info('setup the dataset.')
 
         # --- read the vocabulary -- #
         if args.base != 'byte':
+            
+            if vocab_file is None:
+                vocab_name = 'vocab.{}.{}.{}.pt'.format(pair, 's' if args.share_embeddings else 'n', 'c' if args.base == 'char' else 'w')
+            else:
+                vocab_name = vocab_file
 
-            vocab_name = 'vocab.{}-{}.{}.{}.pt'.format(args.src, args.trg, 
-                                                    's' if args.share_embeddings else 'n',
-                                                    'c' if args.base == 'char' else 'w')
+            if build_vocab:
+                logger.info('build the vocabulary.')
+                if not args.share_embeddings:
+                    SRC.build_vocab(train_data, max_size=args.max_vocab_size)
+                TRG.build_vocab(train_data, max_size=args.max_vocab_size)
+                torch.save([SRC.vocab, TRG.vocab], os.path.join(data_path, vocab_name))
+                logger.info('done. {}/{}'.format(len(SRC.vocab), len(TRG.vocab)))
+                sys.exit(1)
+
             logger.info('load saved vocabulary.')
 
             assert os.path.exists(os.path.join(data_path, vocab_name)), 'need to pre-compute the vocab'
             src_vocab, trg_vocab = torch.load(os.path.join(data_path, vocab_name))
             
-            SRC.vocab = src_vocab
-            TRG.vocab = trg_vocab
+            if reverse:
+                SRC.vocab = trg_vocab
+                TRG.vocab = src_vocab
+            else:    
+                SRC.vocab = src_vocab
+                TRG.vocab = trg_vocab
         
         else:
             SRC.build_vocab([["{0:x}".format(a)] for a in range(256)])

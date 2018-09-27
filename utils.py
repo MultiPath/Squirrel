@@ -21,6 +21,7 @@ from functools import reduce
 from tqdm import tqdm, trange
 from tensorboardX import SummaryWriter
 from termcolor import colored
+from subprocess import PIPE, Popen
 
 COLORS = ['red', 'green', 'yellow', 'blue', 'white', 'magenta', 'cyan']
 
@@ -50,21 +51,55 @@ def export(x):
     except Exception:
         return 0
 
+# detokonizer used when evaluating BLEU scores
 def debpe(x):
+    """
+    de-byte pair encoding, return to tokenized text
+    """
     return x.replace('@@ ', '').split()
 
+def dechar(x):
+    """
+    de-tokonize the text to plain characters (no space)
+    """
+    return list(x.replace('@@ ', '').replace(' ', ''))
 
-def computeGLEU(outputs, targets, corpus=False, tokenizer=None):
+def seg_kytea(outputs):
+    """
+    special for Japanese text:
+    :: resegment the text to segmented pieces with Kytea
+    :: make sure to install kytea first ::
+        http://www.phontron.com/kytea/
+    """
+    def _tok(x):
+        return [xi.split('/')[0] for xi in x.split()]
+
+    p = Popen('kytea', stdin=PIPE, stdout=PIPE, stderr=PIPE)
+    outputs = ["" if len(o) == 0 else ''.join(o) for o in outputs]
+    
+    # very important to put \n in the end.
+    return [_tok(o) for o in p.communicate(('\n'.join(outputs) + '\n').encode('utf-8'))[0].decode('utf-8').split('\n')]
+
+
+def computeGLEU(outputs, targets, corpus=False, tokenizer=None, segmenter=None):
     outputs = [tokenizer(o) for o in outputs]
     targets = [tokenizer(t) for t in targets]
+
+    if segmenter is not None:
+        outputs = segmenter(outputs)
+        targets = segmenter(targets)
 
     if not corpus:
         return [sentence_gleu([t],  o) for o, t in zip(outputs, targets)]
     return corpus_gleu([[t] for t in targets], [o for o in outputs])
 
-def computeBLEU(outputs, targets, corpus=False, tokenizer=None):
+def computeBLEU(outputs, targets, corpus=False, tokenizer=None, segmenter=None):
     outputs = [tokenizer(o) for o in outputs]
     targets = [tokenizer(t) for t in targets]
+
+    if segmenter is not None:
+        outputs = segmenter(outputs)
+        targets = segmenter(targets)
 
     if not corpus:
         return torch.Tensor([sentence_gleu(
@@ -229,16 +264,16 @@ class Watcher(logging.getLoggerClass()):
         
             formatter = logging.Formatter('%(asctime)s %(levelname)s: - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
-            fh = logging.FileHandler(log_path)
-            fh.setLevel(logging.DEBUG)
-            fh.setFormatter(formatter)
+            if log_path is not None:
+                fh = logging.FileHandler(log_path)
+                fh.setLevel(logging.DEBUG)
+                fh.setFormatter(formatter)
+                self.addHandler(fh)
 
             ch = logging.StreamHandler()
             ch.setLevel(logging.DEBUG)
             ch.setFormatter(formatter)
-
             self.addHandler(ch)
-            self.addHandler(fh)
             self.setLevel(logging.DEBUG)
 
         else:

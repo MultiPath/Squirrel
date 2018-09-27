@@ -1,8 +1,5 @@
 import torch
 import numpy as np
-from torchtext import data
-from torchtext import datasets
-
 import logging
 import random
 import argparse
@@ -10,33 +7,18 @@ import sys
 import os
 import copy
 import json
-
-from ez_train import train_model
-from ez_decode import decode_model
-from model import Transformer, INF, TINY, softmax
-from model_c import TransformerC
-
-from time import gmtime, strftime
-from data_loader import DataLoader
-from utils import Watcher
-
-#=====START: ADDED FOR DISTRIBUTED======
-'''Add custom module for distributed'''
-
-try:
-    from torch.nn.parallel.distributed import DistributedDataParallel as DDP
-    # from apex.parallel import DistributedDataParallel as DDP
-except ImportError:
-    raise ImportError("Please install torch 0.4.1")
-
-'''Import distributed data loader'''
-import torch.utils.data
-import torch.utils.data.distributed
-
-'''Import torch.distributed'''
 import torch.distributed as dist
 
-#=====END:   ADDED FOR DISTRIBUTED======
+from torchtext import data
+from torchtext import datasets
+from time import gmtime, strftime
+
+from trainer import train_model, valid_model
+from core import INF, TINY, softmax
+from transformer import Transformer
+from data_loader import DataLoader
+from utils import Watcher
+from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 
 
 # all the hyper-parameters
@@ -49,6 +31,7 @@ parser.add_argument('--workspace_prefix', type=str, default='./')
 parser.add_argument('--dataset',     type=str, default='iwslt', help='"flickr" or "iwslt"')
 parser.add_argument('--src', type=str, default='en', help='source language marker')
 parser.add_argument('--trg', type=str, default='de', help='target language marker')
+parser.add_argument('--vocab_file', type=str, default=None, help='user-defined vocabulary')
 
 # character/byte-level Transformer
 parser.add_argument('--base', type=str, default='bpe', choices=['byte', 'char', 'bpe', 'word'])
@@ -113,15 +96,16 @@ parser.add_argument('--disable_lr_schedule', action='store_true', help='disable 
 parser.add_argument('--length_ratio',  type=int,   default=2, help='maximum lengths of decoding')
 parser.add_argument('--beam_size',     type=int,   default=1, help='beam-size used in Beamsearch, default using greedy decoding')
 parser.add_argument('--alpha',         type=float, default=1, help='length normalization weights')
-parser.add_argument('--no_bpe', action='store_true', help='do not output BPE in the decoding mode.')
+parser.add_argument('--original',      action='store_true', help='output the original output files, not the tokenized ones.')
+parser.add_argument('--decode_test',   action='store_true', help='evaluate scores on test set instead of using dev set.')
 
 # Learning to Translation in Real-Time
 parser.add_argument('--real_time', action='store_true', help='real-time translation.')
 
 
 # model saving/reloading, output translations
-parser.add_argument('--load_from',     type=str, default=None, help='load from checkpoint')
-parser.add_argument('--resume',        action='store_true', help='when loading from the saved model, it resumes from that.')
+parser.add_argument('--load_from', type=str, default='none', help='load from checkpoint')
+parser.add_argument('--resume',    action='store_true', help='when loading from the saved model, it resumes from that.')
 
 # debugging
 parser.add_argument('--debug',       action='store_true', help='debug mode: no saving or tensorboard')
@@ -156,8 +140,11 @@ if 'WORLD_SIZE' in os.environ:
     args.world_size = int(os.environ['WORLD_SIZE'])
     args.distributed = args.world_size > 1
 
+running_time = strftime("%m.%d_%H.%M.%S.", gmtime())
 if args.prefix == '[time]':
-    args.prefix = strftime("%m.%d_%H.%M.%S.", gmtime())
+    args.prefix = running_time
+else:
+    args.prefix = running_time + args.prefix
 
 # model hyper-params:
 hparams = {}
@@ -224,7 +211,7 @@ watcher.info(f'Starting with HPARAMS: {hp_str}')
 # ========================================================================================================== #
 
 # get the dataloader
-dataloader = DataLoader(args, watcher)
+dataloader = DataLoader(args, watcher, vocab_file=args.vocab_file)
 
 # build the model
 model = Transformer(dataloader.SRC, dataloader.TRG, args)
@@ -242,30 +229,30 @@ if args.distributed:
     model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank)
 
 # load pre-trained parameters
-if args.load_from is not None:
+if args.load_from != 'none':
     with torch.cuda.device(args.local_rank):
         model.load_state_dict(torch.load(
             os.path.join(args.workspace_prefix, 'models', args.load_from + '.pt'),
             map_location=lambda storage, loc: storage.cuda()))  # load the pretrained models.
 
+
+decoding_path = os.path.join(args.workspace_prefix, 'decodes', args.load_from if args.mode == 'test' else (args.prefix + hp_str))
+if (args.local_rank == 0) and (not os.path.exists(decoding_path)):
+    os.mkdir(decoding_path)
+
+name_suffix = 'b={}_a={}.txt'.format(args.beam_size, args.alpha)
+names = ['{}.src.{}'.format(args.test_set, name_suffix), '{}.trg.{}'.format(args.test_set, name_suffix), '{}.dec.{}'.format(args.test_set, name_suffix)]
+
 # start running
 if args.mode == 'train':
     watcher.info('starting training')
-    train_model(args, watcher, model, dataloader.train, dataloader.dev)
+    train_model(args, watcher, model, dataloader.train, dataloader.dev, decoding_path=decoding_path, names=names)
 
 elif args.mode == 'test':
-    raise NotImplementedError
-    # watcher.info('starting decoding from the pre-trained model, on the test set...')
-    # assert args.load_from is not None, 'must decode from a pre-trained model.'
 
-    # decoding_path = os.path.join(args.workspace_prefix, 'decodes', args.load_from)
-    # if not os.path.exists(decoding_path):
-    #     os.mkdir(decoding_path)
-    # name_suffix = 'b={}_a={}.txt'.format(args.beam_size, args.alpha)
-    # names = ['{}.src.{}'.format(args.test_set, name_suffix), 
-    #          '{}.trg.{}'.format(args.test_set, name_suffix),
-    #          '{}.dec.{}'.format(args.test_set, name_suffix)]
-    # with torch.no_grad():   
-    #     decode_model(args, model, dataloader.test, evaluate=True, decoding_path=decoding_path, names=names)
+    watcher.info('starting decoding from the pre-trained model, on the test set...')
+    assert args.load_from is not None, 'must decode from a pre-trained model.'
+    with torch.no_grad():   
+        valid_model(args, watcher, model, dataloader.test if args.decode_test else dataloader.dev, decoding_path=decoding_path, names=names)
 
 watcher.info("done.")

@@ -23,7 +23,9 @@ parser.add_argument("--local_rank", default=0, type=int)
 parser.add_argument("--distributed", default=False, type=bool)
 parser.add_argument("--world_size", default=1, type=int)
 parser.add_argument("--vocab_file", type=str, default=None)
-
+parser.add_argument('--word_shuffle', type=int, default=3, help='Special for AE: the maximum range for words can be shuffled.')
+parser.add_argument('--word_dropout', type=float, default=0.1, help='Special for AE: the maximum range for words can be dropped.')
+parser.add_argument('--word_blank', type=float, default=0.2, help='Special for AE: the maximum range for words can be paded.')
 
 args = parser.parse_args() 
 watcher = Watcher(rank=args.local_rank, log_path=None)

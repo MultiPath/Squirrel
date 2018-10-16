@@ -13,7 +13,7 @@ from torch.autograd import Variable
 from torchtext import data, datasets
 from torchtext.data.batch import Batch
 from nltk.translate.gleu_score import sentence_gleu, corpus_gleu
-from bleu_score import corpus_bleu
+
 from contextlib import ExitStack
 from collections import OrderedDict
 from timeit import default_timer
@@ -22,6 +22,8 @@ from tqdm import tqdm, trange
 from tensorboardX import SummaryWriter
 from termcolor import colored
 from subprocess import PIPE, Popen
+
+from tools.bleu_score import corpus_bleu
 
 COLORS = ['red', 'green', 'yellow', 'blue', 'white', 'magenta', 'cyan']
 
@@ -38,6 +40,13 @@ def item(tensor):
     if hasattr(tensor, '__getitem__'):
         return tensor[0]
     return tensor
+
+def format(x, type='k'):
+    if type == 'k':
+        return '{:.2f}K'.format(x / 1000)
+    elif type == 'm':
+        return '{:.3f}M'.format(x / 1000000)
+    return x
 
 def export(x):
     if isinstance(x, dict):

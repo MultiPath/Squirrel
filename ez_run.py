@@ -13,10 +13,14 @@ from torchtext import data
 from torchtext import datasets
 from time import gmtime, strftime
 
-from trainer import train_model, valid_model
-from core import INF, TINY, softmax
-from transformer import Transformer
-from data_loader import DataLoader
+from learner import train_model, train_autoencoder
+from decoder import valid_model
+
+from models.core import INF, TINY, softmax
+from models.transformer import Transformer
+from models.transformer_vae import AutoTransformer, AutoTransformer2
+
+from data_loader import MultiDataLoader
 from utils import Watcher
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 
@@ -27,29 +31,45 @@ parser = argparse.ArgumentParser(description='Train a Transformer-Like Model.')
 # dataset settings --- 
 parser.add_argument('--data_prefix', type=str, default='/data0/data/transformer_data/')
 parser.add_argument('--workspace_prefix', type=str, default='./') 
-
 parser.add_argument('--dataset',     type=str, default='iwslt', help='"flickr" or "iwslt"')
 parser.add_argument('--src', type=str, default='en', help='source language marker')
 parser.add_argument('--trg', type=str, default='de', help='target language marker')
 parser.add_argument('--vocab_file', type=str, default=None, help='user-defined vocabulary')
 
-# character/byte-level Transformer
-parser.add_argument('--base', type=str, default='bpe', choices=['byte', 'char', 'bpe', 'word'])
-parser.add_argument('--c2', action='store_true', help='(experimental) used for input the 2D-char box.')
-
-parser.add_argument('--max_len',      type=int, default=None,  help='limit the train set sentences to this many tokens')
 parser.add_argument('--max_vocab_size', type=int, default=50000, help='max vocabulary size')
 parser.add_argument('--load_vocab',   action='store_true', help='load a pre-computed vocabulary')
 parser.add_argument('--load_lazy', action='store_true', help='load a lazy-mode dataset, not save everything in the mem')
 parser.add_argument('--remove_dec_eos', action='store_true', help='possibly remove <eos> tokens in the decoder')
 parser.add_argument('--remove_enc_eos', action='store_true', help='possibly remove <eos> tokens in the encoder')
-
 parser.add_argument('--train_set', type=str, default=None,  help='which train set to use')
 parser.add_argument('--dev_set', type=str, default=None,  help='which dev set to use')
 parser.add_argument('--test_set', type=str, default=None,  help='which test set to use')
 
+# multi-lingual training
+parser.add_argument('--multi', action='store_true', help='enable multilingual training for Transformer.')
+parser.add_argument('--sample_prob', nargs='*', type=float, help='probabilities of each input dataset.')
+parser.add_argument('--input_conv', type=int, default=0, help='adding additional convolution in the first layer for byte level..')
+parser.add_argument('--local_attention', type=int, default=0, help='force to use local attention for the first K layers.')
+
+# character/byte-level Transformer
+parser.add_argument('--base', type=str, default='bpe', choices=['byte', 'char', 'bpe', 'word'])
+parser.add_argument('--c2', action='store_true', help='(experimental) used for input the 2D-char box.')
+
+# (variational) auto-encoder settings
+parser.add_argument('--autoencoding', action='store_true', help='Train autoencoder')
+parser.add_argument('--ae_func', type=str, default='all_steps', choices=['first_step', 'all_steps'])
+parser.add_argument('--n_proj_layers', type=int, default=6)
+
+# denoising auto-encoder settings
+parser.add_argument('--pool', type=str, default='mean', choices=['mean', 'max'], help='pooling used to extract sentence information.')
+parser.add_argument('--input_noise', type=str, default=None, choices=['n1', 'n2', 'n3'], help='inject input space noise (for Denoising Auto-Encoder)')
+parser.add_argument('--word_shuffle', type=int, default=3, help='Special for AE: the maximum range for words can be shuffled.')
+parser.add_argument('--word_dropout', type=float, default=0.1, help='Special for AE: the maximum range for words can be dropped.')
+parser.add_argument('--word_blank', type=float, default=0.2, help='Special for AE: the maximum range for words can be paded.')
+parser.add_argument('--latent_noise', type=float, default=0, help='inject latent space noise which is a Gaussian (for Denoising Auto-Encoder)')
+
 # model basic settings
-parser.add_argument('--exp',    type=str, default='transformer', help='useless')
+parser.add_argument('--model',  type=str, default='Transformer', choices=['Transformer', 'AutoTransformer', 'AutoTransformer2'])
 parser.add_argument('--prefix', type=str, default='[time]',      help='prefix to denote the model, nothing or [time]')
 parser.add_argument('--params', type=str, default='customize', help='pamarater sets: james-iwslt, t2t-base')
 
@@ -59,6 +79,7 @@ parser.add_argument('--d_hidden', type=int, default=2048,  help='used in feedfor
 parser.add_argument('--warmup',   type=int, default=4000,  help='warming-up steps during training')
 parser.add_argument('--n_layers', type=int, default=6,     help='number of encoder-decoder')
 parser.add_argument('--n_heads',  type=int, default=8,     help='number of heads for multi-head attention')
+parser.add_argument('--n_cross_heads', type=int, default=8,  help='number of heads for multi-head attention')
 parser.add_argument('--drop_ratio', type=float, default=0.1, help='dropout ratio')
 
 # model ablation settings
@@ -68,7 +89,7 @@ parser.add_argument('--causal_enc', action='store_true', help='use unidirectiona
 parser.add_argument('--encoder_lm', action='store_true', help='use unidirectional encoder with additional loss as a LM')
 parser.add_argument('--causal',   action='store_true', help='use causal attention')
 parser.add_argument('--cross_attn_fashion', type=str, default='forward', choices=['forward', 'reverse', 'last_layer'])
-parser.add_argument('--share_embeddings',     action='store_true', help='share embeddings between encoder and decoder')
+parser.add_argument('--share_embeddings', action='store_true', help='share embeddings between encoder and decoder')
 
 # MS-decoder: blockwise parallel decoding 
 parser.add_argument('--multi_width', type=int, default=1, help='default not use multi-step prediction')
@@ -76,7 +97,6 @@ parser.add_argument('--dyn', type=float, default=0.0, help='dynamic block-wse de
 parser.add_argument('--random_path', action='store_true', help='use a random path, instead of dynamic block-wse decoding (experimental)')
 parser.add_argument('--exact_match', action='store_true', help='match with the 1-step model in dynamic block-wse decoding (experimental)')
 parser.add_argument('--constant_penalty', type=float, default=0)
-
 
 # running setting
 parser.add_argument('--mode',    type=str, default='train',  help='train, test or data')  # "data": preprocessing and save vocabulary
@@ -89,11 +109,17 @@ parser.add_argument('--save_every',    type=int, default=50000,   help='save the
 parser.add_argument('--maximum_steps', type=int, default=1000000, help='maximum steps you take to train a model')
 parser.add_argument('--inter_size',    type=int, default=4,       help='process multiple batches before one update')
 parser.add_argument('--batch_size',    type=int, default=2048,    help='# of tokens processed per batch')
+parser.add_argument('--maxlen',        type=int, default=10000,   help='limit the train set sentences to this many tokens')
+parser.add_argument('--maxatt_size',   type=int, default=2200000, help= """
+                                                                        limit the maximum attention computation in order to avoid OOM.
+                                                                        Dynamic batching makes sure: #sent x #token <= batch-size
+                                                                        Dynamic batching makes sure: #sent x #token ^ 2 <= maxatt-size
+                                                                        """)
 parser.add_argument('--optimizer',     type=str, default='Adam')
 parser.add_argument('--disable_lr_schedule', action='store_true', help='disable the transformer-style learning rate')
 
 # decoding
-parser.add_argument('--length_ratio',  type=int,   default=2, help='maximum lengths of decoding')
+parser.add_argument('--length_ratio',  type=int,   default=6, help='maximum lengths of decoding')
 parser.add_argument('--beam_size',     type=int,   default=1, help='beam-size used in Beamsearch, default using greedy decoding')
 parser.add_argument('--alpha',         type=float, default=1, help='length normalization weights')
 parser.add_argument('--original',      action='store_true', help='output the original output files, not the tokenized ones.')
@@ -101,7 +127,6 @@ parser.add_argument('--decode_test',   action='store_true', help='evaluate score
 
 # Learning to Translation in Real-Time
 parser.add_argument('--real_time', action='store_true', help='real-time translation.')
-
 
 # model saving/reloading, output translations
 parser.add_argument('--load_from', type=str, default='none', help='load from checkpoint')
@@ -153,9 +178,12 @@ if args.params == 'james-iwslt':
                 'n_heads': 2, 'drop_ratio': 0.079, 'warmup': 746} # ~32
 elif args.params == 't2t-base':
     hparams = {'d_model': 512, 'd_hidden': 2048, 'n_layers': 6,
-                'n_heads': 8, 'drop_ratio': 0.1, 'warmup': 4000}  # ~32
+                'n_heads': 8, 'n_cross_heads': 8, 'drop_ratio': 0.1, 'warmup': 4000}  # ~32
 else:
     pass
+
+if args.model == 'AutoTransformer2':
+    args.n_cross_heads = 1
 
 args.__dict__.update(hparams)
 
@@ -211,10 +239,14 @@ watcher.info(f'Starting with HPARAMS: {hp_str}')
 # ========================================================================================================== #
 
 # get the dataloader
-dataloader = DataLoader(args, watcher, vocab_file=args.vocab_file)
+# if not args.multi:
+#     dataloader = DataLoader(args, watcher, vocab_file=args.vocab_file)
+# else:
+dataloader = MultiDataLoader(args, watcher, vocab_file=args.vocab_file)
 
 # build the model
-model = Transformer(dataloader.SRC, dataloader.TRG, args)
+model = eval(args.model)(dataloader.SRC, dataloader.TRG, args)  # build the model either Transformer or AutoEncoder.
+watcher.info(model)
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -231,10 +263,13 @@ if args.distributed:
 # load pre-trained parameters
 if args.load_from != 'none':
     with torch.cuda.device(args.local_rank):
-        model.load_state_dict(torch.load(
+        pretrained_dict = torch.load(
             os.path.join(args.workspace_prefix, 'models', args.load_from + '.pt'),
-            map_location=lambda storage, loc: storage.cuda()))  # load the pretrained models.
-
+            map_location=lambda storage, loc: storage.cuda())
+        model_dict = model.state_dict()
+        pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
+        model_dict.update(pretrained_dict) 
+        model.load_state_dict(model_dict)
 
 decoding_path = os.path.join(args.workspace_prefix, 'decodes', args.load_from if args.mode == 'test' else (args.prefix + hp_str))
 if (args.local_rank == 0) and (not os.path.exists(decoding_path)):
@@ -246,13 +281,20 @@ names = ['{}.src.{}'.format(args.test_set, name_suffix), '{}.trg.{}'.format(args
 # start running
 if args.mode == 'train':
     watcher.info('starting training')
-    train_model(args, watcher, model, dataloader.train, dataloader.dev, decoding_path=decoding_path, names=names)
+    if args.autoencoding:  # running auto-encoder
+        train_autoencoder(args, watcher, model, dataloader.train, dataloader.dev)
+    else:
+        train_model(args, watcher, model, dataloader.train, dataloader.dev, decoding_path=decoding_path, names=names)
 
 elif args.mode == 'test':
-
     watcher.info('starting decoding from the pre-trained model, on the test set...')
     assert args.load_from is not None, 'must decode from a pre-trained model.'
-    with torch.no_grad():   
-        valid_model(args, watcher, model, dataloader.test if args.decode_test else dataloader.dev, decoding_path=decoding_path, names=names)
+    with torch.no_grad(): 
+        test_set = dataloader.test if args.decode_test else dataloader.dev
+        if args.autoencoding: # evaluating auto-encoder
+            valid_model(args, watcher, model, test_set, decoding_path=decoding_path, names=names, dataflow=['src', 'src'])
+            valid_model(args, watcher, model, test_set, decoding_path=decoding_path, names=names, dataflow=['trg', 'trg'])
+        else:
+            valid_model(args, watcher, model, test_set, decoding_path=decoding_path, names=names)
 
 watcher.info("done.")

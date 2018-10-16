@@ -74,16 +74,28 @@ def full_reader(paths, fields, max_len=None):
         return examples
 
 """ batch fetcher """
-def fetch_batch(data, batch_size, batch_size_fn=None, world_size=1, reserve=False):
+def fetch_batch(data, batch_size, world_size=1, reserve=False, maxlen=10000, maxatt_size=None):
     """Yield elements from data in chunks of batch_size.
     :: minibatch: a reference of list which the remaining of batches will always be there for fetching next time.
     """
 
-    if batch_size_fn is None:
-        def batch_size_fn(new, count, sofar):
-            return count
+    # --- dynamic batching function -- # 
+    def dynamic_batching(new, i, tokens, maxatt):
+        tokens = tokens + max(len(new.src), len(new.trg))
+        maxatt = maxatt / (i - 1) if i > 1 else 0
+        maxatt = max(len(new.src) ** 2, len(new.trg)  ** 2,  maxatt) * i
+        return tokens, maxatt
+
+    if batch_size == 1:  # speed-test: one sentence per batch.
+        batch_size_fn = lambda new, count, sofar, maxatt: count
+    else:
+        batch_size_fn = dynamic_batching
+
+    if maxatt_size is None:
+        maxatt_size = 1e10  # infinite
 
     size_so_far = 0
+    maxatt_so_far = 0
     t0 = time.time()
 
     minibatch = []
@@ -92,6 +104,9 @@ def fetch_batch(data, batch_size, batch_size_fn=None, world_size=1, reserve=Fals
 
     for it, ex in enumerate(data):
         
+        if max(len(ex.src), len(ex.trg)) > maxlen:
+            continue
+
         if reserve and (it < world_size):
             reserved_minibatch.append(ex)
             continue
@@ -99,14 +114,29 @@ def fetch_batch(data, batch_size, batch_size_fn=None, world_size=1, reserve=Fals
         else:
             minibatch.append(ex)
         
-        size_so_far = batch_size_fn(ex, len(minibatch), size_so_far)
-        if (size_so_far == batch_size * world_size) and (len(minibatch) > world_size):        # make sure there is no empty batches coming out during testing.
+        size_so_far, maxatt_so_far = batch_size_fn(ex, len(minibatch), size_so_far, maxatt_so_far)
+        
+        def check(a, ax, b, bx):
+            if ((a == ax) and (b <= bx)):
+                return 0
+            if ((b == bx) and (a <= ax)):
+                return 0
+            if ((a > ax) or (b > bx)):
+                return 1
+            return -1
+
+        status = check(size_so_far, batch_size * world_size, np.ceil(maxatt_so_far / world_size), maxatt_size)
+        
+        if (status == 0) and (len(minibatch) > world_size):         # make sure there is no empty batches coming out during testing.
+            # print(maxatt_so_far, np.ceil(maxatt_so_far / world_size))
             yield minibatch
-            minibatch, size_so_far = [], 0
+            minibatch, size_so_far, maxatt_so_far = [], 0, 0
             
-        elif (size_so_far > batch_size * world_size) and (len(minibatch) > (world_size + 1)): # make sure there is no empty batches coming out during testing.
+        elif (status == 1) and (len(minibatch) > (world_size + 1)): # make sure there is no empty batches coming out during testing.
+            # print(maxatt_so_far, np.ceil(maxatt_so_far / world_size))
             yield minibatch[:-1]
-            minibatch, size_so_far = minibatch[-1:], batch_size_fn(ex, 1, 0)
+            minibatch = minibatch[-1:]
+            size_so_far, maxatt_so_far = batch_size_fn(ex, 1, 0, 0)
 
     if reserve:
         minibatch += reserved_minibatch  # make sure there is no empty batches coming out during testing.
@@ -114,7 +144,7 @@ def fetch_batch(data, batch_size, batch_size_fn=None, world_size=1, reserve=Fals
 
     
 """ pool of batch fetcher """
-def fetch_pool(data, batch_size, key, batch_size_fn=lambda new, count, sofar: count, random_shuffler=None, world_size=1):
+def fetch_pool(data, batch_size, key, random_shuffler=None, world_size=1, maxlen=10000, maxatt_size=None):
     """Sort within buckets, then batch, then shuffle batches.
     Partitions data into chunks of size 100*batch_size, sorts examples within
     each chunk using sort_key, then batch these examples and shuffle the
@@ -123,23 +153,68 @@ def fetch_pool(data, batch_size, key, batch_size_fn=lambda new, count, sofar: co
     if random_shuffler is None:
         random_shuffler = random.shuffle
 
-    for p in fetch_batch(data, batch_size * 100, batch_size_fn):
-        p_batch = fetch_batch(sorted(p, key=key), batch_size, batch_size_fn, world_size, True) 
+    for p in fetch_batch(data, batch_size * 100, maxatt_size=None):
+        p_batch = fetch_batch(sorted(p, key=key), batch_size, world_size, True, maxlen=maxlen, maxatt_size=maxatt_size) 
         for b in random_shuffler(list(p_batch)):
             yield b
-
 
 # ====================== Supportive Functions =========================================== #
 
 """ sequence data field """
 class Seuqence(data.Field):
 
-    def __init__(self, reverse_tokenize, **kwargs):
+    def __init__(self, reverse_tokenize, shuffle=0, dropout=0, replace=0, **kwargs):
         super().__init__(**kwargs)
         self.reverse_tokenizer = reverse_tokenize
+        self.shuffle, self.dropout, self.replace = shuffle, dropout, replace
 
+    def word_shuffle(self, x):
+        if self.shuffle == 0:
+            return x
+        return [x[i] for i in (np.random.uniform(0, self.shuffle, size=(len(x))) + np.arange(len(x))).argsort()]
 
-    def reverse(self, batch, width=1, return_saved_time=False):
+    def word_dropout(self, x):
+        if self.dropout == 0:
+            return x   
+        return [xi for xi, di in zip(x, (np.random.rand(len(x)) >= self.dropout).tolist()) if di == 1]
+
+    def word_blank(self, x, tok='<unk>'):
+        if self.replace == 0:
+            return x 
+        return [xi if di == 1 else tok for xi, di in zip(x, (np.random.rand(len(x)) >= self.replace).tolist())]
+
+    def add_noise(self, x, noise_level=None):
+        if noise_level is None:
+            return x
+
+        if noise_level == 'n1':
+            c = np.random.choice(3)
+        elif noise_level == 'n2':
+            c = np.random.choice(4)
+        elif noise_level == 'n3':
+            c = 4
+        else:
+            raise NotImplementedError
+
+        if c == 0:
+            return self.word_shuffle(x)
+        elif c == 1:
+            return self.word_dropout(x)
+        elif c == 2:
+            return self.word_blank(x, self.unk_token)
+        elif c == 3:
+            return x
+        elif c == 4:      
+            return self.word_blank(self.word_dropout(self.word_shuffle(x)), self.unk_token)
+        else:
+            raise NotImplementedError
+
+    def process(self, batch, device=None):
+        padded = self.pad(batch)
+        tensor = self.numericalize(padded, device=device)
+        return tensor
+
+    def reverse(self, batch, width=1, return_saved_time=False, reverse_token=True):
         if not self.batch_first:
             batch.t_()
 
@@ -210,122 +285,30 @@ class Seuqence(data.Field):
         else:
             batch_filtered = [list(filter(filter_special, ex)) for ex in batch]
 
+        if not reverse_token:
+            return batch_filtered
+
         output = [self.reverse_tokenizer(ex) for ex in batch_filtered]
         if return_saved_time:
             return output, saved_time, accuracy, decisions
 
         return output
 
-
-class Sequence2D(Seuqence):
-    """
-    A new field to transform input into 2D space.
-    """
-    def pad(self, minibatch):
-        """Pad a batch of examples using this field.
-        Pads to self.fix_length if provided, otherwise pads to the length of
-        the longest example in the batch. Prepends self.init_token and appends
-        self.eos_token if those attributes are not None. Returns a tuple of the
-        padded list and a list containing lengths of each example if
-        `self.include_lengths` is `True` and `self.sequential` is `True`, else just
-        returns the padded list. If `self.sequential` is `False`, no padding is applied.
-        """
-        minibatch = list(minibatch)
-        if not self.sequential:
-            return minibatch
-
-        if self.fix_length is None:
-            max_len = max(len(x) for x in minibatch) + 2
-        else:
-            raise NotImplementedError
-
-        padded, lengths = [], []  
-
-        for x in minibatch:
-            
-            # adding space before <bos> and <eos>
-            for i, word in enumerate(x):
-                x[i].append(' ')
-
-            # adding <bos> and <eos>
-            x = [[self.init_token]] + x + [[self.eos_token]]
-
-            # adding sentence pads
-            padded.append(x + [[self.pad_token]] * max(0, max_len - len(x)))
-            lengths.append(len(padded[-1]) - max(0, max_len - len(x)))
-            
-        if self.fix_length is None:
-            max_word = max(len(word) for sentence in padded for word in sentence)
-        else:
-            raise NotImplementedError
-        
-        padded_word_all = []
-        for sentence in padded:
-            padded_word = []
-            for word in sentence:
-                # put "space" "<bos>" "<eos>" to the end.
-                # adding word pads.
-                padded_word.append(word[:-1] + [self.pad_token] * max(0, max_word - len(word)) + word[-1:])
-            
-            padded_word_all.append(padded_word)  
-        
-        if self.include_lengths:
-            return (padded_word_all, lengths)
-        return padded_word_all
-    
-    def numericalize(self, arr, device=None):
-        """Turn a batch of examples that use this field into a Variable.
-        If the field has include_lengths=True, a tensor of lengths will be
-        included in the return value.
-        Arguments:
-            arr (List[List[str]], or tuple of (List[List[str]], List[int])):
-                List of tokenized and padded examples, or tuple of List of
-                tokenized and padded examples and List of lengths of each
-                example if self.include_lengths is True.
-            device (str or torch.device): A string or instance of `torch.device`
-                specifying which device the Variables are going to be created on.
-                If left as default, the tensors will be created on cpu. Default: None.
-        """
-        if self.include_lengths and not isinstance(arr, tuple):
-            raise ValueError("Field has include_lengths set to True, but "
-                            "input data is not a tuple of "
-                            "(data batch, batch lengths).")
-        
-        if isinstance(arr, tuple):
-            arr, lengths = arr
-            lengths = torch.tensor(lengths, dtype=self.dtype, device=device)
-        
-        if self.use_vocab:
-            if self.sequential:
-                arr = [[[self.vocab.stoi[char] for char in x] for x in ex] for ex in arr]
-            else:
-                raise NotImplementedError
-
-            if self.postprocessing is not None:
-                arr = self.postprocessing(arr, self.vocab)
-        else:
-            raise NotImplementedError
-
-        var = torch.tensor(arr, dtype=self.dtype, device=device)
-
-        if self.sequential and not self.batch_first:
-            var.t_()
-        if self.sequential:
-            var = var.contiguous()
-
-        if self.include_lengths:
-            return var, lengths
-        return var
+    def reapply_noise(self, data, noise):
+        batch = self.reverse(data, reverse_token=False)
+        batch = [self.add_noise(ex, noise) for ex in batch]
+        return self.process(batch, device=data.get_device())
 
 
 """ parallel dataset. using the lazy loader for training """
 class ParallelDataset(datasets.TranslationDataset):
     """ Define a N-parallel dataset: supports abitriry numbers of input streams"""
 
-    def __init__(self, path=None, exts=None, fields=None, lazy=True, max_len=None, buffer=16384, **kwargs):
+    def __init__(self, path=None, exts=None, fields=None, lazy=True, max_len=None, buffer=16384, task=None, **kwargs):
 
         assert len(exts) == len(fields), 'N parallel dataset must match'
         self.N = len(fields)
+        self.task = path.split('/')[-2] if task is None else task
         paths = tuple(os.path.expanduser(path + x) for x in exts)
 
         if lazy:  # using lazy dataloader -- cannot be used to construct the vocabulary -- 
@@ -364,8 +347,6 @@ class DistributedBatch(Batch):
             self.batch_size = len(data)
             self.dataset = dataset
             self.fields = dataset.fields.keys()  # copy field names
-            # print('big batch size', big_batch_size, mini_batch_size, self.batch_size, local_rank, 
-            #         mini_batch_size * local_rank, mini_batch_size * local_rank + mini_batch_size )
             
             for (name, field) in dataset.fields.items():
                 if field is not None:
@@ -377,22 +358,25 @@ class DistributedBatch(Batch):
 class LazyBucketIterator(data.BucketIterator):
 
     def __init__(self, dataset, batch_size, sort_key=None, device=None,
-                batch_size_fn=None, train=True, repeat=None, sort=None,
-                sort_within_batch=False, distributed=False, rank=0, world_size=1):
-        super().__init__(dataset, batch_size, sort_key, device, batch_size_fn, 
+                train=True, repeat=None, sort=None,
+                sort_within_batch=False, distributed=False, rank=0, 
+                world_size=1, maxlen=10000, maxatt_size=None):
+        super().__init__(dataset, batch_size, sort_key, device, None, 
                         train, repeat, shuffle=False, sort=sort, sort_within_batch=sort_within_batch)
         
         # self.minibatch = []  # save unfinished batches.
         self.distributed = distributed
         self.rank = rank
         self.world_size = world_size
+        self.maxlen = maxlen
+        self.maxatt_size = maxatt_size
 
     def create_batches(self):
         if self.sort:
-            self.batches = fetch_batch(self.data(), self.batch_size, self.batch_size_fn, self.world_size, True)
+            self.batches = fetch_batch(self.data(), self.batch_size, self.world_size, True, maxlen=self.maxlen, maxatt_size=self.maxatt_size)
         else:
-            self.batches = fetch_pool(self.data(), self.batch_size, self.sort_key, self.batch_size_fn,
-                                    random_shuffler=self.random_shuffler, world_size=self.world_size)
+            self.batches = fetch_pool(self.data(), self.batch_size, self.sort_key, random_shuffler=self.random_shuffler, 
+                                    world_size=self.world_size, maxlen=self.maxlen, maxatt_size=self.maxatt_size)
 
     # --- wrap the iterator --- 
     def __iter__(self):
@@ -409,19 +393,10 @@ class LazyBucketIterator(data.BucketIterator):
                 if self._iterations_this_epoch > idx:
                     continue
 
-                # --- distributed iterator ---
-                # if self.distributed:
-                #     if count % self.world_size != self.rank:
-                #         continue
-
                 self.iterations += 1
                 self._iterations_this_epoch += 1
                 if self.sort_within_batch:
-                    # NOTE: `rnn.pack_padded_sequence` requires that a minibatch
-                    # be sorted by decreasing order, which requires reversing
-                    # relative to typical sort keys
                     minibatch.sort(key=self.sort_key, reverse=True)
-
                 yield DistributedBatch(minibatch, self.dataset, self.device, self.world_size, self.rank)
 
             if not self.repeat:
@@ -429,7 +404,8 @@ class LazyBucketIterator(data.BucketIterator):
 
 
 # ========================= DataLoader for Distributed Transformer ==================================== #
-class DataLoader(object):
+
+class MultiDataLoader(object):
 
     def __init__(self, args, logger=None, build_vocab=False, vocab_file=None):
 
@@ -447,145 +423,130 @@ class DataLoader(object):
             revserse_tokenizer = byte2str
 
         elif args.base == 'char':
-            if not args.c2:
-                tokenizer = lambda s: list(s)
-                revserse_tokenizer = lambda ex: "".join(ex)
+            tokenizer = lambda s: list(s)
+            revserse_tokenizer = lambda ex: "".join(ex)
 
-            else:    
-                assert args.base == 'char', "2D grid inputs only works at Character-Level"
-                
-                tokenizer = lambda s: [list(word) for word in s.split()]
-                revserse_tokenizer = lambda ex: "".join(ex)
-                sort_key  = lambda ex: data.interleave_keys(sum([len(a) for a in ex.src]), 
-                                                            sum([len(b) for b in ex.trg]))
-                Field = Sequence2D
-
-        # ----------------------- #
-
+        # -- source / target field --- #
+        common_kwargs = {'batch_first': True, 'tokenize': tokenizer, 'reverse_tokenize': revserse_tokenizer, 
+                        'shuffle': args.word_shuffle, 'dropout': args.word_dropout, 'replace': args.word_blank}
         if args.remove_dec_eos:
-            TRG = Field(batch_first=True, tokenize=tokenizer, reverse_tokenize=revserse_tokenizer)
+            TRG = Field(batch_first=True, **common_kwargs)
         else:
-            TRG = Field(init_token='<init>', eos_token='<eos>', batch_first=True, tokenize=tokenizer, reverse_tokenize=revserse_tokenizer)
+            TRG = Field(init_token='<init>', eos_token='<eos>', **common_kwargs)
 
         if args.share_embeddings:
             SRC = TRG
         elif args.remove_enc_eos:
-            SRC = Field(batch_first=True, tokenize=tokenizer, reverse_tokenize=revserse_tokenizer)
+            SRC = Field(batch_first=True, **common_kwargs)
         else:
-            SRC = Field(init_token='<init>', eos_token='<eos>', batch_first=True, tokenize=tokenizer, reverse_tokenize=revserse_tokenizer)
+            SRC = Field(init_token='<init>', eos_token='<eos>', **common_kwargs)
 
         self.SRC, self.TRG = SRC, TRG
 
-        pair = args.src + '-' + args.trg
-        data_path = os.path.join(args.data_prefix, args.dataset, pair)
-        exts=('.src', '.trg')
-        reverse = False
-
-        if not os.path.exists(data_path):
-
-            # translation in a reverse direction #
-            pair = args.trg + '-' + args.src
-            data_path = os.path.join(args.data_prefix, args.dataset, pair)
-            exts=('.trg', '.src')
-            reverse = True
-            
-            if not os.path.exists(data_path):
-                raise NotImplementedError
-            
-
-        # --- setup dataset (no lazy mode when building the vocab) --- #
-        train_data, dev_data, test_data = ParallelDataset.splits(
-            path= data_path + '/', lazy=(not build_vocab),
-            train=args.train_set, validation=args.dev_set, test=args.test_set, 
-            exts=exts, fields=[('src', SRC), ('trg', TRG)],
-            buffer=16384 * args.world_size)
-
-        logger.info('setup the dataset.')
+        # -- languages -- #
+        # e.g. we assume the language markers are using "en,fr,zh"  
+        srcs = args.src.split(',')
+        trgs = args.trg.split(',')
 
         # --- read the vocabulary -- #
         if args.base != 'byte':
+            reverse = False
             
-            if vocab_file is None:
-                vocab_name = 'vocab.{}.{}.{}.pt'.format(pair, 's' if args.share_embeddings else 'n', 'c' if args.base == 'char' else 'w')
-            else:
-                vocab_name = vocab_file
+            if args.multi:
+                assert vocab_file is not None, "Multi-lingual Training requires to compute vocabulary manually first."
+                assert os.path.exists(os.path.join(args.data_prefix, args.dataset, vocab_file)), 'need to pre-compute the vocab'
 
-            if build_vocab:
-                logger.info('build the vocabulary.')
-                if not args.share_embeddings:
-                    SRC.build_vocab(train_data, max_size=args.max_vocab_size)
-                TRG.build_vocab(train_data, max_size=args.max_vocab_size)
-                torch.save([SRC.vocab, TRG.vocab], os.path.join(data_path, vocab_name))
-                logger.info('done. {}/{}'.format(len(SRC.vocab), len(TRG.vocab)))
-                sys.exit(1)
-
-            logger.info('load saved vocabulary.')
-
-            assert os.path.exists(os.path.join(data_path, vocab_name)), 'need to pre-compute the vocab'
-            src_vocab, trg_vocab = torch.load(os.path.join(data_path, vocab_name))
+            if vocab_file is None:  # not recommanded. use the default vocabulary file.
+                pair = srcs[0] + '-' + trgs[0]
+                data_path = os.path.join(args.data_prefix, args.dataset, pair)
+                if not os.path.exists(data_path):
+                    pair = trgs[0] + '-' + srcs[0]
+                    data_path = os.path.join(args.data_prefix, args.dataset, pair)
+                    reverse = True
+                    if not os.path.exists(data_path):
+                        raise IOError   
+                vocab_file = '{}/vocab.{}.{}.{}.pt'.format(pair, pair, 's' if args.share_embeddings else 'n', 'c' if args.base == 'char' else 'w')
+            src_vocab, trg_vocab = torch.load(os.path.join(args.data_prefix, args.dataset, vocab_file))
             
-            if reverse:
-                SRC.vocab = trg_vocab
-                TRG.vocab = src_vocab
-            else:    
+            if not reverse:
                 SRC.vocab = src_vocab
                 TRG.vocab = trg_vocab
-        
+            else:
+                SRC.vocab = trg_vocab
+                TRG.vocab = src_vocab
+
         else:
+            # Byte-level model always use the same vocabulary.
             SRC.build_vocab([["{0:x}".format(a)] for a in range(256)])
             TRG.build_vocab([["{0:x}".format(a)] for a in range(256)])
     
         args.__dict__.update({'trg_vocab': len(TRG.vocab), 'src_vocab': len(SRC.vocab)})
 
-        # --- dynamic batching function -- #
-        def dyn_batch_with_padding(new, i, sofar):
-            prev_max_len = sofar / (i - 1) if i > 1 else 0
-            t =  max(len(new.src), len(new.trg),  prev_max_len) * i
-            return t
-
-        def dyn_batch_without_padding(new, i, sofar):
-            return sofar + max(len(new.src), len(new.trg))
-        
-        def dyn_batch_char2d(new, i, sofar):
-            return sofar + max(sum([len(a) for a in new.src]), sum([len(b) for b in new.trg]))
-
-        if args.batch_size == 1:  # speed-test: one sentence per batch.
-            batch_size_fn = lambda new, count, sofar: count
-        else:
-            batch_size_fn = dyn_batch_without_padding
-        
         # --- build batch-iterator for Translation tasks. ---
-        self.train, self.dev, self.test = None, None, None
-        if train_data is not None:
-            logger.info("build the training set.")
-            self.train = LazyBucketIterator(train_data, 
-                                            batch_size=args.batch_size, 
-                                            device=args.device,
-                                            sort_key=sort_key,
-                                            batch_size_fn=batch_size_fn, train=True, 
-                                            repeat=None if args.mode == 'train' else False,
-                                            sort_within_batch=True, 
-                                            distributed=args.distributed, 
-                                            rank=args.local_rank, world_size=args.world_size)
-        if dev_data is not None:
-            logger.info("build the validation set.")
-            self.dev = LazyBucketIterator(dev_data, 
-                                            batch_size=args.batch_size, 
-                                            device=args.device,
-                                            sort_key=sort_key,
-                                            batch_size_fn=batch_size_fn, train=False, 
-                                            repeat = False, 
-                                            sort_within_batch=True, 
-                                            distributed=args.distributed, 
-                                            rank=args.local_rank, world_size=args.world_size)
+        self.train, self.dev, self.test = [], [], []
 
-            # self.dev = data.BucketIterator(dev_data, batch_size=args.batch_size * 2, device=args.device,
-            #                                 batch_size_fn=batch_size_fn, train=False)
+        def get_iterator(src, trg):
+
+            # find the data #
+            pair = src + '-' + trg
+            data_path = os.path.join(args.data_prefix, args.dataset, pair)
+            exts=('.src', '.trg')
+            reverse = False
+
+            if not os.path.exists(data_path):
+
+                # translation in a reverse direction #
+                pair = trg + '-' + src
+                data_path = os.path.join(args.data_prefix, args.dataset, pair)
+                exts=('.trg', '.src')
+                reverse = True
+                
+                if not os.path.exists(data_path):
+                    raise NotImplementedError   
+
+            # --- setup dataset (no lazy mode when building the vocab) --- #
+            train_data, dev_data, test_data = ParallelDataset.splits(
+                path= data_path + '/', lazy=True,
+                train=args.train_set, validation=args.dev_set, test=args.test_set, 
+                exts=exts, fields=[('src', SRC), ('trg', TRG)],
+                buffer=16384 * args.world_size, task='{}-{}'.format(src, trg))
+            logger.info('setup the dataset.')
+
+
+            if train_data is not None:
+                train = LazyBucketIterator(train_data, 
+                                        batch_size=args.batch_size, 
+                                        device=args.device,
+                                        sort_key=sort_key,
+                                        train=True, 
+                                        repeat=None if args.mode == 'train' else False,
+                                        sort_within_batch=True, 
+                                        distributed=args.distributed, 
+                                        rank=args.local_rank, world_size=args.world_size,
+                                        maxlen=args.maxlen, maxatt_size=args.maxatt_size)
+                                                
+            if dev_data is not None:
+                dev = LazyBucketIterator(dev_data, 
+                                        batch_size=args.batch_size, 
+                                        device=args.device,
+                                        sort_key=sort_key,
+                                        train=False, 
+                                        repeat=False, 
+                                        sort_within_batch=True, 
+                                        distributed=args.distributed, 
+                                        rank=args.local_rank, world_size=args.world_size)
+
+                
+            if test_data is not None:   
+                test = data.BucketIterator(test_data, batch_size=args.batch_size, device=args.device, train=False)
+
+            logger.info("training set: {}-{} successfully loaded.".format(src, trg))
+            return train, dev, test
+
+        for src, trg in zip(srcs, trgs):
+            train, dev, test = get_iterator(src, trg)
             
-        if test_data is not None: 
-            logger.info("build the testing set. (normal iterator is fine)")   
-            self.test = data.BucketIterator(test_data, batch_size=args.batch_size, device=args.device,
-                                            batch_size_fn=batch_size_fn, train=False)
+            self.train.append(train) 
+            self.dev.append(dev)
+            self.test.append(test) 
 
-
-    

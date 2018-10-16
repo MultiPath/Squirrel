@@ -15,8 +15,8 @@ from abc import ABCMeta, abstractmethod
 from torch import nn
 from torch.nn import functional as F
 
-from core import *
-from transformer import Transformer
+from .core import *
+from .transformer import Transformer
 
 INF = 1e10
 TINY = 1e-9

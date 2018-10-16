@@ -1,5 +1,6 @@
 import torch
 import math
+import copy
 
 from collections import defaultdict
 from abc import ABCMeta, abstractmethod
@@ -208,6 +209,7 @@ class Linear(nn.Linear):
         return super().forward(
             x.contiguous().view(-1, size[-1])).view(*size[:-1], -1)
 
+
 class LayerNorm(nn.Module):
 
     def __init__(self, d_model, eps=1e-6):
@@ -220,6 +222,7 @@ class LayerNorm(nn.Module):
         mean = x.mean(-1, keepdim=True)
         std = x.std(-1, keepdim=True)
         return self.gamma * (x - mean) / (std + self.eps) + self.beta
+
 
 class ResidualBlock(nn.Module):
 
@@ -264,13 +267,16 @@ class HighwayBlock(nn.Module):
         g = torch.sigmoid(self.gate(x[0])).expand_as(x[0])
         return self.layernorm(x[0] * g + self.dropout(self.layer(*x)) * (1 - g))
 
+
 class Attention(nn.Module):
 
-    def __init__(self, d_key, drop_ratio, causal, noisy=False):
+    def __init__(self, d_key, drop_ratio, causal, noisy=False, local=False):
         super().__init__()
         self.scale = math.sqrt(d_key)
         self.dropout = nn.Dropout(drop_ratio)
         self.causal = causal
+        self.local = local
+        self.window = 2
         self.noisy  = noisy
         self.p_attn = None
 
@@ -280,8 +286,12 @@ class Attention(nn.Module):
         if query.dim() == 3 and self.causal: # and (query.size(1) == key.size(1)):
             tri = key.data.new(key.size(1), key.size(1)).fill_(1).triu(1) * INF
             tri = tri[-query.size(1):]       # caual attention may work on non-square attention.
-            
             dot_products.data.sub_(tri.unsqueeze(0))
+
+        if self.local:
+            window_mask = key.new_ones(key.size(1), key.size(1))
+            window_mask = (window_mask.triu(self.window+1) + window_mask.tril(-self.window-1)) * INF
+            dot_products.data.sub_(window_mask.unsqueeze(0))
 
         if mask is not None:
             if dot_products.dim() == 2:
@@ -306,16 +316,18 @@ class Attention(nn.Module):
         # return the attention results
         return matmul(self.dropout(probs), value)
 
+
 class MultiHead2(nn.Module):
 
-    def __init__(self, d_key, d_value, n_heads, drop_ratio=0.1, causal=False, noisy=False):
+    def __init__(self, d_key, d_value, n_heads, drop_ratio=0.1, causal=False, noisy=False, local=False):
         super().__init__()
-        self.attention = Attention(d_key, drop_ratio, causal=causal, noisy=noisy)
+        self.attention = Attention(d_key, drop_ratio, causal=causal, noisy=noisy, local=local)
         self.wq = Linear(d_key,   d_key, bias=True)
         self.wk = Linear(d_key,   d_key, bias=True)
         self.wv = Linear(d_value, d_value, bias=True)
         self.wo = Linear(d_value, d_key, bias=True)
         self.n_heads = n_heads
+        self.local = local
 
     def forward(self, query, key, value, mask=None, beta=0, tau=1):
         query, key, value = self.wq(query), self.wk(key), self.wv(value)   # B x T x D
@@ -331,10 +343,39 @@ class MultiHead2(nn.Module):
             else:
                 mask = mask[:, None, :, :].expand(B, N, Tq, Tk).contiguous().view(B * N, Tq, Tk)
 
+        # local mask
+        # if self.local:
+        #     T = torch.arange(Tq, device=mask.get_device())[None, None, :].expand(B*N, Tq, Tk)
+        #     T = (T - T.transpose(1, 2)).float()
+        #     t = 2
+
+        #     def H(a):
+        #         return torch.sigmoid(10 * (a + 0.5))
+
+        #     new_mask = ((H(T + t) - H(T - t - 1)) > 0.5).float()
+        #     if mask.dim() == 2:
+        #         mask = mask[:,None,:] * new_mask
+        #     else:
+        #         mask = mask * new_mask
+
         outputs = self.attention(query, key, value, mask, beta, tau)  # (B x n) x T x (D/n)
         outputs = outputs.contiguous().view(B, N, -1, D//N).transpose(2, 1).contiguous().view(B, -1, D)
         return self.wo(outputs)
 
+
+class MultiHeadConv(nn.Module):
+
+    def __init__(self, d_model, max_width=4):
+        super().__init__()
+        self.max_width = max_width
+        self.convs = nn.ModuleList([nn.Conv1d(d_model // max_width, d_model // max_width, n, stride=1) 
+                                    for n in range(1, max_width + 1)])
+
+    def forward(self, x):
+        batchsize, d_model, length = x.size()
+        x = x.view(batchsize, d_model // self.max_width, self.max_width, length)
+        o = torch.cat([self.convs[k](F.pad(x[:,:,k,:], (0, k))) for k in range(self.max_width)], 1)
+        return o
 
 class FeedForward(nn.Module):
 
@@ -355,13 +396,12 @@ class FeedForward(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, args, causal=False, cross=False, order='tdan'):
-
+    def __init__(self, args, causal=False, cross=False, order='tdan', local=False):
         super().__init__()
         self.selfattn = ResidualBlock(
             MultiHead2(
                 args.d_model, args.d_model, args.n_heads,
-                args.drop_ratio, causal),
+                args.drop_ratio, causal, local=local),
             args.d_model, args.drop_ratio, order=order)
         self.feedforward = ResidualBlock(
             FeedForward(args.d_model, args.d_hidden, args.drop_ratio),
@@ -369,7 +409,7 @@ class Block(nn.Module):
 
         if cross:
             self.crossattn = ResidualBlock(
-            MultiHead2(args.d_model, args.d_model, args.n_heads, args.drop_ratio),  
+            MultiHead2(args.d_model, args.d_model, args.n_cross_heads, args.drop_ratio),  
             args.d_model, args.drop_ratio, order=order)
 
         self.cross = cross
@@ -390,12 +430,12 @@ class Stack(nn.Module):
     --- Merge the Transformer's encoder & decoder into ONE class --
     """
 
-    def __init__(self, field, args, causal=False, cross=False):
+    def __init__(self, field, args, causal=False, cross=False, local=0):
 
         super().__init__()
-
+        
         self.layers = nn.ModuleList(
-            [Block(args, causal, cross, order=args.block_order)
+            [Block(args, causal, cross, order=args.block_order, local=(i < local))
             for i in range(args.n_layers)])
         self.dropout = nn.Dropout(args.drop_ratio)
 
@@ -412,12 +452,16 @@ class Stack(nn.Module):
         if encoding is None:
             return encoding
 
+        if len(encoding) > len(self.layers):
+            encoding = encoding[1:]
+
         if self.cross_attn_fashion == 'reverse':
-            encoding = encoding[1:][::-1]
+            encoding = encoding[::-1]
         elif self.cross_attn_fashion == 'last_layer':
             encoding = [encoding[-1] for _ in range(len(self.layers))]
         else:
-            encoding = encoding[1:]
+            pass
+
         return encoding
 
     def prepare_embedding(self, embedding):
@@ -452,7 +496,7 @@ class IO(nn.Module):
     def i(self, x, pos=True):
         x = F.embedding(x, self.out.weight * self.scale)
         if pos:
-            x += positional_encodings_like(x)
+            x = x + positional_encodings_like(x)
         return x
 
     def o(self, x):
@@ -464,16 +508,12 @@ class IO(nn.Module):
             name = 'MLE'
         targets, outputs = with_mask(targets, outputs, masks.byte())
         loss[name] = cross_entropy_with_smooth(self.o(outputs), targets, label_smooth)
-        
         return loss
 
     def acc(self, targets, masks, outputs):
         with torch.cuda.device_of(targets):
             targets, outputs = with_mask(targets, outputs, masks.byte())
             return (self.o(outputs).max(-1)[1] == targets).float().tolist()
-
-    def reverse(self, outputs, **kwargs):
-        return self.field.reverse(outputs.data, **kwargs)
 
 
 class MulIO(IO):
@@ -590,34 +630,74 @@ class MulIO(IO):
         new_masks = shift(new_masks, blocksize, right=False) * shifted_masks
         return acceptance, new_masks
 
-    # def search(self, scores, K=8):
-    #     batchsize, seqsize, blocksize = scores.size()
-    #     scores = shift(scores, blocksize, right=True, value=-INF)  # right-shifting
-    #     scores = torch.cat([scores, scores.new_zeros(batchsize, seqsize, 1) - INF], dim=2)  # safely guard
+    def search(self, scores, K=8):
+        batchsize, seqsize, blocksize = scores.size()
+        scores = shift(scores, blocksize, right=True, value=-INF)  # right-shifting
+        scores = torch.cat([scores, scores.new_zeros(batchsize, seqsize, 1) - INF], dim=2)  # safely guard
         
-    #     decisions = scores.new_zeros(batchsize, seqsize, K).long() # all starts from 0
-    #     outputs = scores[:, 0, :].gather(1, decisions[:, 0, :])
-    #     outputs[:, 1:].add_(-INF)
+        decisions = scores.new_zeros(batchsize, seqsize, K).long() # all starts from 0
+        outputs = scores[:, 0, :].gather(1, decisions[:, 0, :])
+        outputs[:, 1:].add_(-INF)
         
-    #     for t in range(1, seqsize):
-    #         reject_outputs = outputs + scores[:, t, 0:1]
-    #         accept_outputs = outputs + scores[:, t, :].gather(1, decisions[:, t-1, :] + 1)
+        for t in range(1, seqsize):
+            reject_outputs = outputs + scores[:, t, 0:1]
+            accept_outputs = outputs + scores[:, t, :].gather(1, decisions[:, t-1, :] + 1)
             
-    #         new_outputs = torch.cat([reject_outputs, accept_outputs], 1)
-    #         decisions = torch.cat([decisions, decisions], 2)
-    #         decisions[:, t, K:] = decisions[:, t-1, K:] + 1
+            new_outputs = torch.cat([reject_outputs, accept_outputs], 1)
+            decisions = torch.cat([decisions, decisions], 2)
+            decisions[:, t, K:] = decisions[:, t-1, K:] + 1
 
-    #         outputs, sorted_ind = new_outputs.topk(K, dim=1)
-    #         decisions = decisions.gather(2, sorted_ind[:, None, :].expand(batchsize, seqsize, K))
+            outputs, sorted_ind = new_outputs.topk(K, dim=1)
+            decisions = decisions.gather(2, sorted_ind[:, None, :].expand(batchsize, seqsize, K))
 
-    #     best_decision = decisions[:, :, 0]  
-    #     acceptance = (best_decision != 0).long()
-    #     new_mask = scores.new_zeros(batchsize, seqsize, blocksize).scatter_(2, best_decision.unsqueeze(-1), 1)
-    #     new_mask = shift(new_mask, blocksize, right=False)
+        best_decision = decisions[:, :, 0]  
+        acceptance = (best_decision != 0).long()
+        new_mask = scores.new_zeros(batchsize, seqsize, blocksize).scatter_(2, best_decision.unsqueeze(-1), 1)
+        new_mask = shift(new_mask, blocksize, right=False)
 
-    #     return acceptance, new_mask
-
-
+        return acceptance, new_mask
 
 
+class Seq2Seq(nn.Module):
+    """
+    somehow an abstract class for seq2seq models.
+    provide basic input preprocessing parts
+    """
+    def trainable_parameters(self):
+        param = [p for p in self.parameters() if p.requires_grad] 
+        return [param]
+
+    def prepare_masks(self, inputs):
+        field, text = inputs
+        if text.ndimension() == 2:  # index inputs
+            masks = (text.data != self.fields[field].vocab.stoi['<pad>']).float()
+        else:                       # one-hot vector inputs
+            masks = (text.data[:, :, self.fields[field].vocab.stoi['<pad>']] != 1).float()
+        return masks
+
+    def prepare_field(self, batch, field):
+
+        if len(field.split('_')) == 2: # injecting noise
+            field, noise_level = field.split('_')
+            data = batch.dataset.fields[field].reapply_noise(getattr(batch, field), noise_level)
+        else:
+            data = getattr(batch, field)
+            
+        inputs = data[:, :-1].contiguous()
+        outputs = data[:, 1:].contiguous()
+        masks = self.prepare_masks((field, outputs))
+        return inputs, outputs, masks
+        
+    def prepare_data(self, batch, dataflow=['src', 'trg'], noise=None):
+        # get the data
+        data = dict()
+        _dataflow = copy.deepcopy(dataflow)
+        if noise is not None:
+            _dataflow[0] = _dataflow[0] + '_' + noise
+
+        for i, v in enumerate(_dataflow):
+            if v not in data:
+                data[v] = self.prepare_field(batch, v)
+        output = [x for v in _dataflow for x in data[v]]
+        return tuple(output)
 

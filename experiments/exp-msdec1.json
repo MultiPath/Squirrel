@@ -1,0 +1,22 @@
+{
+    "prefix": "msdec_03",
+    "mode": "train",
+    "workspace_prefix": "/private/home/jgu/space/",
+    "data_prefix": "/private/home/jgu/data/",
+    "dataset": "wmt16",
+    "src": "ro",
+    "trg": "en",
+    "train_set": "train.bpe",
+    "dev_set": "dev.bpe",
+    "load_lazy": true,
+    "params": "t2t-base",
+    "eval_every": 500,
+    "batch_size": 1000,
+    "inter_size": 4,
+    "label_smooth": 0.1,
+    "warmup": 4000,
+    "share_embeddings": true,
+    "tensorboard": true,
+    "multi_width": [1, 2, 3],
+    "debug": false
+}

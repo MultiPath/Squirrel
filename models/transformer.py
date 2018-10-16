@@ -1,10 +1,10 @@
-from core import *
+from .core import *
 
-class Transformer(nn.Module):
+class Transformer(Seq2Seq):
 
     def __init__(self, src, trg, args):
         super().__init__()
-        self.encoder = Stack(src, args, causal=args.causal_enc, cross=False)
+        self.encoder = Stack(src, args, causal=args.causal_enc, cross=False, local=args.local_attention)
         self.decoder = Stack(trg, args, causal=True, cross=True)
         
         if args.multi_width > 1:
@@ -17,46 +17,45 @@ class Transformer(nn.Module):
         if args.share_embeddings:
             self.io_enc.out.weight = self.io_dec.out.weight
 
+        self.input_conv = None
         self.length_ratio = args.length_ratio
         self.fields = {'src': src, 'trg': trg}
         self.args = args  
 
+        if args.input_conv > 0:
+            # self.input_conv = nn.Conv1d(args.d_model, args.d_model, 3, stride=1, padding=1)
+            self.input_conv = MultiHeadConv(args.d_model, max_width=args.input_conv)
+
         # decode or not:
         self.decode = False
         
-    def prepare_masks(self, inputs):
-        field, text = inputs
-        if text.ndimension() == 2:  # index inputs
-            masks = (text.data != self.fields[field].vocab.stoi['<pad>']).float()
-        else:                       # one-hot vector inputs
-            masks = (text.data[:, :, self.fields[field].vocab.stoi['<pad>']] != 1).float()
-        return masks
-
-    def prepare_data(self, batch):
-        source_inputs, source_outputs = batch.src[:, :-1].contiguous(), batch.src[:, 1:].contiguous()
-        target_inputs, target_outputs = batch.trg[:, :-1].contiguous(), batch.trg[:, 1:].contiguous()
-        source_masks, target_masks = self.prepare_masks(('src', source_outputs)), self.prepare_masks(('trg', target_outputs))
-        return source_inputs, source_outputs, source_masks, target_inputs, target_outputs, target_masks
-
-
     # All in All: forward function for training
-    def forward(self, batch, decoding=False, reverse=True):
+    def forward(self, batch, decoding=False, reverse=True, dataflow=['src', 'trg']):
         
         #if info is None:
         info = defaultdict(lambda: 0)
 
         source_inputs, source_outputs, source_masks, \
-        target_inputs, target_outputs, target_masks = self.prepare_data(batch)
+        target_inputs, target_outputs, target_masks = self.prepare_data(batch, dataflow=dataflow)
 
         info['sents']  = (target_inputs[:, 0] * 0 + 1).sum()
         info['tokens'] = (target_masks != 0).sum()
-
+        info['max_trg'] = (target_inputs[0, :] * 0 + 1).sum()
+        info['max_src'] = (source_inputs[0, :] * 0 + 1).sum()
+        info['max_att'] = info['sents'] * max(info['max_src'] ** 2, info['max_trg'] ** 2)
+                                                    
+        # print(self.args.local_rank, info['max_src'].item(), info['max_trg'].item(), info['sents'].item(),
+        #       info['sents'].item() * (info['max_src'].item() ** 2),  info['sents'].item() * (info['max_trg'].item() ** 2))
         # in some extreme case.
         if info['sents'] == 0:
             return info
 
         # encoding
-        encoding_outputs = self.encoder(self.io_enc.i(source_inputs, pos=True), source_masks)
+        encoding_inputs  = self.io_enc.i(source_inputs, pos=True)
+        if self.input_conv is not None:
+            encoding_inputs = self.input_conv(encoding_inputs.permute(0, 2, 1)).permute(0, 2, 1)
+        
+        encoding_outputs = self.encoder(encoding_inputs, source_masks)
         if not decoding:
             # Maximum Likelihood Training (with label smoothing trick)
 
@@ -81,28 +80,28 @@ class Transformer(nn.Module):
 
             if self.args.multi_width > 1: # -- the newly introduced block-wise decoding --
                 assert self.args.beam_size == 1, 'block-wise decoding only works for greedy decoding (for now).' 
-                translation_outputs = self.blockwise_parallel_decoding(encoding_outputs, source_masks)
+                translation_outputs = self.blockwise_parallel_decoding(encoding_outputs, source_masks, field=dataflow[1])
 
             else:
                 if self.args.beam_size == 1:
-                    translation_outputs = self.greedy_decoding(encoding_outputs, source_masks)
+                    translation_outputs = self.greedy_decoding(encoding_outputs, source_masks, field=dataflow[1])
                 else:
-                    translation_outputs = self.beam_search(encoding_outputs, source_masks, self.args.beam_size, self.args.alpha)
+                    translation_outputs = self.beam_search(encoding_outputs, source_masks, self.args.beam_size, self.args.alpha, field=dataflow[1])
 
             if reverse:
-                source_outputs = self.io_enc.reverse(source_outputs)
-                target_outputs = self.io_dec.reverse(target_outputs)
+                source_outputs = self.fields[dataflow[0]].reverse(source_outputs)
+                target_outputs = self.fields[dataflow[1]].reverse(target_outputs)
                 
                 # specially for multi_step decoding #
                 if self.args.multi_width > 1:
-                    translation_outputs, saved_time, pred_acc, decisions = self.io_dec.reverse(translation_outputs, width=self.args.multi_width, return_saved_time=True)
+                    translation_outputs, saved_time, pred_acc, decisions = self.fields[dataflow[1]].reverse(translation_outputs, width=self.args.multi_width, return_saved_time=True)
                     
                     info['saved_time'] = saved_time
                     info['pred_acc'] = pred_acc
                     info['decisions'] = decisions
                 
                 else:
-                    translation_outputs = self.io_dec.reverse(translation_outputs)
+                    translation_outputs = self.fields[dataflow[1]].reverse(translation_outputs)
 
             info['src'] = source_outputs
             info['trg'] = target_outputs
@@ -110,13 +109,15 @@ class Transformer(nn.Module):
         
         return info
 
-    def greedy_decoding(self, encoding=None, mask_src=None):
+    def greedy_decoding(self, encoding=None, mask_src=None, T=None, field='trg'):
 
         encoding = self.decoder.prepare_encoder(encoding)
-        B, T, C = encoding[0].size()  # batch_size, decoding-length, size
+        if T is None:
+            T = encoding[0].size()[1]
+        B, C = encoding[0].size()[0], encoding[0].size()[-1]  # batch_size, decoding-length, size
         T *= self.length_ratio
 
-        outs = encoding[0].new_zeros(B, T + 1).long().fill_(self.fields['trg'].vocab.stoi['<init>'])
+        outs = encoding[0].new_zeros(B, T + 1).long().fill_(self.fields[field].vocab.stoi['<init>'])
         hiddens = [encoding[0].new_zeros(B, T, C) for l in range(len(self.decoder.layers) + 1)]
         hiddens[0] = hiddens[0] + positional_encodings_like(hiddens[0])
         eos_yet = encoding[0].new_zeros(B).byte()
@@ -133,20 +134,22 @@ class Transformer(nn.Module):
                     self.decoder.layers[l].crossattn(x, encoding[l], encoding[l], mask_src))[:, 0]
 
             _, preds = self.io_dec.o(hiddens[-1][:, t]).max(-1)
-            preds[eos_yet] = self.fields['trg'].vocab.stoi['<pad>']
-            eos_yet = eos_yet | (preds == self.fields['trg'].vocab.stoi['<eos>'])
+            preds[eos_yet] = self.fields[field].vocab.stoi['<pad>']
+            eos_yet = eos_yet | (preds == self.fields[field].vocab.stoi['<eos>'])
             outs[:, t + 1] = preds
             if eos_yet.all():
                 break
 
         return outs[:, 1:t+2]
 
-    def beam_search(self, encoding, mask_src=None, width=2, alpha=0.6):  # width: beamsize, alpha: length-norm
+    def beam_search(self, encoding, mask_src=None, width=2, alpha=0.6, T=None, field='trg'):  # width: beamsize, alpha: length-norm
         
         encoding = self.decoder.prepare_encoder(encoding)
 
         W = width
-        B, T, C = encoding[0].size()
+        if T is None:
+            T = encoding[0].size()
+        B, C = encoding[0].size()[0], encoding[0].size()[-1]  # batch_size, decoding-length, size
 
         # expanding
         for i in range(len(encoding)):
@@ -154,8 +157,8 @@ class Transformer(nn.Module):
         mask_src = mask_src[:, None, :].expand(B, W, T).contiguous().view(B * W, T)
 
         T *= self.length_ratio
-        outs = encoding[0].new_zeros(B, W, T + 1).long().fill_(self.fields['trg'].vocab.stoi['<pad>'])
-        outs[:, :, 0] = self.fields['trg'].vocab.stoi['<init>']
+        outs = encoding[0].new_zeros(B, W, T + 1).long().fill_(self.fields[field].vocab.stoi['<pad>'])
+        outs[:, :, 0] = self.fields[field].vocab.stoi['<init>']
 
         logps = encoding[0].new_zeros(B, W).float() # scores
         hiddens = [encoding[0].new_zeros(B, W, T, C) for l in range(len(self.decoder.layers) + 1)]
@@ -178,7 +181,7 @@ class Transformer(nn.Module):
 
             # topk2_logps: scores, topk2_inds: top word index at each beam, batch x beam x beam
             topk2_logps = log_softmax(self.io_dec.o(hiddens[-1][:, :, t]))
-            topk2_logps[:, :, self.fields['trg'].vocab.stoi['<pad>']] = -INF
+            topk2_logps[:, :, self.fields[field].vocab.stoi['<pad>']] = -INF
             topk2_logps, topk2_inds = topk2_logps.topk(W, dim=-1)
 
             # mask out the sentences which are finished
@@ -202,11 +205,10 @@ class Transformer(nn.Module):
 
             for i in range(len(hiddens)):
                 hiddens[i] = hiddens[i].gather(1, topk_beam_inds)
-            eos_yet = eos_yet | (topk_token_inds == self.fields['trg'].vocab.stoi['<eos>'])
+            eos_yet = eos_yet | (topk_token_inds == self.fields[self.trg].vocab.stoi['<eos>'])
             if eos_yet.all():
                 return outs[:, 0, 1:]
         return outs[:, 0, 1:]
-
 
     def simultaneous_decoding(self, input_stream, mask_stream, agent=None):
 
@@ -297,9 +299,6 @@ class Transformer(nn.Module):
             inputs_mask[:, t+1:t+2] = mask_stream.gather(1, t_enc) * (1 - actions.float())
             inputs[:, t+1:t+2] = input_stream.gather(1, t_enc) 
 
-            # print(actions[0, 0].item(), t_dec[0, 0].item(), 
-            #       self.fields['trg'].vocab.itos[outputs[0, t+1].item()])
-
             # gather data
             output_stream.scatter_(1, t_dec, outputs[:, t+1:t+2])
 
@@ -308,7 +307,7 @@ class Transformer(nn.Module):
 
         return output_stream[:, 1:]
         
-    def blockwise_parallel_decoding(self, encoding_outputs, mask_stream):
+    def blockwise_parallel_decoding(self, encoding_outputs, mask_stream, field='trg'):
         assert self.args.multi_width > 1, "block-wise parallel decoding only works for multi-step prediction."
 
         B, T0 = mask_stream.size()
@@ -322,7 +321,7 @@ class Transformer(nn.Module):
         # --- decoding ---
 
         # prepare blanks
-        outputs = mask_stream.new_zeros(B, T2 + 1).long().fill_(self.fields['trg'].vocab.stoi['<init>'])
+        outputs = mask_stream.new_zeros(B, T2 + 1).long().fill_(self.fields[field].vocab.stoi['<init>'])
         outputs_mask = mask_stream.new_zeros(B, T2 + 1)
         decoding_outputs = [mask_stream.new_zeros(B, T2, self.args.d_model).float()
                             for _ in range(self.args.n_layers + 1)]
@@ -387,11 +386,11 @@ class Transformer(nn.Module):
 
                 # 3. check prediction
                 new_outputs = new_outputs * (1 - eos_yet.long()) \
-                            + self.fields['trg'].vocab.stoi['<eos>'] * eos_yet.long()    # mask dead sentences.
-                is_eos = new_outputs[:, 0:1] == self.fields['trg'].vocab.stoi['<eos>'] 
+                            + self.fields[field].vocab.stoi['<eos>'] * eos_yet.long()    # mask dead sentences.
+                is_eos = new_outputs[:, 0:1] == self.fields[field].vocab.stoi['<eos>'] 
                 
                 # fatol BUG here: <eos> may come-out earlier as you thought 
-                already_eos = prev_outputs.gather(1, new_index[:, None]) == self.fields['trg'].vocab.stoi['<eos>'] 
+                already_eos = prev_outputs.gather(1, new_index[:, None]) == self.fields[field].vocab.stoi['<eos>'] 
 
                 eos_yet = eos_yet | is_eos | already_eos  # check if sentence is dead.
                 
@@ -406,6 +405,6 @@ class Transformer(nn.Module):
                 if eos_yet.all():
                     break
 
-        outputs = outputs * outputs_mask.long() + self.fields['trg'].vocab.stoi['<pad>'] * (1 - outputs_mask.long())
+        outputs = outputs * outputs_mask.long() + self.fields[field].vocab.stoi['<pad>'] * (1 - outputs_mask.long())
         return outputs[:, 1:]
 

@@ -43,21 +43,23 @@ def train_model(args, watcher, model, train, dev, save_path=None, maxsteps=None,
     watcher.set_best_tracker(model, opt, save_path, args.local_rank, *param_to_watch)
     if args.tensorboard and (not args.debug):
         watcher.set_tensorboard('{}/runs/{}'.format(args.workspace_prefix, args.prefix+args.hp_str))
-    
+
 
     train = [iter(t) for t in train]
-
     while True:
 
+        def check(every, k=0):
+            return iters % every == k
+
         # --- saving --- #
-        if (iters % args.save_every == 0) and (args.local_rank == 0): # saving only works for local-rank=0
+        if check(args.save_every) and (args.local_rank == 0): # saving only works for local-rank=0
             watcher.info('save (back-up) checkpoints at iter={}'.format(iters))
             with torch.cuda.device(args.local_rank):
                 torch.save(watcher.best_tracker.model.state_dict(), '{}_iter={}.pt'.format(args.model_name, iters))
                 torch.save([iters, watcher.best_tracker.opt.state_dict()], '{}_iter={}.pt.states'.format(args.model_name, iters))
 
         # --- validation --- #
-        if (iters % args.eval_every == 0) and (not args.no_valid): # and (args.local_rank == 0):
+        if check(args.eval_every) and (not args.no_valid): # and (args.local_rank == 0):
 
             watcher.close_progress_bar()
 
@@ -92,7 +94,7 @@ def train_model(args, watcher, model, train, dev, save_path=None, maxsteps=None,
                         #         print(d, file=handles[2], flush=True)
                         #     for handle in handles:
                         #         handle.close()
-
+            
             watcher.info('model:' + args.prefix + args.hp_str)
 
             # ---set-up a new progressor---
@@ -139,12 +141,15 @@ def train_model(args, watcher, model, train, dev, save_path=None, maxsteps=None,
                 else:
                     batch = sample_a_training_set(train, args.sample_prob)
 
+                # --- attention visualization --- #
+                if (check(args.att_plot_every, 1) and (inter_step == 0) and (args.local_rank == 0)):
+                    model.module.attention_flag = True
+
                 info_ = model(batch, dataflow=['src', 'trg'])
                 info_['loss'] = info_['loss'] / args.inter_size
                 info_['loss'].backward()
 
                 pairs.append(batch.dataset.task)
-
                 for t in info_:
                     info[t] += [info_[t].item()]
                 
@@ -169,9 +174,17 @@ def train_model(args, watcher, model, train, dev, save_path=None, maxsteps=None,
                 info_str += '{}={:.3f}, '.format(keyword, info[keyword] / args.world_size / args.inter_size)
                 if args.tensorboard and (not args.debug):
                     watcher.add_tensorboard('train/{}'.format(keyword), info[keyword] / args.world_size / args.inter_size, iters)
-        
-        watcher.step_progress_bar(info_str=info_str)
+                    
+                    # -- attention visualization -- #
+                    if (model.module.attention_maps is not None) and (args.local_rank == 0):
+                        watcher.info('Attention visualization at Tensorboard')
+                        with Timer() as visualization_timer:
+                            for name, value in model.module.attention_maps:
+                                watcher.add_tensorboard(name, value, iters, 'figure')
+                            model.module.attention_maps = None
+                        watcher.info('Attention visualization cost: {}s'.format(visualization_timer.elapsed_secs))
 
+        watcher.step_progress_bar(info_str=info_str)
 
 def train_autoencoder(args, watcher, model, train, dev, save_path=None, maxsteps=None):
     """

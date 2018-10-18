@@ -90,6 +90,10 @@ parser.add_argument('--encoder_lm', action='store_true', help='use unidirectiona
 parser.add_argument('--causal',   action='store_true', help='use causal attention')
 parser.add_argument('--cross_attn_fashion', type=str, default='forward', choices=['forward', 'reverse', 'last_layer'])
 parser.add_argument('--share_embeddings', action='store_true', help='share embeddings between encoder and decoder')
+parser.add_argument('--relative_pos', action='store_true', help="""
+                                                                use relative position in the attention, instead of positional encoding.
+                                                                currently supports the simplest case: left (0), self(1), right(2)
+                                                                """)
 
 # MS-decoder: blockwise parallel decoding 
 parser.add_argument('--multi_width', type=int, default=1, help='default not use multi-step prediction')
@@ -105,6 +109,7 @@ parser.add_argument('--seed',    type=int, default=19920206, help='seed for rand
 # training
 parser.add_argument('--label_smooth',  type=float, default=0.1,   help='regularization via label-smoothing during training.')
 parser.add_argument('--eval_every',    type=int, default=1000,    help='run dev every')
+parser.add_argument('--att_plot_every',type=int, default=250,     help='visualization the attention matrix of a sampled training set.')
 parser.add_argument('--save_every',    type=int, default=50000,   help='save the best checkpoint every 50k updates')
 parser.add_argument('--maximum_steps', type=int, default=1000000, help='maximum steps you take to train a model')
 parser.add_argument('--inter_size',    type=int, default=4,       help='process multiple batches before one update')
@@ -191,6 +196,7 @@ args.__dict__.update(hparams)
 hp_str = (  f".{args.dataset}_{args.params}_"
             f"{args.src}_{args.trg}_"
             f"{'causal_' if args.causal_enc else ''}"
+            f"{'rp_' if args.relative_pos else ''}"
             f"{'lm_' if args.encoder_lm else ''}"
             f"{args.base}_"
             f"{args.label_smooth}_"

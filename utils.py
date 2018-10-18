@@ -7,7 +7,11 @@ import time
 import pickle
 import operator
 import logging
+import matplotlib
+matplotlib.use('Agg')
 
+import pylab as plt
+import seaborn as sns
 
 from torch.autograd import Variable
 from torchtext import data, datasets
@@ -22,13 +26,23 @@ from tqdm import tqdm, trange
 from tensorboardX import SummaryWriter
 from termcolor import colored
 from subprocess import PIPE, Popen
-
 from tools.bleu_score import corpus_bleu
+
 
 COLORS = ['red', 'green', 'yellow', 'blue', 'white', 'magenta', 'cyan']
 
 INF = 1e10
 TINY = 1e-9
+
+params = {'legend.fontsize': 'x-large',
+            'figure.figsize': (15, 5),
+            'axes.labelsize': 'x-large',
+            'axes.titlesize':'x-large',
+            'xtick.labelsize':'x-large',
+            'ytick.labelsize':'x-large',
+            'figure.max_open_warning': 200}
+plt.rcParams.update(params)
+sns.set()
 
 
 def prod(factors):
@@ -150,6 +164,14 @@ def colored_seq(seq, bound, char=False):
         return ' '.join(new_seq)
     else:
         return ''.join(new_seq)
+
+def visualize_attention(seq1, seq2, attention):
+    fig, ax = plt.subplots(figsize=(len(seq1) // 3, len(seq2) // 3), dpi=100)
+    sns.heatmap(attention, ax=ax, cbar=False, cmap=sns.cubehelix_palette(start=2.4, rot=.1, light=1), square=True, xticklabels=seq1, yticklabels=seq2)
+    ax.xaxis.tick_top()
+    for tick in ax.get_xticklabels():
+        tick.set_rotation(90)
+    return fig
 
 
 class Timer(object):
@@ -314,9 +336,14 @@ class Watcher(logging.getLoggerClass()):
         if self.rank == 0:
             self.tb_writer = SummaryWriter(path)
     
-    def add_tensorboard(self, name, value, iters):
+    def add_tensorboard(self, name, value, iters, dtype='scalar'):
         if self.rank == 0:
-            self.tb_writer.add_scalar(name, value, iters)
+            if dtype == 'scalar':
+                self.tb_writer.add_scalar(name, value, iters)
+            elif dtype == 'figure':
+                self.tb_writer.add_figure(name, value, iters)
+            else:
+                raise NotImplementedError
 
     # ----- best performance tracker ---- #
     def set_best_tracker(self, model, opt, save_path, device, *names):

@@ -28,11 +28,12 @@ def valid_model(args, watcher, model, dev, dataflow=['src', 'trg'], print_out=Fa
 
         # decoding
         dev_outputs = model(dev_batch, decoding=True, reverse=True, dataflow=dataflow)
-        
+
         # compute sentence-level GLEU score 
         dev_outputs['gleu'] = computeGLEU(dev_outputs['dec'], dev_outputs['trg'], corpus=False, tokenizer=tokenizer, segmenter=segmenter)
         dev_outputs['sents']  = [dev_outputs['sents'].item()]
         dev_outputs['tokens'] = [dev_outputs['tokens'].item()]
+        dev_outputs['max_att'] = [dev_outputs['max_att'].item()]
 
         # gather from all workers:
         if args.distributed:
@@ -93,5 +94,8 @@ def valid_model(args, watcher, model, dev, dataflow=['src', 'trg'], print_out=Fa
             print(s, file=handles[0], flush=True)
             print(t, file=handles[1], flush=True)
             print(d, file=handles[2], flush=True)
+
+    # clean cached memory
+    torch.cuda.empty_cache()
 
     return outputs

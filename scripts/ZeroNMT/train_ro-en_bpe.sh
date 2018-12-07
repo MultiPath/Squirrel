@@ -1,5 +1,5 @@
 gpus=${1:-2}
-jbname=${2:-UnsupMT}
+jbname=${2:-ZeroNMT}
 mode=${3:-train}
 load_from=${4:-none}  # --load_from name --resume
 python -m torch.distributed.launch --nproc_per_node=${gpus} --master_port=23456 \
@@ -8,7 +8,7 @@ python -m torch.distributed.launch --nproc_per_node=${gpus} --master_port=23456 
                 --mode ${mode} \
                 --data_prefix "/private/home/jgu/data/" \
                 --dataset "wmt16" \
-                --src "en" --trg "en" \
+                --src "ro" --trg "en" \
                 --train_set "train.bpe" \
                 --dev_set   "dev.bpe"   \
                 --test_set  "test.bpe"  \
@@ -23,6 +23,7 @@ python -m torch.distributed.launch --nproc_per_node=${gpus} --master_port=23456 
                 --share_embeddings \
                 --tensorboard \
                 --cross_attn_fashion "forward" \
-                --model 'AutoTransformer3' \
-                # --debug --no_valid
+                --model 'Transformer' \
+                --debug --lang_as_init_token \
+                
 

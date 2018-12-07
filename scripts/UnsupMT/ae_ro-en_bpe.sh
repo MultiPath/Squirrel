@@ -8,7 +8,7 @@ python -m torch.distributed.launch --nproc_per_node=${gpus} --master_port=23456 
                 --mode ${mode} \
                 --data_prefix "/private/home/jgu/data/" \
                 --dataset "wmt16" \
-                --src "en" --trg "en" \
+                --src "ro" --trg "en" \
                 --train_set "train.bpe" \
                 --dev_set   "dev.bpe"   \
                 --test_set  "test.bpe"  \

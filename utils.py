@@ -1,4 +1,5 @@
 import torch
+import random
 import torch.nn as nn
 import numpy as np
 import os
@@ -44,6 +45,12 @@ params = {'legend.fontsize': 'x-large',
 plt.rcParams.update(params)
 sns.set()
 
+
+def setup_random_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 def prod(factors):
     return reduce(operator.mul, factors, 1)
@@ -264,7 +271,11 @@ class Best:
                 if self.model is not None:
                     torch.save(self.model.state_dict(), self.path)
                 if self.opt is not None:
-                    torch.save([self.i, self.opt.state_dict()], self.path + '.states')
+                    if isinstance(self.opt, list):
+                        torch.save([self.i, [opt.state_dict() for opt in self.opt]], 
+                                    self.path + '.states')
+                    else:
+                        torch.save([self.i, self.opt.state_dict()], self.path + '.states')
                 os.remove(self.path + '.temp')
 
     def __getattr__(self, key):
@@ -400,7 +411,7 @@ def reduce_dict(info_dict):
         dist.all_reduce(p, op=dist.reduce_op.SUM)
         info_dict[it] = p / dist.get_world_size()
 
-def all_gather_list(data, max_size=16384):
+def all_gather_list(data, max_size=32768):
 
     """Gathers arbitrary data from all nodes into a list."""
     world_size = torch.distributed.get_world_size()
@@ -440,12 +451,13 @@ def gather_dict(info_dict):
     for w in info_dict:
         new_v = []
 
-        for v in all_gather_list(info_dict[w], 2 ** 17):
+        for v in all_gather_list(info_dict[w], 2 ** 19):
             if isinstance(v, list):
                 new_v += v
             else:
                 new_v.append(v)
 
         info_dict[w] = new_v
+
 
 #=====END:   ADDED FOR DISTRIBUTED======

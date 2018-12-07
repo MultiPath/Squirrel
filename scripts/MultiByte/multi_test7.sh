@@ -18,18 +18,19 @@ python -m torch.distributed.launch --nproc_per_node=${gpus} --master_port=23456 
                 --base "byte" \
                 --workspace_prefix "/private/home/jgu/space/${jbname}/" \
                 --eval_every 1000  \
-                --batch_size 3000 \
-                --maxatt_size 1500000 \
-                --maxlen 800 \
-                --inter_size 5 \
+                --batch_size 1600 \
+                --maxatt_size 1000000 \
+                --inter_size 6 \
                 --label_smooth 0.1 \
                 --tensorboard \
                 --cross_attn_fashion "forward" \
                 --load_from ${load_from} --resume \
-                --maxlen 666 \
+                --maxlen 600 \
                 --length_ratio 2 \
                 --n_layers 8 \
                 --local_attention 3 \
-                # --debug --no_valid
+                --debug 
+                
+                #--no_valid
                 # --n_layers 8 \
 

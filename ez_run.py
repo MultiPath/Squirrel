@@ -8,20 +8,23 @@ import os
 import copy
 import json
 import torch.distributed as dist
+import subprocess
 
 from torchtext import data
 from torchtext import datasets
 from time import gmtime, strftime
 
-from learner import train_model, train_autoencoder
+from learner import train_model, train_2phases
 from decoder import valid_model
 
 from models.core import INF, TINY, softmax
+from models.transformer_ins import TransformerIns
+from models.transformer_iww import TransformerIww
 from models.transformer import Transformer
-from models.transformer_vae import AutoTransformer, AutoTransformer2
+from models.transformer_vae import AutoTransformer, AutoTransformer2, AutoTransformer3
 
-from data_loader import MultiDataLoader
-from utils import Watcher
+from data_loader import MultiDataLoader, OrderDataLoader
+from utils import *
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 
 
@@ -34,7 +37,10 @@ parser.add_argument('--workspace_prefix', type=str, default='./')
 parser.add_argument('--dataset',     type=str, default='iwslt', help='"flickr" or "iwslt"')
 parser.add_argument('--src', type=str, default='en', help='source language marker')
 parser.add_argument('--trg', type=str, default='de', help='target language marker')
+parser.add_argument('--test_src', type=str, default=None, help='source language marker in testin')
+parser.add_argument('--test_trg', type=str, default=None, help='target language marker')
 parser.add_argument('--vocab_file', type=str, default=None, help='user-defined vocabulary')
+parser.add_argument('--lang_as_init_token', action='store_true', help='use language token as initial tokens')
 
 parser.add_argument('--max_vocab_size', type=int, default=50000, help='max vocabulary size')
 parser.add_argument('--load_vocab',   action='store_true', help='load a pre-computed vocabulary')
@@ -44,6 +50,27 @@ parser.add_argument('--remove_enc_eos', action='store_true', help='possibly remo
 parser.add_argument('--train_set', type=str, default=None,  help='which train set to use')
 parser.add_argument('--dev_set', type=str, default=None,  help='which dev set to use')
 parser.add_argument('--test_set', type=str, default=None,  help='which test set to use')
+
+# insertable transformer
+parser.add_argument('--insertable', action='store_true')
+parser.add_argument('--insert_mode', choices=['word_first', 'position_first', 'balanced'], type=str, default='word_first')
+parser.add_argument('--order', choices=['fixed', 'random', 'optimal', 'search_optimal', 'trainable'], type=str, default='fixed')
+parser.add_argument('--path_temp', default=0, type=float, help='temperature to choose paths. 0 means choosing the top path only')
+parser.add_argument('--beta', type=int, default=4, help='beam-size to search optimal paths.')
+parser.add_argument('--ln_pos', action='store_true', help='a linear layer over the embedding and query.')
+parser.add_argument('--no_bound', action='store_true', help='no boundary probabilitis.')
+parser.add_argument('--no_weights', action='store_true', help='do not use reweighting after beam-search.')
+parser.add_argument('--search_with_dropout', action='store_true', help='no boundary probabilitis.')
+
+parser.add_argument('--epsilon', type=float, default=0, help='possibility to choose random order during training.')
+parser.add_argument('--gamma', type=float, default=1, help='balance p(x) and p(z)')
+parser.add_argument('--sample_order', action='store_true', help='perform sampling instead of beam-search')
+parser.add_argument('--resampling', action='store_true', help='resampling after every samling operations')
+parser.add_argument('--resample_fix', action='store_true', help='resampling after every samling operations')
+parser.add_argument('--use_gumbel', action='store_true', help='resampling after every samling operations')
+parser.add_argument('--esteps', type=int, default=1, help='possibility to choose random order during training.')
+parser.add_argument('--gsteps', type=int, default=1, help='possibility to choose random order during training.')
+parser.add_argument('--decouple', action='store_true', help='decouple the scorer and the trainer. use best model.')
 
 # multi-lingual training
 parser.add_argument('--multi', action='store_true', help='enable multilingual training for Transformer.')
@@ -69,7 +96,7 @@ parser.add_argument('--word_blank', type=float, default=0.2, help='Special for A
 parser.add_argument('--latent_noise', type=float, default=0, help='inject latent space noise which is a Gaussian (for Denoising Auto-Encoder)')
 
 # model basic settings
-parser.add_argument('--model',  type=str, default='Transformer', choices=['Transformer', 'AutoTransformer', 'AutoTransformer2'])
+parser.add_argument('--model',  type=str, default='Transformer', choices=['Transformer', 'TransformerIns', 'TransformerIww', 'AutoTransformer', 'AutoTransformer3'])
 parser.add_argument('--prefix', type=str, default='[time]',      help='prefix to denote the model, nothing or [time]')
 parser.add_argument('--params', type=str, default='customize', help='pamarater sets: james-iwslt, t2t-base')
 
@@ -80,7 +107,9 @@ parser.add_argument('--warmup',   type=int, default=4000,  help='warming-up step
 parser.add_argument('--n_layers', type=int, default=6,     help='number of encoder-decoder')
 parser.add_argument('--n_heads',  type=int, default=8,     help='number of heads for multi-head attention')
 parser.add_argument('--n_cross_heads', type=int, default=8,  help='number of heads for multi-head attention')
-parser.add_argument('--drop_ratio', type=float, default=0.1, help='dropout ratio')
+parser.add_argument('--drop_ratio', type=float, default=0.1, help='dropout ratio for attention')
+parser.add_argument('--relu_drop_ratio', type=float, default=0.0, help='dropout ratio')
+parser.add_argument('--attn_drop_ratio', type=float, default=0.0, help='dropout ratio')
 
 # model ablation settings
 parser.add_argument('--block_order', type=str, default='tdan', choices=['tdan', 'tdna', 'tnda'])
@@ -90,6 +119,7 @@ parser.add_argument('--encoder_lm', action='store_true', help='use unidirectiona
 parser.add_argument('--causal',   action='store_true', help='use causal attention')
 parser.add_argument('--cross_attn_fashion', type=str, default='forward', choices=['forward', 'reverse', 'last_layer'])
 parser.add_argument('--share_embeddings', action='store_true', help='share embeddings between encoder and decoder')
+parser.add_argument('--uniform_embedding_init', action='store_true', help='by default, we use Transformer clever init for embeddings. But we can always go back to pytorch default.')
 parser.add_argument('--relative_pos', action='store_true', help="""
                                                                 use relative position in the attention, instead of positional encoding.
                                                                 currently supports the simplest case: left (0), self(1), right(2)
@@ -109,9 +139,11 @@ parser.add_argument('--seed',    type=int, default=19920206, help='seed for rand
 # training
 parser.add_argument('--label_smooth',  type=float, default=0.1,   help='regularization via label-smoothing during training.')
 parser.add_argument('--eval_every',    type=int, default=1000,    help='run dev every')
-parser.add_argument('--att_plot_every',type=int, default=250,     help='visualization the attention matrix of a sampled training set.')
+parser.add_argument('--print_every',   type=int, default=0,       help='print every during training')
+parser.add_argument('--att_plot_every',type=int, default=0,       help='visualization the attention matrix of a sampled training set.')
 parser.add_argument('--save_every',    type=int, default=50000,   help='save the best checkpoint every 50k updates')
 parser.add_argument('--maximum_steps', type=int, default=1000000, help='maximum steps you take to train a model')
+parser.add_argument('--sub_inter_size',type=int, default=1,       help='process multiple batches before one update')
 parser.add_argument('--inter_size',    type=int, default=4,       help='process multiple batches before one update')
 parser.add_argument('--batch_size',    type=int, default=2048,    help='# of tokens processed per batch')
 parser.add_argument('--maxlen',        type=int, default=10000,   help='limit the train set sentences to this many tokens')
@@ -121,7 +153,10 @@ parser.add_argument('--maxatt_size',   type=int, default=2200000, help= """
                                                                         Dynamic batching makes sure: #sent x #token ^ 2 <= maxatt-size
                                                                         """)
 parser.add_argument('--optimizer',     type=str, default='Adam')
+parser.add_argument('--lr',            type=float, default=0)
 parser.add_argument('--disable_lr_schedule', action='store_true', help='disable the transformer-style learning rate')
+parser.add_argument('--weight_decay',  type=float, default=0)
+parser.add_argument('--grad_clip',     type=float, default=25)
 
 # decoding
 parser.add_argument('--length_ratio',  type=int,   default=6, help='maximum lengths of decoding')
@@ -149,14 +184,46 @@ http://pytorch.org/tutorials/intermediate/dist_tuto.html
 --local_rank will be supplied by the Pytorch launcher wrapper (torch.distributed.launch)
 '''
 parser.add_argument("--local_rank", default=0, type=int)
+parser.add_argument("--device", default="cpu", type=str)
+parser.add_argument("--device_id", default=0, type=int)
 parser.add_argument("--distributed", default=False, type=bool)
 parser.add_argument("--world_size", default=1, type=int)
+parser.add_argument("--init_method", default=None, type=str)
+parser.add_argument("--master_port", default=11111, type=int)
 
 # load pre_saved arguments
 parser.add_argument("--json", default=None, type=str)
 
 # arguments (:)
 args = parser.parse_args() 
+args.device_id  = args.local_rank
+args.device = "cuda:{}".format(args.device_id) 
+
+if 'MASTER_PORT' in os.environ:
+    args.master_port = os.environ['MASTER_PORT']
+
+# use SLURM: multi-node training --- # hacky
+if 'SLURM_PROCID' in os.environ:
+    node_list = os.environ['SLURM_JOB_NODELIST']
+    hostnames = subprocess.check_output(['scontrol', 'show', 'hostnames', node_list]).split()
+
+    args.init_method = 'tcp://{host}:{port}'.format(host=hostnames[0].decode('utf-8'), port=args.master_port) 
+    args.local_rank = args.local_rank + int(os.environ['SLURM_PROCID']) * int(os.environ['WORLD_SIZE'])
+    args.world_size = int(os.environ['WORLD_SIZE']) * len(hostnames)
+    args.distributed = True
+
+else:
+    # single node training
+    if 'WORLD_SIZE' in os.environ:
+        args.world_size = int(os.environ['WORLD_SIZE'])
+        args.distributed = args.world_size > 1 
+        args.init_method = 'tcp://localhost:{}'.format(args.master_port)
+
+# setup multi-gpu
+torch.cuda.set_device(args.device_id)
+if args.distributed:
+    torch.distributed.init_process_group(backend='nccl', init_method=args.init_method, world_size=args.world_size, rank=args.local_rank)
+
 if args.local_rank == 0:
     if not os.path.exists(args.workspace_prefix):
         os.mkdir(args.workspace_prefix)
@@ -164,11 +231,6 @@ if args.local_rank == 0:
     for d in ['models', 'runs', 'logs', 'decodes', 'settings']:    # check the path
         if not os.path.exists(os.path.join(args.workspace_prefix, d)):
             os.mkdir(os.path.join(args.workspace_prefix, d))
-
-
-if 'WORLD_SIZE' in os.environ:
-    args.world_size = int(os.environ['WORLD_SIZE'])
-    args.distributed = args.world_size > 1
 
 running_time = strftime("%m.%d_%H.%M.%S.", gmtime())
 if args.prefix == '[time]':
@@ -197,11 +259,13 @@ hp_str = (  f".{args.dataset}_{args.params}_"
             f"{args.src}_{args.trg}_"
             f"{'causal_' if args.causal_enc else ''}"
             f"{'rp_' if args.relative_pos else ''}"
+            f"{'ins_' if args.insertable else ''}"
+            f"{'wf_' if args.insert_mode == 'word_first' else ''}"
             f"{'lm_' if args.encoder_lm else ''}"
             f"{args.base}_"
             f"{args.label_smooth}_"
             f"{args.inter_size*args.batch_size*args.world_size}_"
-            f"{'M{}'.format(args.multi_width)}"
+            f"{'M{}'.format(args.multi_width) if args.multi_width > 1 else ''}"
         )
 
 
@@ -221,21 +285,8 @@ else:
         with open(os.path.join(args.workspace_prefix, 'settings', args.prefix + hp_str + '.json'), 'w') as outfile:
             json.dump(vars(args), outfile)
 
-# ========================================================================================= #
-
-# special for Pytorch 0.4
-args.device = "cuda:{}".format(args.local_rank) 
-
-# setup multi-gpu
-torch.cuda.set_device(args.local_rank)
-if args.distributed:
-    torch.distributed.init_process_group(backend='nccl', init_method='env://')
-
 # setup random seeds
-random.seed(args.seed)
-np.random.seed(args.seed)
-torch.manual_seed(args.seed)
-torch.cuda.manual_seed_all(args.seed)
+setup_random_seed(args.seed)
 
 # setup watcher settings
 watcher = Watcher(rank=args.local_rank, log_path=os.path.join(args.workspace_prefix, 'logs', 'log-{}.txt'.format(args.prefix)))
@@ -245,12 +296,11 @@ watcher.info(f'Starting with HPARAMS: {hp_str}')
 # ========================================================================================================== #
 
 # get the dataloader
-# if not args.multi:
-#     dataloader = DataLoader(args, watcher, vocab_file=args.vocab_file)
-# else:
-dataloader = MultiDataLoader(args, watcher, vocab_file=args.vocab_file)
+if args.insertable:
+    dataloader = OrderDataLoader(args, watcher, vocab_file=args.vocab_file)
+else:
+    dataloader = MultiDataLoader(args, watcher, vocab_file=args.vocab_file)
 
-# build the model
 model = eval(args.model)(dataloader.SRC, dataloader.TRG, args)  # build the model either Transformer or AutoEncoder.
 watcher.info(model)
 
@@ -264,11 +314,13 @@ if torch.cuda.is_available():
     model.cuda()
 
 if args.distributed:
-    model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank)
+    model = DDP(model, device_ids=[args.device_id], output_device=args.device_id)
+
+print("RANK:{}, WORLD_SIZE:{}, DEVICE-ID:{}, MASTER={}".format(args.local_rank, args.world_size, args.init_method, args.device_id))
 
 # load pre-trained parameters
 if args.load_from != 'none':
-    with torch.cuda.device(args.local_rank):
+    with torch.cuda.device(args.device_id):
         pretrained_dict = torch.load(
             os.path.join(args.workspace_prefix, 'models', args.load_from + '.pt'),
             map_location=lambda storage, loc: storage.cuda())
@@ -281,26 +333,32 @@ decoding_path = os.path.join(args.workspace_prefix, 'decodes', args.load_from if
 if (args.local_rank == 0) and (not os.path.exists(decoding_path)):
     os.mkdir(decoding_path)
 
-name_suffix = 'b={}_a={}.txt'.format(args.beam_size, args.alpha)
-names = ['{}.src.{}'.format(args.test_set, name_suffix), '{}.trg.{}'.format(args.test_set, name_suffix), '{}.dec.{}'.format(args.test_set, name_suffix)]
-
 # start running
 if args.mode == 'train':
     watcher.info('starting training')
-    if args.autoencoding:  # running auto-encoder
-        train_autoencoder(args, watcher, model, dataloader.train, dataloader.dev)
+    # if args.autoencoding:  # running auto-encoder
+    #     train_autoencoder(args, watcher, model, dataloader.train, dataloader.dev)
+    # else:
+    
+    if 'AutoTransformer' in args.model:
+        train_2phases(args, watcher, model, dataloader.train, dataloader.dev, decoding_path=decoding_path)
     else:
-        train_model(args, watcher, model, dataloader.train, dataloader.dev, decoding_path=decoding_path, names=names)
+        train_model(args, watcher, model, dataloader.train, dataloader.dev, decoding_path=decoding_path)
 
 elif args.mode == 'test':
     watcher.info('starting decoding from the pre-trained model, on the test set...')
     assert args.load_from is not None, 'must decode from a pre-trained model.'
+
     with torch.no_grad(): 
         test_set = dataloader.test if args.decode_test else dataloader.dev
-        if args.autoencoding: # evaluating auto-encoder
-            valid_model(args, watcher, model, test_set, decoding_path=decoding_path, names=names, dataflow=['src', 'src'])
-            valid_model(args, watcher, model, test_set, decoding_path=decoding_path, names=names, dataflow=['trg', 'trg'])
-        else:
-            valid_model(args, watcher, model, test_set, decoding_path=decoding_path, names=names)
+        name = '{}.b={}_a={}.txt'.format(args.test_set if args.decode_test else args.dev_set, args.beam_size, args.alpha)
+        decoding_path += '/{}'.format(name)
+
+        for set_i in test_set:
+            if args.autoencoding: # evaluating auto-encoder
+                valid_model(args, watcher, model, set_i, decoding_path=decoding_path, dataflow=['src', 'src'])
+                valid_model(args, watcher, model, set_i, decoding_path=decoding_path, dataflow=['trg', 'trg'])
+            else:
+                valid_model(args, watcher, model, set_i, print_out=True, decoding_path=decoding_path, dataflow=['src', 'trg'])
 
 watcher.info("done.")

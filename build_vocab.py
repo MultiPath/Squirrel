@@ -50,7 +50,7 @@ TRG = Field(init_token=args.dec_init, eos_token=args.dec_eos, **common_kwargs)
 if args.share_embeddings:
     SRC = TRG
 else:
-    SRC = Field(init_token=args.src_init, eos_token=args.src_eos, **common_kwargs)
+    SRC = Field(init_token=args.enc_init, eos_token=args.enc_eos, **common_kwargs)
 print('build the vocabulary.')
 
 # --- setup dataset (no lazy mode when building the vocab) --- #

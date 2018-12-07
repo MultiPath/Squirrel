@@ -8,7 +8,7 @@ from tqdm import tqdm, trange
 from utils import *
 
 
-def valid_model(args, watcher, model, dev, dataflow=['src', 'trg'], print_out=False, decoding_path=None, names=None):
+def valid_model(args, watcher, model, dev, dataflow=['src', 'trg'], print_out=False, decoding_path=None):
 
     model.eval()
 
@@ -27,7 +27,7 @@ def valid_model(args, watcher, model, dev, dataflow=['src', 'trg'], print_out=Fa
         start_t = time.time()
 
         # decoding
-        dev_outputs = model(dev_batch, decoding=True, reverse=True, dataflow=dataflow)
+        dev_outputs = model(dev_batch, mode='decoding', reverse=True, dataflow=dataflow)
 
         # compute sentence-level GLEU score 
         dev_outputs['gleu'] = computeGLEU(dev_outputs['dec'], dev_outputs['trg'], corpus=False, tokenizer=tokenizer, segmenter=segmenter)
@@ -63,6 +63,7 @@ def valid_model(args, watcher, model, dev, dataflow=['src', 'trg'], print_out=Fa
         watcher.step_progress_bar(info_str=info_str, step=sum(dev_outputs['sents']))    
         used_t = time.time() - start_t
         curr_time += used_t
+
     watcher.close_progress_bar()
 
     if args.multi_width > 1:
@@ -75,10 +76,10 @@ def valid_model(args, watcher, model, dev, dataflow=['src', 'trg'], print_out=Fa
     decodes = segmenter([tokenizer(o) for o in outputs['dec']])
     targets = segmenter([tokenizer(t) for t in outputs['trg']])
 
-    if not args.original:
-        outputs['src'] = [' '.join(s) if len(s) > 0 else '--EMPTY--' for s in sources ]
-        outputs['trg'] = [' '.join(t) if len(t) > 0 else '--EMPTY--' for t in targets ]
-        outputs['dec'] = [' '.join(d) if len(d) > 0 else '--EMPTY--' for d in decodes ]
+    # if not args.original:
+    #     outputs['src'] = [' '.join(s) if len(s) > 0 else '--EMPTY--' for s in sources ]
+    #     outputs['trg'] = [' '.join(t) if len(t) > 0 else '--EMPTY--' for t in targets ]
+    #     outputs['dec'] = [' '.join(d) if len(d) > 0 else '--EMPTY--' for d in decodes ]
 
     outputs['corpus_bleu'] = corpus_bleu([[t] for t in targets], [o for o in decodes], emulate_multibleu=True)
     watcher.info("The dev-set corpus BLEU = {}".format(outputs['corpus_bleu']))
@@ -89,13 +90,16 @@ def valid_model(args, watcher, model, dev, dataflow=['src', 'trg'], print_out=Fa
 
     # output the sequences
     if (decoding_path is not None) and (args.local_rank == 0):
-        handles = [open(os.path.join(decoding_path, name), 'w') for name in names]
-        for s, t, d in sorted(zip(outputs['src'], outputs['trg'], outputs['dec']), key=lambda a: a[0]):
-            print(s, file=handles[0], flush=True)
-            print(t, file=handles[1], flush=True)
-            print(d, file=handles[2], flush=True)
+        with open(decoding_path, 'w') as fh:
+            output_flows = ['src', 'trg', 'dec']
+            if 'ori' in outputs:
+                output_flows += ['ori']
+
+            for i in range(len(outputs['src'])):
+                for d in output_flows:
+                    s = outputs[d][i]
+                    print('[{}]\t{}'.format(d, s), file=fh, flush=True)
 
     # clean cached memory
     torch.cuda.empty_cache()
-
     return outputs

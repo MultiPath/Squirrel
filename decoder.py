@@ -7,6 +7,34 @@ from collections import defaultdict
 from tqdm import tqdm, trange
 from utils import *
 
+def valid_model_ppl(args, watcher, model, dev, dataflow=['src', 'trg'], lm_only=False):
+
+    model.eval()
+    outputs = defaultdict(lambda:[])
+    watcher.set_progress_bar(len(dev.dataset))
+
+    for j, dev_batch in enumerate(dev):
+        dev_outputs = model(dev_batch, mode='train', dataflow=dataflow, lm_only=lm_only)
+        for key in dev_outputs:
+            dev_outputs[key] = [dev_outputs[key].item()]
+
+        if args.distributed:
+            gather_dict(dev_outputs)
+
+        for key in dev_outputs:
+            if isinstance(dev_outputs[key], list):
+                outputs[key] += dev_outputs[key]
+            else:
+                outputs[key] += [dev_outputs[key]]
+
+        info_str = 'Valid: sentences={}, ppl={:.3f}'.format(sum(outputs['sents']), np.mean(outputs['loss']))
+        watcher.step_progress_bar(info_str=info_str, step=sum(dev_outputs['sents']))   
+
+    watcher.close_progress_bar()
+    
+    # record for tensorboard:
+    outputs['tb_data'] += [ ('dev/{}/PPL'.format(dev.dataset.task), np.mean(outputs['loss']))]
+    return outputs
 
 def valid_model(args, watcher, model, dev, dataflow=['src', 'trg'], print_out=False, decoding_path=None):
 
@@ -103,3 +131,5 @@ def valid_model(args, watcher, model, dev, dataflow=['src', 'trg'], print_out=Fa
     # clean cached memory
     torch.cuda.empty_cache()
     return outputs
+
+    

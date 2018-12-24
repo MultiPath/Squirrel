@@ -1,11 +1,11 @@
 gpus=${1:-2}
-jbname=${2:-Insertable3}
+jbname=${2:-Insertable5}
 mode=${3:-train}
 load_from=${4:-none}  # --load_from name --resume
 
 python -m torch.distributed.launch --nproc_per_node=${gpus} --master_port 23456\
                 ez_run.py \
-                --prefix fairseq \
+                --prefix fairseq_g10 \
                 --mode ${mode} \
                 --data_prefix "/private/home/jgu/data/" \
                 --dataset "wmt16" \
@@ -32,11 +32,13 @@ python -m torch.distributed.launch --nproc_per_node=${gpus} --master_port 23456\
                 --relative_pos \
                 --model TransformerIns \
                 --insertable --insert_mode word_first \
-                --order optimal --gsteps 3000 --beta 4 --gamma 1.0 \
-                --use_gumbel --no_weight --search_with_dropout \
-
+                --order optimal --beta 6 \
+                --resampling --sample_order \
+                --gsteps 3000 \
+                # --debug --no_valid \
+                # --use_gumbel --search_with_dropout \
                 # --uniform_embedding_init \
-                # --debug --no_valid
+                # 
                 # --debug --no_valid
                 # --debug --no_valid \
                 

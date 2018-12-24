@@ -1,4 +1,5 @@
 from .core import *
+from utils import visualize_attention
 
 class Transformer(Seq2Seq):
 
@@ -19,18 +20,52 @@ class Transformer(Seq2Seq):
 
         self.input_conv = None
         self.length_ratio = args.length_ratio
+        self.relative_pos = args.relative_pos
         self.fields = {'src': src, 'trg': trg}
         self.args = args  
 
-        if args.input_conv > 0:
-            # self.input_conv = nn.Conv1d(args.d_model, args.d_model, 3, stride=1, padding=1)
-            self.input_conv = MultiHeadConv(args.d_model, max_width=args.input_conv)
+        self.attention_maps = None
+        self.attention_flag = False
+        self.visual_limit = 33
 
-        # decode or not:
-        self.decode = False
+        self.langs = list(set(self.args.src.split(',') + self.args.trg.split(',')))
+        for i, lang in enumerate(self.langs):
+            self.langs[i] = '<' + lang + '>'
+
+    def trainable_parameters(self):
+
+        def get_params(modules):
+            return [p for module in modules for p in module.parameters() if p.requires_grad]
         
+        all_param = get_params([self])
+        enc_param = get_params([self.encoder, self.io_enc])
+        dec_param = get_params([self.decoder, self.io_dec])
+        return [all_param, enc_param, dec_param]
+
+    def plot_attention(self, source_inputs, target_inputs, dataflow):
+        src = [self.fields[dataflow[0]].init_token] + self.fields[dataflow[0]].reverse(source_inputs)[0].split() + ['<eos>']
+        trg = [self.fields[dataflow[1]].init_token] + self.fields[dataflow[1]].reverse(target_inputs)[0].split()
+        
+        if (len(src) <= self.visual_limit) and (len(trg) <= self.visual_limit):
+            
+            self.attention_flag = False
+            self.attention_maps = []
+            for i in range(self.args.n_layers):
+                for j in range(self.args.n_heads):
+                    fig = visualize_attention(src, src, self.encoder.layers[i].selfattn.layer.attention.p_attn[j].detach()[:len(src), :len(src)])
+                    name = 'Self-attention (Enc) L{}/H{}'.format(i, j)
+                    self.attention_maps.append((name, fig))
+
+                    fig = visualize_attention(trg, trg, self.decoder.layers[i].selfattn.layer.attention.p_attn[j].detach()[:len(trg), :len(trg)])
+                    name = 'Self-attention (Dec) L{}/H{}'.format(i, j)
+                    self.attention_maps.append((name, fig))
+
+                    fig = visualize_attention(src, trg, self.decoder.layers[i].crossattn.layer.attention.p_attn[j].detach()[:len(trg), :len(src)])
+                    name = 'Cross-attention L{}/H{}'.format(i, j)
+                    self.attention_maps.append((name, fig))
+
     # All in All: forward function for training
-    def forward(self, batch, decoding=False, reverse=True, dataflow=['src', 'trg']):
+    def forward(self, batch, mode='train', reverse=True, dataflow=['src', 'trg'], step=None, lm_only=False):
         
         #if info is None:
         info = defaultdict(lambda: 0)
@@ -40,27 +75,26 @@ class Transformer(Seq2Seq):
 
         info['sents']  = (target_inputs[:, 0] * 0 + 1).sum()
         info['tokens'] = (target_masks != 0).sum()
-        info['max_trg'] = (target_inputs[0, :] * 0 + 1).sum()
-        info['max_src'] = (source_inputs[0, :] * 0 + 1).sum()
-        info['max_att'] = info['sents'] * max(info['max_src'] ** 2, info['max_trg'] ** 2)
-                                                    
-        # print(self.args.local_rank, info['max_src'].item(), info['max_trg'].item(), info['sents'].item(),
-        #       info['sents'].item() * (info['max_src'].item() ** 2),  info['sents'].item() * (info['max_trg'].item() ** 2))
-        # in some extreme case.
-        if info['sents'] == 0:
-            return info
-
-        # encoding
-        encoding_inputs  = self.io_enc.i(source_inputs, pos=True)
-        if self.input_conv is not None:
-            encoding_inputs = self.input_conv(encoding_inputs.permute(0, 2, 1)).permute(0, 2, 1)
+        info['max_att'] = info['sents'] * max((source_inputs[0, :] * 0 + 1).sum() ** 2,
+                                              (target_inputs[0, :] * 0 + 1).sum() ** 2)
         
-        encoding_outputs = self.encoder(encoding_inputs, source_masks)
-        if not decoding:
-            # Maximum Likelihood Training (with label smoothing trick)
+        # encoding: if first dataflow is empty, then ignore the encoder.
+        if not lm_only:
+            encoding_inputs  = self.io_enc.i(source_inputs, pos=(not self.relative_pos))
+            encoding_outputs = self.encoder(encoding_inputs, source_masks)
+        else:
+            encoding_outputs, source_masks = None, None
 
-            decoding_outputs = self.decoder(self.io_dec.i(target_inputs), target_masks, encoding_outputs, source_masks)
-            loss = self.io_dec.cost(target_outputs, target_masks, outputs=decoding_outputs[-1], label_smooth=self.args.label_smooth)
+        if self.training:
+            label_smooth = self.args.label_smooth
+        else:
+            label_smooth = 0.0
+
+        if mode == 'train':
+            # Maximum Likelihood Training (with label smoothing trick)
+            decoding_inputs = self.io_dec.i(target_inputs, pos=(not self.relative_pos))
+            decoding_outputs = self.decoder(decoding_inputs, target_masks, encoding_outputs, source_masks)
+            loss = self.io_dec.cost(target_outputs, target_masks, outputs=decoding_outputs[-1], label_smooth=label_smooth)
             
             for w in loss:
                 info['L@' + w] = loss[w]
@@ -71,17 +105,19 @@ class Transformer(Seq2Seq):
             if self.args.encoder_lm and self.args.causal_enc:
                 loss_lm = self.io_enc.cost(source_outputs, source_masks, outputs=encoding_outputs[-1])
                 for w in loss_lm:
-                    info['L@' + w] = loss[w]
+                    info['L@' + w] = loss_lm[w]
                     if w[0] != '#':
-                        info['loss'] = info['loss'] + loss[w]
+                        info['loss'] = info['loss'] + loss_lm[w]
 
+            if self.attention_flag:
+                self.plot_attention(source_inputs, target_inputs, dataflow)
+                            
         else:
             # Decoding (for evaluation)
-
             if self.args.multi_width > 1: # -- the newly introduced block-wise decoding --
                 assert self.args.beam_size == 1, 'block-wise decoding only works for greedy decoding (for now).' 
-                translation_outputs = self.blockwise_parallel_decoding(encoding_outputs, source_masks, field=dataflow[1])
 
+                translation_outputs = self.blockwise_parallel_decoding(encoding_outputs, source_masks, field=dataflow[1])
             else:
                 if self.args.beam_size == 1:
                     translation_outputs = self.greedy_decoding(encoding_outputs, source_masks, field=dataflow[1])
@@ -117,9 +153,11 @@ class Transformer(Seq2Seq):
         B, C = encoding[0].size()[0], encoding[0].size()[-1]  # batch_size, decoding-length, size
         T *= self.length_ratio
 
-        outs = encoding[0].new_zeros(B, T + 1).long().fill_(self.fields[field].vocab.stoi['<init>'])
+        outs = encoding[0].new_zeros(B, T + 1).long().fill_(self.fields[field].vocab.stoi[self.fields[field].init_token])
         hiddens = [encoding[0].new_zeros(B, T, C) for l in range(len(self.decoder.layers) + 1)]
-        hiddens[0] = hiddens[0] + positional_encodings_like(hiddens[0])
+
+        if not self.relative_pos:
+            hiddens[0] = hiddens[0] + positional_encodings_like(hiddens[0])  # absolute positions
         eos_yet = encoding[0].new_zeros(B).byte()
 
         for t in range(T):
@@ -148,7 +186,7 @@ class Transformer(Seq2Seq):
 
         W = width
         if T is None:
-            T = encoding[0].size()
+            T = encoding[0].size()[1]
         B, C = encoding[0].size()[0], encoding[0].size()[-1]  # batch_size, decoding-length, size
 
         # expanding
@@ -158,12 +196,14 @@ class Transformer(Seq2Seq):
 
         T *= self.length_ratio
         outs = encoding[0].new_zeros(B, W, T + 1).long().fill_(self.fields[field].vocab.stoi['<pad>'])
-        outs[:, :, 0] = self.fields[field].vocab.stoi['<init>']
+        outs[:, :, 0] = self.fields[field].vocab.stoi[self.fields[field].init_token]
 
         logps = encoding[0].new_zeros(B, W).float() # scores
         hiddens = [encoding[0].new_zeros(B, W, T, C) for l in range(len(self.decoder.layers) + 1)]
 
-        hiddens[0] = hiddens[0] + positional_encodings_like(hiddens[0])
+        if not self.relative_pos:
+            hiddens[0] = hiddens[0] + positional_encodings_like(hiddens[0])  # absolute positions
+
         eos_yet = encoding[0].new_zeros(B, W).byte() # batch x beamsize, all the sentences are not finished yet.
         eos_mask = eos_yet.float().fill_(INF)[:, :, None].expand(B, W, W).contiguous()  # --- BUG, logps < 0 assign INF here 
                                                                                         # --- UPDATE: Aug 9, 2018: BUG again, expand needs contiguous
@@ -173,7 +213,7 @@ class Transformer(Seq2Seq):
         for t in range(T):
             hiddens[0][:, :, t] = self.decoder.prepare_embedding(hiddens[0][:, :, t] + self.io_dec.i(outs[:, :, t], pos=False))
 
-            for l in range(len(self.layers)):
+            for l in range(len(self.decoder.layers)):
                 x = hiddens[l][:, :, :t + 1].contiguous().view(B * W, -1, C)
                 x = self.decoder.layers[l].selfattn(x[:, -1:, :], x, x)
                 hiddens[l + 1][:, :, t] = self.decoder.layers[l].feedforward(
@@ -205,7 +245,7 @@ class Transformer(Seq2Seq):
 
             for i in range(len(hiddens)):
                 hiddens[i] = hiddens[i].gather(1, topk_beam_inds)
-            eos_yet = eos_yet | (topk_token_inds == self.fields[self.trg].vocab.stoi['<eos>'])
+            eos_yet = eos_yet | (topk_token_inds == self.fields[field].vocab.stoi['<eos>'])
             if eos_yet.all():
                 return outs[:, 0, 1:]
         return outs[:, 0, 1:]
@@ -213,6 +253,8 @@ class Transformer(Seq2Seq):
     def simultaneous_decoding(self, input_stream, mask_stream, agent=None):
 
         assert self.args.cross_attn_fashion == 'forward', 'currently only forward'
+        assert (not self.relative_pos), 'currently only support absoulte positions'
+
         B, T0 = input_stream.size()
         T = T0 * (1 + self.args.length_ratio)
 
@@ -222,8 +264,8 @@ class Transformer(Seq2Seq):
         output_stream = input_stream.new_zeros(B, T + 1).fill_(self.fields['trg'].vocab.stoi['<pad>'])
 
         # prepare blanks.
-        inputs  = input_stream.new_zeros(B, T + 1).fill_(self.fields['src'].vocab.stoi['<init>'])  # inputs
-        outputs = input_stream.new_zeros(B, T + 1).fill_(self.fields['trg'].vocab.stoi['<init>'])  # outputs
+        inputs  = input_stream.new_zeros(B, T + 1).fill_(self.fields['src'].vocab.stoi[self.fields['src'].init_token])  # inputs
+        outputs = input_stream.new_zeros(B, T + 1).fill_(self.fields['trg'].vocab.stoi[self.fields['trg'].init_token])  # outputs
         
         inputs_mask  = mask_stream.new_zeros(B, T + 1)
         outputs_mask = mask_stream.new_zeros(B, T + 1)
@@ -308,7 +350,9 @@ class Transformer(Seq2Seq):
         return output_stream[:, 1:]
         
     def blockwise_parallel_decoding(self, encoding_outputs, mask_stream, field='trg'):
+        
         assert self.args.multi_width > 1, "block-wise parallel decoding only works for multi-step prediction."
+        assert (not self.relative_pos), 'currently only support absoulte positions'
 
         B, T0 = mask_stream.size()
         N  = self.args.multi_width  # multi-step prediction
@@ -321,7 +365,7 @@ class Transformer(Seq2Seq):
         # --- decoding ---
 
         # prepare blanks
-        outputs = mask_stream.new_zeros(B, T2 + 1).long().fill_(self.fields[field].vocab.stoi['<init>'])
+        outputs = mask_stream.new_zeros(B, T2 + 1).long().fill_(self.fields[field].vocab.stoi[self.fields[field].init_token])
         outputs_mask = mask_stream.new_zeros(B, T2 + 1)
         decoding_outputs = [mask_stream.new_zeros(B, T2, self.args.d_model).float()
                             for _ in range(self.args.n_layers + 1)]

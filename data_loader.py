@@ -714,7 +714,7 @@ class MultiDataLoader(object):
                                                 
             if dev_data is not None:
                 dev = LazyBucketIterator(dev_data, 
-                                        batch_size=args.batch_size, 
+                                        batch_size=args.valid_batch_size, 
                                         device=args.device,
                                         sort_key=sort_key,
                                         train=False, 
@@ -727,7 +727,7 @@ class MultiDataLoader(object):
                 
             if test_data is not None:   
                 test = LazyBucketIterator(test_data, 
-                                        batch_size=args.batch_size, 
+                                        batch_size=args.valid_batch_size, 
                                         device=args.device,
                                         sort_key=sort_key,
                                         train=False, 

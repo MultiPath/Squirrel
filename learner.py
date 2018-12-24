@@ -9,7 +9,7 @@ from torch.autograd import Variable
 from tqdm import tqdm, trange
 from utils import *
 from data_loader import split_batch
-from decoder import valid_model
+from decoder import valid_model, valid_model_ppl
 from optimizer import Adam
 
 import torch.distributed as dist
@@ -36,7 +36,8 @@ def get_learning_rate(args, i):
 def train_model(args, watcher, model, train, dev, save_path=None, maxsteps=None, decoding_path=None, names=None):
 
     # optimizer
-    opt = [Adam(param, betas=(0.9, 0.98), eps=1e-9, weight_decay=args.weight_decay) for param in model.module.trainable_parameters()][0]
+    all_opt = [Adam(param, betas=(0.9, 0.98), eps=1e-9, weight_decay=args.weight_decay) for param in model.module.trainable_parameters()]
+    opt = all_opt[0]
 
     # if resume training
     if (args.load_from != 'none') and (args.resume):
@@ -75,6 +76,12 @@ def train_model(args, watcher, model, train, dev, save_path=None, maxsteps=None,
                 return False
             return iters % every == k
 
+        # whether we only train LM or not.
+        if args.lm_schedule:
+            raise NotImplementedError
+        else:
+            lm_only = False if iters > args.lm_steps else True
+
         # --- saving --- #
         if check(args.save_every) and (args.local_rank == 0): # saving only works for local-rank=0
             watcher.info('save (back-up) checkpoints at iter={}'.format(iters))
@@ -83,50 +90,51 @@ def train_model(args, watcher, model, train, dev, save_path=None, maxsteps=None,
                 torch.save([iters, watcher.best_tracker.opt.state_dict()], '{}_iter={}.pt.states'.format(args.model_name, iters))
 
         # --- validation --- #
-        if check(args.eval_every) and (not args.no_valid): # and (args.local_rank == 0):
+        if check(args.eval_every): # and (args.local_rank == 0):
             
             watcher.close_progress_bar()
 
-            with torch.no_grad():
-                outputs_data = [valid_model(args, watcher, model, d, print_out=True, dataflow=['src', 'trg']) for d in dev]
+            if not args.no_valid:
+                with torch.no_grad():
+                    outputs_data = [valid_model(args, watcher, model, d, print_out=True, dataflow=['src', 'trg']) for d in dev]
 
+                if args.tensorboard and (not args.debug):
+                    for outputs in outputs_data:
+                        for name, value in outputs['tb_data']:
+                            watcher.add_tensorboard(name, value, iters)
 
-            if args.tensorboard and (not args.debug):
-                for outputs in outputs_data:
-                    for name, value in outputs['tb_data']:
-                        watcher.add_tensorboard(name, value, iters)
-
-            if not args.debug:
-                if len(outputs_data) == 1: # single pair MT
-                    corpus_bleu = outputs_data[0]['corpus_bleu']
-                else:
-                    # for multilingual training, we use the average of all languages.
-                    corpus_bleu = np.exp(np.mean([np.log(outputs['corpus_bleu'] + TINY) for outputs in outputs_data]))
-                
-                watcher.acc_best_tracker(iters, corpus_bleu)
-                watcher.info('the best model is achieved at {}, corpus BLEU={}'.format(watcher.best_tracker.i, watcher.best_tracker.corpus_bleu))
-                
-                if args.local_rank == 0:
-                    if watcher.best_tracker.i > best_i:
-                        best_i = watcher.best_tracker.i
-
-                # update best model (internal)
-                if args.decouple and (best_scores <= corpus_bleu):
-                    best_scores = corpus_bleu
-                    best_model.load_state_dict(model.state_dict())
-                    watcher.info('update the best model. BLEU={}'.format(corpus_bleu))
+                if not args.debug:
+                    if len(outputs_data) == 1: # single pair MT
+                        corpus_bleu = outputs_data[0]['corpus_bleu']
+                    else:
+                        # for multilingual training, we use the average of all languages.
+                        corpus_bleu = np.exp(np.mean([np.log(outputs['corpus_bleu'] + TINY) for outputs in outputs_data]))
                     
-                    # # output the best translation for record #
-                    # if decoding_path is not None:
-                    #     handles = [open(os.path.join(decoding_path, name), 'w') for name in names]
-                    #     for s, t, d in sorted(zip(outputs_data['src'], outputs_data['trg'], outputs_data['dec']), key=lambda a: a[0]):
-                    #         print(s, file=handles[0], flush=True)l
-                    #         print(t, file=handles[1], flush=True)
-                    #         print(d, file=handles[2], flush=True)
-                    #     for handle in handles:
-                    #         handle.close()
+                    watcher.acc_best_tracker(iters, corpus_bleu)
+                    watcher.info('the best model is achieved at {}, corpus BLEU={}'.format(watcher.best_tracker.i, watcher.best_tracker.corpus_bleu))
+                    
+                    if args.local_rank == 0:
+                        if watcher.best_tracker.i > best_i:
+                            best_i = watcher.best_tracker.i
+
+                    # update best model (internal)
+                    if args.decouple and (best_scores <= corpus_bleu):
+                        best_scores = corpus_bleu
+                        best_model.load_state_dict(model.state_dict())
+                        watcher.info('update the best model. BLEU={}'.format(corpus_bleu))
+                        
+                watcher.info('model:' + args.prefix + args.hp_str)
+
             
-            watcher.info('model:' + args.prefix + args.hp_str)
+            if args.valid_ppl:
+                with torch.no_grad():
+                    outputs_data = [valid_model_ppl(args, watcher, model, d, dataflow=['src', 'trg'], lm_only=lm_only) for d in dev]
+
+                if args.tensorboard and (not args.debug):
+                    for outputs in outputs_data:
+                        for name, value in outputs['tb_data']:
+                            watcher.add_tensorboard(name, value, iters)
+                watcher.info('model:' + args.prefix + args.hp_str)
 
             # ---set-up a new progressor---
             watcher.set_progress_bar(args.eval_every)
@@ -141,9 +149,8 @@ def train_model(args, watcher, model, train, dev, save_path=None, maxsteps=None,
 
         # --- training  --- #
         iters += 1
-        # model.train()
+        model.train()
 
-    
         info_str = 'training step = {}, lr={:.7f}, '.format(iters, opt.param_groups[0]['lr'])
         info = defaultdict(lambda:[])
         pairs = []
@@ -207,8 +214,8 @@ def train_model(args, watcher, model, train, dev, save_path=None, maxsteps=None,
 
                     model.train() # open drop-out
                     mode = 'search_train' if args.order == 'search_optimal' else 'train'
-                    info_ = model(batch, mode=mode, dataflow=['src', 'trg'], step=iters)
-
+                    
+                    info_ = model(batch, mode=mode, dataflow=['src', 'trg'], step=iters, lm_only=lm_only)
                     info_['loss'] = info_['loss'] / DIV
                     info_['loss'].backward()
 
@@ -252,7 +259,8 @@ def train_model(args, watcher, model, train, dev, save_path=None, maxsteps=None,
                 if args.tensorboard and (not args.debug):
                     watcher.add_tensorboard('train/{}'.format(keyword), info[keyword] / args.world_size / DIV, iters)
 
-        if args.tensorboard and (not args.debug):             
+        if args.tensorboard and (not args.debug):        
+            watcher.add_tensorboard('train/LR', opt.param_groups[0]['lr'], iters)
             # -- attention visualization -- #
             if (model.module.attention_maps is not None) and (args.local_rank == 0):
                 watcher.info('Attention visualization at Tensorboard')
@@ -393,6 +401,7 @@ def train_autoencoder(args, watcher, model, train, dev, save_path=None, maxsteps
         for keyword in info:
             if keyword[:2] == 'L@':
                 info_str += '{}={:.3f}, '.format(keyword, info[keyword] / args.world_size / args.inter_size)
+                
                 if args.tensorboard and (not args.debug):
                     watcher.add_tensorboard('train/{}'.format(keyword), info[keyword] / args.world_size / args.inter_size, iters)
         

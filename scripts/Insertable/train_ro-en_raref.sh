@@ -1,32 +1,32 @@
 gpus=${1:-2}
-jbname=${2:-UnsupMT}
+jbname=${2:-Insertable}
 mode=${3:-train}
 load_from=${4:-none}  # --load_from name --resume
 python -m torch.distributed.launch --nproc_per_node=${gpus} --master_port=23456 \
                 ez_run.py \
-                --prefix [time] \
+                --prefix rare_freq \
                 --mode ${mode} \
                 --data_prefix "/private/home/jgu/data/" \
                 --dataset "wmt16" \
-                --src "en" --trg "en" \
-                --train_set "train.bpe" \
+                --src "ro" --trg "en" \
+                --train_set "train.bpe.rare_freq" \
                 --dev_set   "dev.bpe"   \
-                --test_set  "test.bpe"  \
+                --vocab_file "ro-en/vocab.ins.pt" \
                 --load_lazy \
                 --base "bpe" \
                 --workspace_prefix "/private/home/jgu/space/${jbname}/" \
-                --params "t2t-base" \
                 --eval_every 500  \
-                --batch_size 2048 \
+                --att_plot_every 1500 \
+                --batch_size 2000 \
                 --inter_size 2 \
                 --label_smooth 0.1 \
                 --share_embeddings \
                 --tensorboard \
                 --cross_attn_fashion "forward" \
-                --model 'AutoTransformer2' \
-                --n_proj_layers 2 \
-                --debug --no_valid
-
+                --load_from ${load_from} \
+                --length_ratio 2 \
+                --relative_pos \
+                --model TransformerIns \
                 #--debug
-            
+
 

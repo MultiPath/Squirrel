@@ -365,7 +365,6 @@ class Watcher(logging.getLoggerClass()):
             self.best_tracker.accumulate(*values, iters)
 
 
-
 def masked_sort(x, mask, dim=-1):
     x.data += ((1 - mask) * INF).long()
     y, i = torch.sort(x, dim)
@@ -376,7 +375,6 @@ def unsorted(y, i, dim=-1):
     z = Variable(y.data.new(*y.size()))
     z.scatter_(dim, i, y)
     return z
-
 
 def merge_cache(decoding_path, names0, last_epoch=0, max_cache=20):
     file_lock = open(decoding_path + '/_temp_decode', 'w')
@@ -390,8 +388,6 @@ def merge_cache(decoding_path, names0, last_epoch=0, max_cache=20):
         code = 'cat {} > {}.train.{}'.format(" ".join(filenames), '{}/{}'.format(decoding_path, name), last_epoch)
         os.system(code)
     os.remove(decoding_path + '/_temp_decode')
-
-
 
 #=====START: ADDED FOR DISTRIBUTED======
 

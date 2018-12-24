@@ -20,6 +20,7 @@ from decoder import valid_model
 from models.core import INF, TINY, softmax
 from models.transformer_ins import TransformerIns
 from models.transformer_iww import TransformerIww
+from models.transformer_sink import TransformerSink
 from models.transformer import Transformer
 from models.transformer_vae import AutoTransformer, AutoTransformer2, AutoTransformer3
 
@@ -66,16 +67,16 @@ parser.add_argument('--epsilon', type=float, default=0, help='possibility to cho
 parser.add_argument('--gamma', type=float, default=1, help='balance p(x) and p(z)')
 parser.add_argument('--sample_order', action='store_true', help='perform sampling instead of beam-search')
 parser.add_argument('--resampling', action='store_true', help='resampling after every samling operations')
-parser.add_argument('--resample_fix', action='store_true', help='resampling after every samling operations')
+parser.add_argument('--adaptive_ess_ratio', default=0.375, type=float, help='th of adaptive effective sample size')
 parser.add_argument('--use_gumbel', action='store_true', help='resampling after every samling operations')
 parser.add_argument('--esteps', type=int, default=1, help='possibility to choose random order during training.')
 parser.add_argument('--gsteps', type=int, default=1, help='possibility to choose random order during training.')
 parser.add_argument('--decouple', action='store_true', help='decouple the scorer and the trainer. use best model.')
 
+
 # multi-lingual training
 parser.add_argument('--multi', action='store_true', help='enable multilingual training for Transformer.')
 parser.add_argument('--sample_prob', nargs='*', type=float, help='probabilities of each input dataset.')
-parser.add_argument('--input_conv', type=int, default=0, help='adding additional convolution in the first layer for byte level..')
 parser.add_argument('--local_attention', type=int, default=0, help='force to use local attention for the first K layers.')
 
 # character/byte-level Transformer
@@ -96,7 +97,7 @@ parser.add_argument('--word_blank', type=float, default=0.2, help='Special for A
 parser.add_argument('--latent_noise', type=float, default=0, help='inject latent space noise which is a Gaussian (for Denoising Auto-Encoder)')
 
 # model basic settings
-parser.add_argument('--model',  type=str, default='Transformer', choices=['Transformer', 'TransformerIns', 'TransformerIww', 'AutoTransformer', 'AutoTransformer3'])
+parser.add_argument('--model',  type=str, default='Transformer', choices=['Transformer', 'TransformerIns', 'TransformerIww', 'AutoTransformer', 'AutoTransformer2', 'AutoTransformer3', 'TransformerSink'])
 parser.add_argument('--prefix', type=str, default='[time]',      help='prefix to denote the model, nothing or [time]')
 parser.add_argument('--params', type=str, default='customize', help='pamarater sets: james-iwslt, t2t-base')
 
@@ -143,9 +144,14 @@ parser.add_argument('--print_every',   type=int, default=0,       help='print ev
 parser.add_argument('--att_plot_every',type=int, default=0,       help='visualization the attention matrix of a sampled training set.')
 parser.add_argument('--save_every',    type=int, default=50000,   help='save the best checkpoint every 50k updates')
 parser.add_argument('--maximum_steps', type=int, default=1000000, help='maximum steps you take to train a model')
+
+parser.add_argument('--lm_steps',      type=int, default=0,       help='pre-training steps without encoder inputs.')
+parser.add_argument('--lm_schedule',   action='store_true',       help='instead of switching LM and MT, we incorporate a scheduling, gradually increasing the prop.')
+
 parser.add_argument('--sub_inter_size',type=int, default=1,       help='process multiple batches before one update')
 parser.add_argument('--inter_size',    type=int, default=4,       help='process multiple batches before one update')
 parser.add_argument('--batch_size',    type=int, default=2048,    help='# of tokens processed per batch')
+parser.add_argument('--valid_batch_size', type=int, default=2048, help='# of tokens processed per batch')
 parser.add_argument('--maxlen',        type=int, default=10000,   help='limit the train set sentences to this many tokens')
 parser.add_argument('--maxatt_size',   type=int, default=2200000, help= """
                                                                         limit the maximum attention computation in order to avoid OOM.
@@ -159,7 +165,7 @@ parser.add_argument('--weight_decay',  type=float, default=0)
 parser.add_argument('--grad_clip',     type=float, default=25)
 
 # decoding
-parser.add_argument('--length_ratio',  type=int,   default=6, help='maximum lengths of decoding')
+parser.add_argument('--length_ratio',  type=int,   default=3, help='maximum lengths of decoding')
 parser.add_argument('--beam_size',     type=int,   default=1, help='beam-size used in Beamsearch, default using greedy decoding')
 parser.add_argument('--alpha',         type=float, default=1, help='length normalization weights')
 parser.add_argument('--original',      action='store_true', help='output the original output files, not the tokenized ones.')
@@ -175,6 +181,7 @@ parser.add_argument('--resume',    action='store_true', help='when loading from 
 # debugging
 parser.add_argument('--debug',       action='store_true', help='debug mode: no saving or tensorboard')
 parser.add_argument('--no_valid',    action='store_true', help='debug mode: no validation')
+parser.add_argument('--valid_ppl',   action='store_true', help='debug mode: validation with ppl')
 parser.add_argument('--tensorboard', action='store_true', help='use TensorBoard')
 
 
@@ -257,17 +264,22 @@ args.__dict__.update(hparams)
 # model name
 hp_str = (  f".{args.dataset}_{args.params}_"
             f"{args.src}_{args.trg}_"
+            f"{args.model}_"
             f"{'causal_' if args.causal_enc else ''}"
             f"{'rp_' if args.relative_pos else ''}"
             f"{'ins_' if args.insertable else ''}"
             f"{'wf_' if args.insert_mode == 'word_first' else ''}"
-            f"{'lm_' if args.encoder_lm else ''}"
+            f"{'lm{}_'.format(args.lm_steps) if args.lm_steps > 0 else ''}"
             f"{args.base}_"
             f"{args.label_smooth}_"
             f"{args.inter_size*args.batch_size*args.world_size}_"
             f"{'M{}'.format(args.multi_width) if args.multi_width > 1 else ''}"
         )
 
+if args.load_from != 'none':
+    hp_str += 'from_' + args.load_from
+    if args.resume:
+        hp_str += '-C'
 
 model_name = os.path.join(args.workspace_prefix, 'models', args.prefix + hp_str)
 args.__dict__.update({'model_name': model_name, 'hp_str': hp_str})
@@ -336,14 +348,15 @@ if (args.local_rank == 0) and (not os.path.exists(decoding_path)):
 # start running
 if args.mode == 'train':
     watcher.info('starting training')
+    train_model(args, watcher, model, dataloader.train, dataloader.dev, decoding_path=decoding_path)
+
     # if args.autoencoding:  # running auto-encoder
     #     train_autoencoder(args, watcher, model, dataloader.train, dataloader.dev)
     # else:
     
-    if 'AutoTransformer' in args.model:
-        train_2phases(args, watcher, model, dataloader.train, dataloader.dev, decoding_path=decoding_path)
-    else:
-        train_model(args, watcher, model, dataloader.train, dataloader.dev, decoding_path=decoding_path)
+    # if 'AutoTransformer' in args.model:
+    #     train_2phases(args, watcher, model, dataloader.train, dataloader.dev, decoding_path=decoding_path)
+    # else:
 
 elif args.mode == 'test':
     watcher.info('starting decoding from the pre-trained model, on the test set...')

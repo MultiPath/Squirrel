@@ -45,7 +45,7 @@ class AutoTransformer2(Transformer):
         return [param_ae, param_mt, self.parameters()]
 
     # All in All: forward function for training
-    def forward(self, batch, decoding=False, reverse=True, dataflow=['src', 'src'], noise_level=None):
+    def forward(self, batch, mode='train', reverse=True, dataflow=['src', 'src'], noise_level=None, step=None):
         
         #if info is None:
         info = defaultdict(lambda: 0)
@@ -55,6 +55,8 @@ class AutoTransformer2(Transformer):
 
         info['sents']  = (target_inputs[:, 0] * 0 + 1).sum()
         info['tokens'] = (target_masks != 0).sum()
+        info['max_att'] = info['sents'] * max((source_inputs[0, :] * 0 + 1).sum() ** 2,
+                                              (target_inputs[0, :] * 0 + 1).sum() ** 2)
 
         # in some extreme case.
         if info['sents'] == 0:
@@ -86,7 +88,7 @@ class AutoTransformer2(Transformer):
         decoding_inputs = self.proj_o(hidden).view(batch_size, self.args.n_proj_layers, self.args.d_model)  # batch x d_model
         decoding_inputs = [decoding_inputs for t in range(self.args.n_layers)]
 
-        if not decoding:
+        if mode == 'train':
 
             self.counter += 1
 
@@ -121,7 +123,6 @@ class AutoTransformer2(Transformer):
         return info
 
         
-# ------- Old Codes --------- #
 class AutoTransformer(Transformer):
     """
     Simple Auto-encoder with the Transformer architecture.
@@ -132,9 +133,6 @@ class AutoTransformer(Transformer):
 
         self.encoder = Stack(src, args, causal=False, cross=False)
         self.decoder = Stack(trg, args, causal=True,  cross=False) # decoder CANNOT attention to encoder
-        
-        if args.variational:
-            raise NotImplementedError
 
         self.proj_i = Linear(args.d_model, args.d_model)
         self.proj_o = Linear(args.d_model, args.d_model)
@@ -150,40 +148,61 @@ class AutoTransformer(Transformer):
         self.fields = {'src': src, 'trg': trg}
         self.pool = args.pool
         self.args = args  
+        
+        self.attention_maps = None
+        self.attention_flag = False
+        self.visual_limit = 33
 
+    def trainable_parameters(self):
+        param_enc = [p for w in [self.encoder, self.proj_i, self.proj_o, self.io_enc] for p in w.parameters()]
+        param_dec = [p for w in [self.decoder, self.io_dec] for p in w.parameters()]
+        return [param_dec + param_enc, param_enc, param_dec]
     
     # All in All: forward function for training
-    def forward(self, batch, decoding=False, reverse=True):
-        
+    def forward(self, batch, mode='train', reverse=True, dataflow=['src', 'trg'], step=None, block='all'):
+        # mode:: train, test
+        # block:: enc, dec, both
+
         #if info is None:
         info = defaultdict(lambda: 0)
 
         source_inputs, source_outputs, source_masks, \
-        target_inputs, target_outputs, target_masks = self.prepare_data(batch)
+        target_inputs, target_outputs, target_masks = self.prepare_data(batch, dataflow=dataflow)
 
         info['sents']  = (target_inputs[:, 0] * 0 + 1).sum()
         info['tokens'] = (target_masks != 0).sum()
-
+        info['max_att'] = info['sents'] * max((source_inputs[0, :] * 0 + 1).sum() ** 2,
+                                              (target_inputs[0, :] * 0 + 1).sum() ** 2)
         # in some extreme case.
         if info['sents'] == 0:
             return info
 
+        batch_size = target_inputs.size(0)
+        d_model = self.args.d_model
+
         # encoding
-        if self.pool == 'mean':
-            encoding_outputs = (self.encoder(self.io_enc.i(source_inputs, pos=True), source_masks)[-1] \
-                                * source_masks[:, :, None]).sum(1) / source_masks.sum(1, keepdim=True)  # batch_size x d_model'
-        elif self.pool == 'max':
-            encoding_outputs = (self.encoder(self.io_enc.i(source_inputs, pos=True), source_masks)[-1] - (1 - source_masks[:, :, None]) * INF).max(1)
+        if block != 'dec':
+            if self.pool == 'mean':
+                encoding_outputs = (self.encoder(self.io_enc.i(source_inputs, pos=True), source_masks)[-1] \
+                                    * source_masks[:, :, None]).sum(1) / source_masks.sum(1, keepdim=True)  # batch_size x d_model'
+            elif self.pool == 'max':
+                encoding_outputs = (self.encoder(self.io_enc.i(source_inputs, pos=True), source_masks)[-1] - (1 - source_masks[:, :, None]) * INF).max(1)
+            else:
+                raise NotImplementedError
+
+            # hidden representations
+            hidden = torch.tanh(self.proj_i(encoding_outputs))
+
+            # decoding 
+            decoding_inputs = self.proj_o(hidden)  # batch x d_model
+        
+
         else:
-            raise NotImplementedError
+            
+            decoding_inputs = target_masks.new_zeros(batch_size, d_model)
+        
 
-        # hidden representations
-        hidden = torch.tanh(self.proj_i(encoding_outputs))
-
-        # decoding 
-        decoding_inputs = self.proj_o(hidden)  # batch x d_model
-
-        if not decoding:
+        if mode == 'train':
             # Maximum Likelihood Training (with label smoothing trick)
             decoding_inputs_embed = self.io_dec.i(target_inputs)
 
@@ -202,6 +221,9 @@ class AutoTransformer(Transformer):
                 if w[0] != '#':
                     info['loss'] = info['loss'] + loss[w]
 
+            if self.attention_flag:
+                self.plot_attention(source_inputs, target_inputs, dataflow)
+
         else:
             # Decoding (for evaluation)
 
@@ -212,9 +234,9 @@ class AutoTransformer(Transformer):
                 #translation_outputs = self.beam_search(encoding_outputs, source_masks, self.args.beam_size, self.args.alpha)
 
             if reverse:
-                source_outputs = self.io_enc.reverse(source_outputs)
-                target_outputs = self.io_dec.reverse(target_outputs)
-                translation_outputs = self.io_dec.reverse(translation_outputs)
+                source_outputs = self.fields[dataflow[0]].reverse(source_outputs)
+                target_outputs = self.fields[dataflow[1]].reverse(target_outputs)
+                translation_outputs = self.fields[dataflow[1]].reverse(translation_outputs)
 
             info['src'] = source_outputs
             info['trg'] = target_outputs
@@ -227,7 +249,7 @@ class AutoTransformer(Transformer):
         B, C = start.size()  # batch_size, decoding-length, size
         T = T * self.length_ratio
 
-        outs = start.new_zeros(B, T + 1).long().fill_(self.fields['trg'].vocab.stoi['<init>'])
+        outs = start.new_zeros(B, T + 1).long().fill_(self.fields['trg'].vocab.stoi[self.fields['trg'].init_token])
         hiddens = [start.new_zeros(B, T, C) for l in range(len(self.decoder.layers) + 1)]
 
         if self.args.ae_func == 'first_step':
@@ -258,3 +280,89 @@ class AutoTransformer(Transformer):
 
         return outs[:, 1:t+2]
 
+
+class AutoTransformer3(Transformer):
+    """
+    Simple Auto-encoder with the Transformer architecture.
+    """
+
+    def trainable_parameters(self):
+        param_enc, param_dec = list(self.io_enc.parameters()), list(self.io_dec.parameters())
+        param_enc += list(self.encoder.parameters())
+
+        for layer in self.decoder.layers:
+            param_dec += list(layer.selfattn.parameters())
+            param_dec += list(layer.feedforward.parameters())
+            param_enc += list(layer.crossattn.parameters())
+
+        return [param_dec + param_enc, param_enc, param_dec]
+
+    # All in All: forward function for training
+    def forward(self, batch, mode='train', reverse=True, dataflow=['src', 'trg'], step=None, block='all'):
+        # mode:: train, test
+        # block:: enc, dec, both
+
+        #if info is None:
+        info = defaultdict(lambda: 0)
+
+        source_inputs, source_outputs, source_masks, \
+        target_inputs, target_outputs, target_masks = self.prepare_data(batch, dataflow=dataflow)
+
+        info['sents']  = (target_inputs[:, 0] * 0 + 1).sum()
+        info['tokens'] = (target_masks != 0).sum()
+        info['max_att'] = info['sents'] * max((source_inputs[0, :] * 0 + 1).sum() ** 2,
+                                              (target_inputs[0, :] * 0 + 1).sum() ** 2)
+        # in some extreme case.
+        if info['sents'] == 0:
+            return info
+
+        batch_size = target_inputs.size(0)
+        d_model = self.args.d_model
+
+        # encoding
+        if block != 'dec':
+            # encoding
+            encoding_inputs  = self.io_enc.i(source_inputs, pos=(not self.relative_pos))
+            if self.input_conv is not None:
+                encoding_inputs = self.input_conv(encoding_inputs.permute(0, 2, 1)).permute(0, 2, 1)
+            encoding_outputs = self.encoder(encoding_inputs, source_masks)
+        
+        else:
+            # no encoding     
+            encoding_outputs, source_masks = None, None
+        
+
+        if mode == 'train':
+
+            # Maximum Likelihood Training (with label smoothing trick)
+            decoding_inputs = self.io_dec.i(target_inputs, pos=(not self.relative_pos))
+            decoding_outputs = self.decoder(decoding_inputs, target_masks, encoding_outputs, source_masks)
+            loss = self.io_dec.cost(target_outputs, target_masks, outputs=decoding_outputs[-1], label_smooth=self.args.label_smooth)
+            
+            for w in loss:
+                info['L@' + w] = loss[w]
+                if w[0] != '#':
+                    info['loss'] = info['loss'] + loss[w]
+
+            if self.attention_flag:
+                self.plot_attention(source_inputs, target_inputs, dataflow)
+
+        else:
+            # Decoding (for evaluation)
+            assert(block != 'dec')
+            
+            if self.args.beam_size == 1:
+                translation_outputs = self.greedy_decoding(encoding_outputs, source_masks, field=dataflow[1])
+            else:
+                translation_outputs = self.beam_search(encoding_outputs, source_masks, self.args.beam_size, self.args.alpha, field=dataflow[1])
+
+            if reverse:
+                source_outputs = self.fields[dataflow[0]].reverse(source_outputs)
+                target_outputs = self.fields[dataflow[1]].reverse(target_outputs)
+                translation_outputs = self.fields[dataflow[1]].reverse(translation_outputs)
+
+            info['src'] = source_outputs
+            info['trg'] = target_outputs
+            info['dec'] = translation_outputs
+        
+        return info

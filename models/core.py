@@ -1,6 +1,9 @@
 import torch
 import math
 import copy
+import numpy as np
+import random
+import time
 
 from collections import defaultdict
 from abc import ABCMeta, abstractmethod
@@ -12,6 +15,7 @@ from utils import computeGLEU, masked_sort, unsorted, colored_seq
 
 INF = 1e10
 TINY = 1e-9
+BIG = 10000000
 
 # -- -- helper functions ----- #
 class GradReverse(Function):
@@ -34,7 +38,8 @@ def positional_encodings_like(x, t=None):   # hope to be differentiable
         positions = Variable(positions)
     else:
         positions = t
-    positions = positions.float()
+    
+    positions = positions.float() + 2  # to avild trivial first two positions
 
     # channels
     channels = torch.arange(0, x.size(-1), 2).float() / x.size(-1) # 0 2 4 6 ... (256)
@@ -93,14 +98,102 @@ def softmax(x):
 def log_softmax(x):
     return F.log_softmax(x, dim=-1)
 
-def logsumexp(x, dim=-1):
-    x_max = x.max(dim, keepdim=True)[0]
-    return torch.log(torch.exp(x - x_max.expand_as(x)).sum(dim, keepdim=True) + TINY) + x_max
+def logsumexp(x, dim=-1, keepdim=True):
+    return torch.logsumexp(x, dim, keepdim)
 
-def gumbel_softmax(input, beta=0.5, tau=1.0):
-    noise = input.data.new(*input.size()).uniform_()
-    noise.add_(TINY).log_().neg_().add_(TINY).log_().neg_()
-    return softmax((input + beta * Variable(noise)) / tau)
+def gumbel_noise(input):
+    return input.new_zeros(*input.size()).uniform_().add_(TINY).log_().neg_().add_(TINY).log_().neg_()
+
+def gumbel_softmax(input, beta=0.5, tau=1.0, noise=None):
+    if noise is None:
+        noise = gumbel_noise(input)
+    return softmax((input + beta * noise) / tau)
+
+"""
+Gumbel-Sinkhorn Operations
+"""
+def sample_gumbel(tensor, eps=1e-20):
+    return tensor.new_zeros(tensor.size()).uniform_().add_(TINY).log_().neg_().add_(TINY).log_().neg_()
+
+def sinkhorn(log_alpha, n_iters=20):
+    """
+    Performs incomplete Sinkhorn normalization to log_alpha.
+    By a theorem by Sinkhorn and Knopp [1], a sufficiently well-behaved  matrix
+    with positive entries can be turned into a doubly-stochastic matrix
+    (i.e. its rows and columns add up to one) via the succesive row and column
+    normalization.
+    -To ensure positivity, the effective input to sinkhorn has to be
+    exp(log_alpha) (elementwise).
+    -However, for stability, sinkhorn works in the log-space. It is only at
+    return time that entries are exponentiated.
+    
+    [1] Sinkhorn, Richard and Knopp, Paul.
+    Concerning nonnegative matrices and doubly stochastic
+    matrices. Pacific Journal of Mathematics, 1967
+    """
+
+    for _ in range(n_iters):
+        log_alpha -= logsumexp(log_alpha, dim=2)
+        log_alpha -= logsumexp(log_alpha, dim=1)
+    return torch.exp(log_alpha)
+
+def gumbel_sinkhorn(log_alpha,
+                    temp=1.0, n_samples=1, noise_factor=1.0, n_iters=20,
+                    squeeze=True):
+    """
+    Random doubly-stochastic matrices via gumbel noise.
+    In the zero-temperature limit sinkhorn(log_alpha/temp) approaches
+    a permutation matrix. Therefore, for low temperatures this method can be
+    seen as an approximate sampling of permutation matrices, where the
+    distribution is parameterized by the matrix log_alpha
+
+    The deterministic case (noise_factor=0) is also interesting: it can be
+    shown that lim t->0 sinkhorn(log_alpha/t) = M, where M is a
+    permutation matrix, the solution of the
+    matching problem M=arg max_M sum_i,j log_alpha_i,j M_i,j.
+    
+    Therefore, the deterministic limit case of gumbel_sinkhorn can be seen
+    as approximate solving of a matching problem, otherwise solved via the
+    Hungarian algorithm.
+    """
+    batch_size, n = log_alpha.size(0), log_alpha.size(1)
+    log_alpha_w_noise = torch.cat([log_alpha for _ in range(n_samples)], 0)
+    if noise_factor == 0:
+        noise = 0.0
+    else:
+        noise = gumbel_noise(log_alpha) * noise_factor
+    
+    log_alpha_w_noise = (log_alpha_w_noise + noise) / temp
+
+    sink = sinkhorn(log_alpha_w_noise, n_iters)
+    sink = sink.view(n_samples, batch_size, n, n).contiguous().transpose(0, 1)
+    log_alpha_w_noise = log_alpha_w_noise.view(n_samples, batch_size, n, n).contiguous().transpose(0, 1)
+    return sink, log_alpha_w_noise
+
+
+def matching(log_alpha):
+    """Solves a matching problem (Linear ASsignment Problem) for a batch of matrices.
+    This is a wrapper for the py-lapsolver. 
+    https://github.com/cheind/py-lapsolver
+
+    It solves the optimization problem max_P sum_i,j M_i,j P_i,j with P a
+    permutation matrix. Notice the negative sign; the reason, the original
+    function solves a minimization problem
+    """
+    from lapsolver import solve_dense 
+    
+    batch, n = log_alpha.size(0), log_alpha.size(1)
+    log_alpha_numpy = log_alpha.data.cpu().numpy()
+    t0 = time.time()
+    perms = []
+    for b in range(batch):
+        rids, cids = solve_dense(-log_alpha_numpy[b])
+        perm = np.arange(n)
+        perm[rids] = cids
+        perms.append(perm.tolist())
+    perms = torch.Tensor(perms, device=log_alpha.get_device())
+    return perms
+
 
 def argmax(x):  # return the one-hot vectors
     shape = x.size()
@@ -109,6 +202,13 @@ def argmax(x):  # return the one-hot vectors
     x_hard.scatter_(1, ind.view(-1, 1), 1)
     x_hard = x_hard.view(*shape)
     return x_hard
+
+def gelu(x):
+    """Implementation of the gelu activation function.
+        For information: OpenAI GPT's gelu is slightly different (and gives slightly different results):
+        0.5 * x * (1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3))))
+    """
+    return x * 0.5 * (1.0 + torch.erf(x / math.sqrt(2.0)))
 
 def cross_entropy_with_smooth(outputs, targets, label_smooth=0.1, reweight=None):
     logits = log_softmax(outputs)
@@ -149,6 +249,15 @@ def pad_to_match(x, y):
     if x_len < y_len:
         return torch.cat((x, extra), 1), y
     return x, torch.cat((y, extra), 1)
+
+# --- multi-variable sampling
+def stratified_resample(weights, W):
+    positions = (weights.new_zeros(weights.size(0), W).uniform_() + torch.arange(W, device=weights.get_device())[None, :].float()) / W
+    cumulative_weights = weights.cumsum(1)
+    difference_selects = (positions[:, :, None] < cumulative_weights[:, None, :])
+    difference_selects[:, :, 1:] -= difference_selects[:, :, :-1]
+    selected_beams = difference_selects.max(2)[1]
+    return selected_beams
 
 # --- Top K search with PQ (used in Non-Autoregressive NMT)
 def topK_search(logits, mask_src, N=100):
@@ -204,6 +313,12 @@ def topK_search(logits, mask_src, N=100):
 
 
 class Linear(nn.Linear):
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.weight)
+        if self.bias is not None:
+            nn.init.constant_(self.bias, 0.)
+
     def forward(self, x):
         size = x.size()
         return super().forward(
@@ -270,7 +385,7 @@ class HighwayBlock(nn.Module):
 
 class Attention(nn.Module):
 
-    def __init__(self, d_key, drop_ratio, causal, noisy=False, local=False):
+    def __init__(self, d_key, n_heads, drop_ratio, causal, noisy=False, local=False, relative_pos=False):
         super().__init__()
         self.scale = math.sqrt(d_key)
         self.dropout = nn.Dropout(drop_ratio)
@@ -279,11 +394,38 @@ class Attention(nn.Module):
         self.window = 2
         self.noisy  = noisy
         self.p_attn = None
+        self.relative_pos = relative_pos
+        self.d_key = d_key
+        self.n_heads = n_heads
+        if relative_pos:
+            self.R = Linear(d_key // n_heads, 3)
+            # self.R = Linear(d_key // n_heads, 3 * n_heads)  # each head not sharing the positions.
 
-    def forward(self, query, key, value=None, mask=None, beta=0, tau=1):
+    def forward(self, query, key, value=None, mask=None, relation=None, non_causal=False):
         dot_products = matmul(query, key.transpose(1, 2))   # batch x trg_len x trg_len
 
-        if query.dim() == 3 and self.causal: # and (query.size(1) == key.size(1)):
+        # relative position attention
+        if self.relative_pos:
+            pos_products = self.R(query)  # batch x trg_len x 3 x n_heads
+            if relation is None: 
+                n_heads = self.n_heads
+                n_sents = key.size(0) // n_heads
+
+                relation = query.new_ones(key.size(1), key.size(1)).triu(1).long()
+                relation = relation - relation.t() + 1 
+
+                relation = relation.expand(key.size(0), key.size(1), key.size(1))
+                relation = relation[:, -query.size(1):]
+
+            else:
+
+                relation = relation + 1  # -1,0,1 ---> 0,1,2
+                
+            # relative positional attention
+            pos_products = torch.gather(pos_products, 2, relation)  # batch x trg_len x trg_len
+            dot_products = dot_products + pos_products
+
+        if (query.dim() == 3 and self.causal) and (not non_causal): 
             tri = key.data.new(key.size(1), key.size(1)).fill_(1).triu(1) * INF
             tri = tri[-query.size(1):]       # caual attention may work on non-square attention.
             dot_products.data.sub_(tri.unsqueeze(0))
@@ -303,25 +445,28 @@ class Attention(nn.Module):
                 else:
                     dot_products.data -= ((1 - mask) * INF)
 
-        if value is None:
-            return dot_products
-
         logits = dot_products / self.scale
+        if value is None:
+            return logits
+
         if (not self.noisy): # or (not self.training):
             probs = softmax(logits)
         else:
-            probs = gumbel_softmax(logits, beta=beta, tau=tau)
+            probs = gumbel_softmax(logits, beta=0, tau=1)
         self.p_attn = probs
 
         # return the attention results
-        return matmul(self.dropout(probs), value)
+        # do not apply attention on the first step.
+        probs = self.dropout(probs)
+        # probs = torch.cat([probs[:, :, 0:1], self.dropout(probs[:, :, 1:])], 2)
+        return matmul(probs, value)
 
 
 class MultiHead2(nn.Module):
 
-    def __init__(self, d_key, d_value, n_heads, drop_ratio=0.1, causal=False, noisy=False, local=False):
+    def __init__(self, d_key, d_value, n_heads, drop_ratio=0.1, causal=False, noisy=False, local=False, relative_pos=False):
         super().__init__()
-        self.attention = Attention(d_key, drop_ratio, causal=causal, noisy=noisy, local=local)
+        self.attention = Attention(d_key, n_heads, drop_ratio, causal=causal, noisy=noisy, local=local, relative_pos=relative_pos)
         self.wq = Linear(d_key,   d_key, bias=True)
         self.wk = Linear(d_key,   d_key, bias=True)
         self.wv = Linear(d_value, d_value, bias=True)
@@ -329,53 +474,29 @@ class MultiHead2(nn.Module):
         self.n_heads = n_heads
         self.local = local
 
-    def forward(self, query, key, value, mask=None, beta=0, tau=1):
+    def forward(self, query, key, value, mask=None, relation=None):
         query, key, value = self.wq(query), self.wk(key), self.wv(value)   # B x T x D
         B, Tq, D = query.size()
         _, Tk, _ = key.size()
         N = self.n_heads
 
         # reshape query-key-value for multi-head attention
-        query, key, value = (x.contiguous().view(B, -1, N, D//N).transpose(2, 1).contiguous().view(B*N, -1, D//N) for x in (query, key, value))
+        query, key, value = (x.contiguous().view(B, -1, N, D//N).transpose(2, 1).contiguous().view(B*N, -1, D//N) 
+                            for x in (query, key, value))
         if mask is not None:
             if mask.dim() == 2:
                 mask = mask[:, None, :].expand(B, N, Tk).contiguous().view(B*N, -1)
             else:
                 mask = mask[:, None, :, :].expand(B, N, Tq, Tk).contiguous().view(B * N, Tq, Tk)
+        
+        if relation is not None:
+            assert(relation.dim() == 3)
+            relation = relation[:, None, :, :].expand(B, N, Tq, Tk).contiguous().view(B * N, Tq, Tk)
 
-        # local mask
-        # if self.local:
-        #     T = torch.arange(Tq, device=mask.get_device())[None, None, :].expand(B*N, Tq, Tk)
-        #     T = (T - T.transpose(1, 2)).float()
-        #     t = 2
-
-        #     def H(a):
-        #         return torch.sigmoid(10 * (a + 0.5))
-
-        #     new_mask = ((H(T + t) - H(T - t - 1)) > 0.5).float()
-        #     if mask.dim() == 2:
-        #         mask = mask[:,None,:] * new_mask
-        #     else:
-        #         mask = mask * new_mask
-
-        outputs = self.attention(query, key, value, mask, beta, tau)  # (B x n) x T x (D/n)
+        outputs = self.attention(query, key, value, mask, relation)  # (B x n) x T x (D/n)
         outputs = outputs.contiguous().view(B, N, -1, D//N).transpose(2, 1).contiguous().view(B, -1, D)
         return self.wo(outputs)
 
-
-class MultiHeadConv(nn.Module):
-
-    def __init__(self, d_model, max_width=4):
-        super().__init__()
-        self.max_width = max_width
-        self.convs = nn.ModuleList([nn.Conv1d(d_model // max_width, d_model // max_width, n, stride=1) 
-                                    for n in range(1, max_width + 1)])
-
-    def forward(self, x):
-        batchsize, d_model, length = x.size()
-        x = x.view(batchsize, d_model // self.max_width, self.max_width, length)
-        o = torch.cat([self.convs[k](F.pad(x[:,:,k,:], (0, k))) for k in range(self.max_width)], 1)
-        return o
 
 class FeedForward(nn.Module):
 
@@ -387,7 +508,6 @@ class FeedForward(nn.Module):
         self.linear1 = Linear(d_model, d_hidden)
         self.linear2 = Linear(d_hidden, d_output)
         self.dropout = nn.Dropout(drop_ratio)
-
 
     def forward(self, x):
         return self.linear2(self.dropout(F.relu(self.linear1(x))))  # adding dropout in feedforward layer
@@ -401,26 +521,27 @@ class Block(nn.Module):
         self.selfattn = ResidualBlock(
             MultiHead2(
                 args.d_model, args.d_model, args.n_heads,
-                args.drop_ratio, causal, local=local),
+                args.attn_drop_ratio, causal, local=local, 
+                relative_pos=args.relative_pos),
             args.d_model, args.drop_ratio, order=order)
+
         self.feedforward = ResidualBlock(
-            FeedForward(args.d_model, args.d_hidden, args.drop_ratio),
+            FeedForward(args.d_model, args.d_hidden, args.relu_drop_ratio),
             args.d_model, args.drop_ratio, order=order)
 
         if cross:
             self.crossattn = ResidualBlock(
-            MultiHead2(args.d_model, args.d_model, args.n_cross_heads, args.drop_ratio),  
+            MultiHead2(args.d_model, args.d_model, args.n_cross_heads, args.attn_drop_ratio),  
             args.d_model, args.drop_ratio, order=order)
 
         self.cross = cross
         self.causal = causal
     
-    def forward(self, x, x_mask=None, y=None, y_mask=None):
-        x = self.selfattn(x, x, x, x_mask)
-        if self.cross:
-            assert y is not None, 'cross attention needs source information'
+    def forward(self, x, x_mask=None, y=None, y_mask=None, relation=None):
+        x = self.selfattn(x, x, x, x_mask, relation)
+        if self.cross and (y is not None):
+            # assert y is not None, 'cross attention needs source information'
             x = self.crossattn(x, y, y, y_mask)
-        
         return self.feedforward(x)
 
 
@@ -470,7 +591,7 @@ class Stack(nn.Module):
             embedding = self.layernorm(embedding)
         return embedding
 
-    def forward(self, x, x_mask, encoding=None, y_mask=None):
+    def forward(self, x, x_mask, encoding=None, y_mask=None, relation=None):
 
         outputs = [x]
         x = self.prepare_embedding(x)
@@ -478,7 +599,7 @@ class Stack(nn.Module):
 
         for l, layer in enumerate(self.layers):
             y = encoding[l] if encoding is not None else None
-            x = layer(x, x_mask, y, y_mask)
+            x = layer(x, x_mask, y, y_mask, relation)
             outputs.append(x)
 
         return outputs
@@ -493,6 +614,10 @@ class IO(nn.Module):
         self.out = nn.Linear(args.d_model, len(field.vocab), bias=False)
         self.scale = math.sqrt(args.d_model)
 
+        # initialize the embedding weights using N(0, 1/sqrt(d_model))
+        if not args.uniform_embedding_init:
+            nn.init.normal_(self.out.weight, mean=0, std=args.d_model ** -0.5)
+
     def i(self, x, pos=True):
         x = F.embedding(x, self.out.weight * self.scale)
         if pos:
@@ -502,12 +627,16 @@ class IO(nn.Module):
     def o(self, x):
         return self.out(x)
 
-    def cost(self, targets, masks, outputs, label_smooth=0.0, name=None):
+    def cost(self, targets, masks, outputs, label_smooth=0.0, name=None, weights=None):
         loss = dict()
         if name is None:
             name = 'MLE'
+        
+        if weights is not None:
+            weights = weights[:, None].expand_as(targets)[masks.byte()]
         targets, outputs = with_mask(targets, outputs, masks.byte())
-        loss[name] = cross_entropy_with_smooth(self.o(outputs), targets, label_smooth)
+
+        loss[name] = cross_entropy_with_smooth(self.o(outputs), targets, label_smooth, reweight=weights)
         return loss
 
     def acc(self, targets, masks, outputs):
@@ -663,6 +792,9 @@ class Seq2Seq(nn.Module):
     somehow an abstract class for seq2seq models.
     provide basic input preprocessing parts
     """
+    def module(self):  # hack: to be compitible with distributed version.
+        return self
+
     def trainable_parameters(self):
         param = [p for p in self.parameters() if p.requires_grad] 
         return [param]

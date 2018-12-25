@@ -167,8 +167,8 @@ def fetch_batch(data, batch_size, world_size=1, reserve=False, maxlen=10000, max
         if max(len(ex.src), len(ex.trg)) > maxlen:
             continue
 
-        if min(len(ex.src), len(ex.trg)) < 4:
-            continue
+        # if min(len(ex.src), len(ex.trg)) < 4:
+        #     continue
 
         if reserve and (it < world_size):
             reserved_minibatch.append(ex)

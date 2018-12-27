@@ -40,6 +40,7 @@ parser.add_argument('--src', type=str, default='en', help='source language marke
 parser.add_argument('--trg', type=str, default='de', help='target language marker')
 parser.add_argument('--test_src', type=str, default=None, help='source language marker in testin')
 parser.add_argument('--test_trg', type=str, default=None, help='target language marker')
+parser.add_argument('--track_best', type=str, default=None, help='track ... dataset is required to track the BLEU. default track all.')
 parser.add_argument('--vocab_file', type=str, default=None, help='user-defined vocabulary')
 parser.add_argument('--lang_as_init_token', action='store_true', help='use language token as initial tokens')
 
@@ -277,7 +278,10 @@ hp_str = (  f".{args.dataset}_{args.params}_"
         )
 
 if args.load_from != 'none':
-    hp_str += 'from_' + args.load_from
+    hp_str += 'from_' + args.load_from[:15]
+    if 'iter' in args.load_from:
+        hp_str += args.load_from[args.load_from.index('iter'):]
+
     if args.resume:
         hp_str += '-C'
 

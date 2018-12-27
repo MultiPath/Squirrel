@@ -105,23 +105,41 @@ def train_model(args, watcher, model, train, dev, save_path=None, maxsteps=None,
 
                 if not args.debug:
                     if len(outputs_data) == 1: # single pair MT
-                        corpus_bleu = outputs_data[0]['corpus_bleu']
+                        ovr_corpus_bleu = outputs_data[0]['corpus_bleu']
+
                     else:
-                        # for multilingual training, we use the average of all languages.
-                        corpus_bleu = np.exp(np.mean([np.log(outputs['corpus_bleu'] + TINY) for outputs in outputs_data]))
-                    
-                    watcher.acc_best_tracker(iters, corpus_bleu)
+                        # for multilingual training, we need to compute the overall BLEU
+                        # which is merge the dataset and re-evaluate
+                        if args.track_best is not None:
+                            requires_tracking = [int(a) for a in args.track_best.split(',')]
+                        else:
+                            requires_tracking = list(arange(len(dev)))
+                        
+                        decodes, targets = [], []
+                        for i in requires_tracking:
+                            decodes += outputs_data[i]['dec']
+                            targets += outputs_data[i]['trg']
+
+                        ovr_corpus_bleu = corpus_bleu([[t] for t in targets], [o for o in decodes], emulate_multibleu=True)
+                        avg_corpus_bleu = np.mean([outputs_data[i]['corpus_bleu'] for i in requires_tracking])
+
+                    if args.tensorboard and (not args.debug):
+                        watcher.add_tensorboard('dev/overall_BLEU', ovr_corpus_bleu, iters)
+                        if len(outputs_data) > 1:
+                            watcher.add_tensorboard('dev/average_BLEU', avg_corpus_bleu, iters)
+
+                    watcher.acc_best_tracker(iters, ovr_corpus_bleu)
+
+                    if args.test_src is not None:
+                        test_srcs, test_trgs = args.test_src.split(','), args.test_trg.split(',')
+                    else:
+                        test_srcs, test_trgs = args.src.split(','), args.trg.split(',')
+                    watcher.info('tracking for language pairs: {}'.format('/'.join(['{}-{}'.format(test_srcs[i], test_trgs[i]) for i in requires_tracking])))
                     watcher.info('the best model is achieved at {}, corpus BLEU={}'.format(watcher.best_tracker.i, watcher.best_tracker.corpus_bleu))
                     
                     if args.local_rank == 0:
                         if watcher.best_tracker.i > best_i:
                             best_i = watcher.best_tracker.i
-
-                    # update best model (internal)
-                    if args.decouple and (best_scores <= corpus_bleu):
-                        best_scores = corpus_bleu
-                        best_model.load_state_dict(model.state_dict())
-                        watcher.info('update the best model. BLEU={}'.format(corpus_bleu))
                         
                 watcher.info('model:' + args.prefix + args.hp_str)
 

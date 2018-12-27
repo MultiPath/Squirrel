@@ -53,12 +53,11 @@ def valid_model(args, watcher, model, dev, dataflow=['src', 'trg'], print_out=Fa
     for j, dev_batch in enumerate(dev):
 
         start_t = time.time()
-
         # decoding
         dev_outputs = model(dev_batch, mode='decoding', reverse=True, dataflow=dataflow)
 
         # compute sentence-level GLEU score 
-        dev_outputs['gleu'] = computeGLEU(dev_outputs['dec'], dev_outputs['trg'], corpus=False, tokenizer=tokenizer, segmenter=segmenter)
+        # dev_outputs['gleu'] = computeGLEU(dev_outputs['dec'], dev_outputs['trg'], corpus=False, tokenizer=tokenizer, segmenter=segmenter)
         dev_outputs['sents']  = [dev_outputs['sents'].item()]
         dev_outputs['tokens'] = [dev_outputs['tokens'].item()]
         dev_outputs['max_att'] = [dev_outputs['max_att'].item()]
@@ -83,7 +82,7 @@ def valid_model(args, watcher, model, dev, dataflow=['src', 'trg'], print_out=Fa
                 watcher.info("{}: {}".format('decode', dev_outputs['dec'][0]))
             watcher.info('------------------------------------------------------------------')
 
-        info_str = 'Decoding: sentences={}, gleu={:.3f}'.format(sum(outputs['sents']), np.mean(outputs['gleu']))
+        info_str = 'Decoding: sentences={}'.format(sum(outputs['sents']))
         
         if args.multi_width > 1:
             info_str += ', speed-up={:.4f}, pred-len={:.4f}'.format(1 / (np.mean(outputs['saved_time'])), np.mean(outputs['pred_acc']) * args.multi_width)
@@ -110,11 +109,10 @@ def valid_model(args, watcher, model, dev, dataflow=['src', 'trg'], print_out=Fa
     #     outputs['dec'] = [' '.join(d) if len(d) > 0 else '--EMPTY--' for d in decodes ]
 
     outputs['corpus_bleu'] = corpus_bleu([[t] for t in targets], [o for o in decodes], emulate_multibleu=True)
-    watcher.info("The dev-set corpus BLEU = {}".format(outputs['corpus_bleu']))
+    watcher.info("The dev-set corpus BLEU = {} / {} sentences".format(outputs['corpus_bleu'], len(outputs['src'])))
     
     # record for tensorboard:
-    outputs['tb_data'] += [ ('dev/{}/BLEU'.format(dev.dataset.task), outputs['corpus_bleu']), 
-                            ('dev/{}/GLEU'.format(dev.dataset.task), np.mean(outputs['gleu']))]
+    outputs['tb_data'] += [('dev/{}/BLEU'.format(dev.dataset.task), outputs['corpus_bleu'])]
 
     # output the sequences
     if (decoding_path is not None) and (args.local_rank == 0):
@@ -130,6 +128,9 @@ def valid_model(args, watcher, model, dev, dataflow=['src', 'trg'], print_out=Fa
 
     # clean cached memory
     torch.cuda.empty_cache()
+
+    # output segmented data
+    outputs['src'], outputs['trg'], outputs['dec'] = sources, targets, decodes
     return outputs
 
     

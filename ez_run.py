@@ -36,13 +36,17 @@ parser = argparse.ArgumentParser(description='Train a Transformer-Like Model.')
 parser.add_argument('--data_prefix', type=str, default='/data0/data/transformer_data/')
 parser.add_argument('--workspace_prefix', type=str, default='./') 
 parser.add_argument('--dataset',     type=str, default='iwslt', help='"flickr" or "iwslt"')
-parser.add_argument('--src', type=str, default='en', help='source language marker')
-parser.add_argument('--trg', type=str, default='de', help='target language marker')
+parser.add_argument('--src', type=str, default=None, help='source language marker')
+parser.add_argument('--trg', type=str, default=None, help='target language marker')
 parser.add_argument('--test_src', type=str, default=None, help='source language marker in testin')
 parser.add_argument('--test_trg', type=str, default=None, help='target language marker')
+parser.add_argument('--suffix_src', type=str, default='.src', help='all the files should have exactly the same suffix for train/dev/test')
+parser.add_argument('--suffix_trg', type=str, default='.trg', help='all the files should have exactly the same suffix for train/dev/test')
 parser.add_argument('--track_best', type=str, default=None, help='track ... dataset is required to track the BLEU. default track all.')
 parser.add_argument('--vocab_file', type=str, default=None, help='user-defined vocabulary')
 parser.add_argument('--lang_as_init_token', action='store_true', help='use language token as initial tokens')
+parser.add_argument('--force_translate_to',   type=str, default=None, help='force my decode to decode to X langauge, no matter the target is.')
+parser.add_argument('--force_translate_from', type=str, default=None, help='force my decode to decode from X langauge, no matter the source is.')
 
 parser.add_argument('--max_vocab_size', type=int, default=50000, help='max vocabulary size')
 parser.add_argument('--load_vocab',   action='store_true', help='load a pre-computed vocabulary')
@@ -50,8 +54,8 @@ parser.add_argument('--load_lazy', action='store_true', help='load a lazy-mode d
 parser.add_argument('--remove_dec_eos', action='store_true', help='possibly remove <eos> tokens in the decoder')
 parser.add_argument('--remove_enc_eos', action='store_true', help='possibly remove <eos> tokens in the encoder')
 parser.add_argument('--train_set', type=str, default=None,  help='which train set to use')
-parser.add_argument('--dev_set', type=str, default=None,  help='which dev set to use')
-parser.add_argument('--test_set', type=str, default=None,  help='which test set to use')
+parser.add_argument('--dev_set',   type=str, default=None,  help='which dev set to use')
+parser.add_argument('--test_set',  type=str, default=None,  help='which test set to use')
 
 # insertable transformer
 parser.add_argument('--insertable', action='store_true')
@@ -171,6 +175,7 @@ parser.add_argument('--beam_size',     type=int,   default=1, help='beam-size us
 parser.add_argument('--alpha',         type=float, default=1, help='length normalization weights')
 parser.add_argument('--original',      action='store_true', help='output the original output files, not the tokenized ones.')
 parser.add_argument('--decode_test',   action='store_true', help='evaluate scores on test set instead of using dev set.')
+parser.add_argument('--output_decoding_files', action='store_true', help='output separate files in testing.')
 
 # Learning to Translation in Real-Time
 parser.add_argument('--real_time', action='store_true', help='real-time translation.')

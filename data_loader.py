@@ -567,7 +567,8 @@ class MultiDataLoader(object):
         revserse_tokenizer = lambda ex: " ".join(ex)
         sort_key = None
         Field = Sequence
-        
+        suffixes = [args.suffix_src, args.suffix_trg] # default: .src /.trg
+
         if args.base == 'byte':
             tokenizer = str2byte
             revserse_tokenizer = byte2str
@@ -594,12 +595,14 @@ class MultiDataLoader(object):
 
         # -- languages -- #
         # e.g. we assume the language markers are using "en,fr,zh"  
+        assert(args.src is not None)
         srcs = args.src.split(',')
         trgs = args.trg.split(',')
 
         if args.test_src is not None:
             test_srcs = args.test_src.split(',')
             test_trgs = args.test_trg.split(',')
+
         else:
             test_srcs = srcs
             test_trgs = trgs
@@ -624,12 +627,15 @@ class MultiDataLoader(object):
                         
                 vocab_file = '{}/vocab.{}.{}.{}.pt'.format(pair, pair, 's' if args.share_embeddings else 'n', 'c' if args.base == 'char' else 'w')
             
+            if not os.path.exists(vocab_file):
+                vocab_file = os.path.join(args.data_prefix, args.dataset, vocab_file)
+                if not os.path.exists(vocab_file):
+                    raise FileNotFoundError
             try:
-                src_vocab, trg_vocab = torch.load(os.path.join(args.data_prefix, args.dataset, vocab_file))
-
+                src_vocab, trg_vocab = torch.load(vocab_file)
             except Exception:
                 # to deal with some exceptions
-                src_vocab, trg_vocab, _ = [a[1] for a in torch.load(os.path.join(args.data_prefix, args.dataset, vocab_file)).items()]
+                src_vocab, trg_vocab, _ = [a[1] for a in torch.load(vocab_file).items()]
 
             if not reverse:
                 SRC.vocab = src_vocab
@@ -669,17 +675,22 @@ class MultiDataLoader(object):
             # find the data #
             pair = src + '-' + trg
             data_path = os.path.join(args.data_prefix, args.dataset, pair)
-            exts=('.src', '.trg')
-            init_tokens = { 'src': '<{}>'.format(src), 
-                            'trg': '<{}>'.format(trg)} if args.lang_as_init_token else None
-            reverse = False
+            exts=(suffixes[0], suffixes[1])
+            if not args.lang_as_init_token:
+                init_tokens = None
+            
+            else:
+                init_tokens = dict()
+                init_tokens['src'] = '<{}>'.format(src if args.force_translate_from is None else args.force_translate_from)
+                init_tokens['trg'] = '<{}>'.format(trg if args.force_translate_to   is None else args.force_translate_to)
 
+            reverse = False
             if not os.path.exists(data_path):
 
                 # translation in a reverse direction #
                 pair = trg + '-' + src
                 data_path = os.path.join(args.data_prefix, args.dataset, pair)
-                exts=('.trg', '.src')
+                exts=(suffixes[1], suffixes[0])
                 reverse = True
                 
                 if not os.path.exists(data_path):
@@ -689,6 +700,7 @@ class MultiDataLoader(object):
                 train_set, dev_set, test_set = args.train_set, None, None
             else:
                 train_set, dev_set, test_set = None, args.dev_set, args.test_set
+
 
             # --- setup dataset (no lazy mode when building the vocab) --- #
             train_data, dev_data, test_data = ParallelDataset.splits(
@@ -748,6 +760,7 @@ class MultiDataLoader(object):
             _, dev, test = get_iterator(src, trg, train=False)
             self.dev.append(dev)
             self.test.append(test) 
+        
 
 class OrderDataLoader(object):
     """
@@ -764,7 +777,8 @@ class OrderDataLoader(object):
         revserse_tokenizer = lambda ex: " ".join(ex)
         sort_key = None
         Field = Sequence
-        
+        suffixes = [args.suffix_src, args.suffix_trg] # default: .src /.trg
+
         # -- source / target field --- #
         common_kwargs = {'batch_first': True, 'tokenize': tokenizer, 'reverse_tokenize': revserse_tokenizer, 
                         'shuffle': args.word_shuffle, 'dropout': args.word_dropout, 'replace': args.word_blank}
@@ -816,7 +830,7 @@ class OrderDataLoader(object):
         # find the data #
         pair = src + '-' + trg
         data_path = os.path.join(args.data_prefix, args.dataset, pair)
-        exts=('.src', '.trg')
+        exts=(suffixes[0], suffixes[1])
         reverse = False
 
         if not os.path.exists(data_path):
@@ -824,7 +838,7 @@ class OrderDataLoader(object):
             # translation in a reverse direction #
             pair = trg + '-' + src
             data_path = os.path.join(args.data_prefix, args.dataset, pair)
-            exts=('.trg', '.src')
+            exts=(suffixes[1], suffixes[0])
             reverse = True
             
             if not os.path.exists(data_path):

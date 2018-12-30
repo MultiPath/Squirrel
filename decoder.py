@@ -32,6 +32,7 @@ def valid_model_ppl(args, watcher, model, dev, dataflow=['src', 'trg'], lm_only=
 
     watcher.close_progress_bar()
     
+    
     # record for tensorboard:
     outputs['tb_data'] += [ ('dev/{}/PPL'.format(dev.dataset.task), np.mean(outputs['loss']))]
     return outputs
@@ -109,22 +110,36 @@ def valid_model(args, watcher, model, dev, dataflow=['src', 'trg'], print_out=Fa
     #     outputs['dec'] = [' '.join(d) if len(d) > 0 else '--EMPTY--' for d in decodes ]
 
     outputs['corpus_bleu'] = corpus_bleu([[t] for t in targets], [o for o in decodes], emulate_multibleu=True)
-    watcher.info("The dev-set corpus BLEU = {} / {} sentences".format(outputs['corpus_bleu'], len(outputs['src'])))
+    watcher.info("The {} dev-set corpus BLEU = {} / {} sentences".format(dev.dataset.task, outputs['corpus_bleu'], len(outputs['src'])))
     
     # record for tensorboard:
     outputs['tb_data'] += [('dev/{}/BLEU'.format(dev.dataset.task), outputs['corpus_bleu'])]
 
     # output the sequences
     if (decoding_path is not None) and (args.local_rank == 0):
+
         with open(decoding_path, 'w') as fh:
             output_flows = ['src', 'trg', 'dec']
             if 'ori' in outputs:
                 output_flows += ['ori']
 
+            if args.output_decoding_files:
+                if not os.path.exists(decoding_path[:-4]):
+                    os.mkdir(decoding_path[:-4])
+                if not os.path.exists(decoding_path[:-4] + '/' + dev.dataset.task):
+                    os.mkdir(decoding_path[:-4] + '/' + dev.dataset.task)
+                output_handles = [open(decoding_path[:-4] + '/' + dev.dataset.task + '/dev.bpe.{}'.format(s), 'w') for s in output_flows]
+
             for i in range(len(outputs['src'])):
-                for d in output_flows:
+                for j, d in enumerate(output_flows):
                     s = outputs[d][i]
                     print('[{}]\t{}'.format(d, s), file=fh, flush=True)
+
+                    if args.output_decoding_files:
+                        print(s, file=output_handles[j])
+        
+
+
 
     # clean cached memory
     torch.cuda.empty_cache()

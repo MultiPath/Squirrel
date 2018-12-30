@@ -106,14 +106,14 @@ def train_model(args, watcher, model, train, dev, save_path=None, maxsteps=None,
                 if not args.debug:
                     if len(outputs_data) == 1: # single pair MT
                         ovr_corpus_bleu = outputs_data[0]['corpus_bleu']
-
+                        requires_tracking = [0]
                     else:
                         # for multilingual training, we need to compute the overall BLEU
                         # which is merge the dataset and re-evaluate
                         if args.track_best is not None:
                             requires_tracking = [int(a) for a in args.track_best.split(',')]
                         else:
-                            requires_tracking = list(arange(len(dev)))
+                            requires_tracking = list(range(len(dev)))
                         
                         decodes, targets = [], []
                         for i in requires_tracking:

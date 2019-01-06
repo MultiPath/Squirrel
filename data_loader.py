@@ -228,8 +228,7 @@ def split_batch(batch, N):
 
     else:
         backup_batch = batch
-
-        big_batch_size  = backup_batch.preprocessed[0].size(0)
+        big_batch_size  = backup_batch.batch_size
         mini_batch_size = int(math.floor(big_batch_size / N))
         additional_size = int(big_batch_size -  mini_batch_size * N)
         
@@ -246,6 +245,7 @@ def split_batch(batch, N):
             if start_pos >= end_pos:
                 continue
 
+            batch.batch_size = end_pos - start_pos
             if backup_batch.preprocessed is not None:
                 batch.preprocessed = []
                 for u in range(len(backup_batch.preprocessed)):
@@ -256,10 +256,32 @@ def split_batch(batch, N):
             
             for field in backup_batch.fields:
                 setattr(batch, field, getattr(backup_batch, field)[start_pos: end_pos])
+            
+            
             batches.append(batch)
+
         
         for batch in batches:
             yield batch
+
+def merge_batches(batches):
+    if len(batches) == 1:
+        return batches[0]
+
+    else:
+        batch = DistributedBatch()
+
+        for field in batches[-1].fields:
+            for backup_batch in batches:
+                assert field in backup_batch.fields, "must have the same fields"
+
+        batch.fields = batches[-1].fields
+        for field in batches[-1].fields:
+            max_len = max([getattr(backup_batch, field).size(1) for backup_batch in batches])
+            setattr(batch, field, torch.cat([backup_batch.dataset.fields[field].extend_padding(getattr(backup_batch, field), max_len) for backup_batch in batches], 0))
+        batch.batch_size = sum([backup_batch.batch_size for backup_batch in batches])
+        batch.task = '/'.join([backup_batch.task for backup_batch in batches])
+        return batch
 
 # ====================== Supportive Functions =========================================== #
 
@@ -350,6 +372,11 @@ class Sequence(data.Field):
         padded = self.pad(batch)
         tensor = self.numericalize(padded, device=device)
         return tensor
+    
+    def extend_padding(self, batch, maxlen):
+        new_batch = batch.new_zeros(batch.size(0), maxlen).fill_(self.vocab.stoi[self.pad_token])
+        new_batch[:, :batch.size(1)] = batch
+        return new_batch
 
     def reverse(self, batch, width=1, return_saved_time=False, reverse_token=True):
         if not self.batch_first:
@@ -470,6 +497,7 @@ class DistributedBatch(Batch):
         """Create a Batch from a list of examples."""
 
         self.message = ''
+        self.task = ''
         self.preprocessed = None
         self.weights = None
 
@@ -488,7 +516,8 @@ class DistributedBatch(Batch):
             self.batch_size = len(data)
             self.dataset = dataset
             self.fields = dataset.fields.keys()  # copy field names
-                
+            self.task = dataset.task
+
             for (name, field) in dataset.fields.items():
                 if field is not None:
                     batch = [getattr(x, name) for x in data]

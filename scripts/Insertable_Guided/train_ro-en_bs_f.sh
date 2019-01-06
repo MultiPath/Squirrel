@@ -22,6 +22,9 @@ python -m torch.distributed.launch --nproc_per_node=${gpus} --master_port 23456\
                 --sub_inter_size 4 \
                 --inter_size 1 \
                 --label_smooth 0.1 \
+                --lr 0.0005 \
+                --weight_decay 0.0001 \
+                --drop_ratio 0.1 --attn_drop_ratio 0.1 \
                 --share_embeddings \
                 --tensorboard \
                 --cross_attn_fashion "forward" \
@@ -34,9 +37,9 @@ python -m torch.distributed.launch --nproc_per_node=${gpus} --master_port 23456\
                 --model TransformerIns \
                 --insertable --insert_mode word_first \
                 --order optimal --beta 8 \
-                --resampling --sample_order \
+                --search_with_dropout --no_weights \
                 # --debug --no_valid \
-                # --use_gumbel --search_with_dropout \
+                # --use_gumbel \
                 # --uniform_embedding_init \
                 # 
                 # --debug --no_valid

@@ -5,7 +5,7 @@ load_from=${4:-none}  # --load_from name --resume
 seed=${5:-19920206}
 port=${6:-22220}
 
-export CUDA_VISIBLE_DEVICES=6,7
+# export CUDA_VISIBLE_DEVICES=6,7
 python -m torch.distributed.launch --nproc_per_node=${gpus} --master_port=${port} \
                 ez_run.py \
                 --prefix 'MT' \
@@ -25,10 +25,10 @@ python -m torch.distributed.launch --nproc_per_node=${gpus} --master_port=${port
                 --params "t2t-base" \
                 --lm_steps 0 \
                 --eval_every 1000  \
-                --batch_size 1200 \
+                --batch_size 1000 \
                 --valid_batch_size 4800 \
                 --save_every 5000 \
-                --inter_size 6 \
+                --inter_size 1 --sub_inter_size 3 \
                 --label_smooth 0.1 \
                 --drop_ratio 0.1 \
                 --lr 0.0005 \
@@ -40,4 +40,4 @@ python -m torch.distributed.launch --nproc_per_node=${gpus} --master_port=${port
                 --lang_as_init_token \
                 --load_from 12.26_22.57.59.LM.es-de-fr-eval_t2t-base_de,en,fr,en,es,en_en,de,en,fr,en,es_Transformer_wf_lm300000_bpe_0.1_14400__iter=0 \
                 --seed ${seed} \
-        
+                --debug 

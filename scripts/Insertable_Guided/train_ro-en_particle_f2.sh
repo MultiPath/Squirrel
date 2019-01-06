@@ -22,6 +22,8 @@ python -m torch.distributed.launch --nproc_per_node=${gpus} --master_port 23456\
                 --sub_inter_size 4 \
                 --inter_size 1 \
                 --label_smooth 0.1 \
+                --lr 0.0005 \
+                --weight_decay 0.0001 \
                 --share_embeddings \
                 --tensorboard \
                 --cross_attn_fashion "forward" \

@@ -9,6 +9,7 @@ import copy
 import json
 import torch.distributed as dist
 import subprocess
+import datetime
 
 from torchtext import data
 from torchtext import datasets
@@ -47,6 +48,7 @@ parser.add_argument('--vocab_file', type=str, default=None, help='user-defined v
 parser.add_argument('--lang_as_init_token', action='store_true', help='use language token as initial tokens')
 parser.add_argument('--force_translate_to',   type=str, default=None, help='force my decode to decode to X langauge, no matter the target is.')
 parser.add_argument('--force_translate_from', type=str, default=None, help='force my decode to decode from X langauge, no matter the source is.')
+parser.add_argument('--sample_a_training_set', action='store_true', help='if we have multiple training sets, we can choose to sample one form it.')
 
 parser.add_argument('--max_vocab_size', type=int, default=50000, help='max vocabulary size')
 parser.add_argument('--load_vocab',   action='store_true', help='load a pre-computed vocabulary')
@@ -72,12 +74,12 @@ parser.add_argument('--epsilon', type=float, default=0, help='possibility to cho
 parser.add_argument('--gamma', type=float, default=1, help='balance p(x) and p(z)')
 parser.add_argument('--sample_order', action='store_true', help='perform sampling instead of beam-search')
 parser.add_argument('--resampling', action='store_true', help='resampling after every samling operations')
-parser.add_argument('--adaptive_ess_ratio', default=0.375, type=float, help='th of adaptive effective sample size')
+parser.add_argument('--l2r_guided', action='store_true', help='using L2R order to guide the model a bit (searching in a possible space.)')
+parser.add_argument('--adaptive_ess_ratio', default=0.5, type=float, help='th of adaptive effective sample size')
 parser.add_argument('--use_gumbel', action='store_true', help='resampling after every samling operations')
 parser.add_argument('--esteps', type=int, default=1, help='possibility to choose random order during training.')
 parser.add_argument('--gsteps', type=int, default=1, help='possibility to choose random order during training.')
 parser.add_argument('--decouple', action='store_true', help='decouple the scorer and the trainer. use best model.')
-
 
 # multi-lingual training
 parser.add_argument('--multi', action='store_true', help='enable multilingual training for Transformer.')
@@ -125,6 +127,7 @@ parser.add_argument('--encoder_lm', action='store_true', help='use unidirectiona
 parser.add_argument('--causal',   action='store_true', help='use causal attention')
 parser.add_argument('--cross_attn_fashion', type=str, default='forward', choices=['forward', 'reverse', 'last_layer'])
 parser.add_argument('--share_embeddings', action='store_true', help='share embeddings between encoder and decoder')
+parser.add_argument('--share_encdec', action='store_true', help='completely share the encoder with the decoder. In return, encoder has to be causal.')
 parser.add_argument('--uniform_embedding_init', action='store_true', help='by default, we use Transformer clever init for embeddings. But we can always go back to pytorch default.')
 parser.add_argument('--relative_pos', action='store_true', help="""
                                                                 use relative position in the attention, instead of positional encoding.
@@ -176,12 +179,14 @@ parser.add_argument('--alpha',         type=float, default=1, help='length norma
 parser.add_argument('--original',      action='store_true', help='output the original output files, not the tokenized ones.')
 parser.add_argument('--decode_test',   action='store_true', help='evaluate scores on test set instead of using dev set.')
 parser.add_argument('--output_decoding_files', action='store_true', help='output separate files in testing.')
+parser.add_argument('--decoding_path', type=str, default=None, help='manually provide the decoding path for the models to decode')
 
 # Learning to Translation in Real-Time
 parser.add_argument('--real_time', action='store_true', help='real-time translation.')
 
 # model saving/reloading, output translations
 parser.add_argument('--load_from', type=str, default='none', help='load from checkpoint')
+parser.add_argument('--never_load', nargs='*', type=str, default=None, help='parameters contaiend in this list will be discarded.')
 parser.add_argument('--resume',    action='store_true', help='when loading from the saved model, it resumes from that.')
 
 # debugging
@@ -206,6 +211,9 @@ parser.add_argument("--master_port", default=11111, type=int)
 
 # load pre_saved arguments
 parser.add_argument("--json", default=None, type=str)
+
+
+START_TIME = time.time()
 
 # arguments (:)
 args = parser.parse_args() 
@@ -347,27 +355,47 @@ if args.load_from != 'none':
             map_location=lambda storage, loc: storage.cuda())
         model_dict = model.state_dict()
         pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
+        
+        # discard some parameters which is not needed (optional)
+        if args.never_load is not None:
+            keys = []
+            for k in pretrained_dict:
+                flag = 0
+                for s in args.never_load:
+                    if s in k:
+                        flag = 1
+                        break
+                if flag == 0:
+                    keys.append(k)
+            pretrained_dict = {k: pretrained_dict[k] for k in keys}
+
+        for k in pretrained_dict:
+            if args.local_rank == 0:
+                print('load from checkpoints... {}'.format(k))
+
+        
         model_dict.update(pretrained_dict) 
         model.load_state_dict(model_dict)
 
-decoding_path = os.path.join(args.workspace_prefix, 'decodes', args.load_from if args.mode == 'test' else (args.prefix + hp_str))
-if (args.local_rank == 0) and (not os.path.exists(decoding_path)):
-    os.mkdir(decoding_path)
+if args.decoding_path is None:
+    decoding_path = os.path.join(args.workspace_prefix, 'decodes', args.load_from if args.mode == 'test' else (args.prefix + hp_str))
+    if args.force_translate_from is not None:
+        decoding_path = decoding_path + '_from_{}'.format(args.force_translate_from)
+    if args.force_translate_to is not None:
+        decoding_path = decoding_path + '_to_{}'.format(args.force_translate_to)
+else:
+    decoding_path = args.decoding_path
 
 # start running
 if args.mode == 'train':
     watcher.info('starting training')
-    train_model(args, watcher, model, dataloader.train, dataloader.dev, decoding_path=decoding_path)
-
-    # if args.autoencoding:  # running auto-encoder
-    #     train_autoencoder(args, watcher, model, dataloader.train, dataloader.dev)
-    # else:
-    
-    # if 'AutoTransformer' in args.model:
-    #     train_2phases(args, watcher, model, dataloader.train, dataloader.dev, decoding_path=decoding_path)
-    # else:
+    train_model(args, watcher, model, dataloader.train, dataloader.dev, decoding_path=None)
 
 elif args.mode == 'test':
+
+    if (args.local_rank == 0) and (not os.path.exists(decoding_path)):
+        os.mkdir(decoding_path)
+
     watcher.info('starting decoding from the pre-trained model, on the test set...')
     assert args.load_from is not None, 'must decode from a pre-trained model.'
 
@@ -383,4 +411,5 @@ elif args.mode == 'test':
             else:
                 valid_model(args, watcher, model, set_i, print_out=True, decoding_path=decoding_path, dataflow=['src', 'trg'])
 
-watcher.info("done.")
+watcher.info("done.  Total clock time = {}".format(str(datetime.timedelta(seconds=(time.time() - START_TIME)))))
+

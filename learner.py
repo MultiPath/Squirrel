@@ -8,7 +8,7 @@ from collections import defaultdict
 from torch.autograd import Variable
 from tqdm import tqdm, trange
 from utils import *
-from data_loader import split_batch
+from data_loader import split_batch, merge_batches
 from decoder import valid_model, valid_model_ppl
 from optimizer import Adam
 
@@ -80,7 +80,8 @@ def train_model(args, watcher, model, train, dev, save_path=None, maxsteps=None,
         if args.lm_schedule:
             raise NotImplementedError
         else:
-            lm_only = False if iters > args.lm_steps else True
+            lm_only = False if iters >= args.lm_steps else True
+
 
         # --- saving --- #
         if check(args.save_every) and (args.local_rank == 0): # saving only works for local-rank=0
@@ -177,7 +178,7 @@ def train_model(args, watcher, model, train, dev, save_path=None, maxsteps=None,
         
             opt.param_groups[0]['lr'] = get_learning_rate(args, iters) # (args.model == 'AutoTransformer2'))
             opt.zero_grad()
-                
+            
             # prepare the data
             for inter_step in range(args.inter_size):
 
@@ -187,27 +188,30 @@ def train_model(args, watcher, model, train, dev, save_path=None, maxsteps=None,
                     train_idx = np.random.choice(np.arange(len(train)), p=prob)
                     return next(train[train_idx])
 
+                def merge_training_sets(train):
+                    return merge_batches([next(train_i) for train_i in train])
+
+
                 if len(train) == 1:  # single-pair MT:
                     batch = next(train_iter[0])  # load the next batch of training data.
+                
                 else:
-                    if (args.inter_size % len(train) == 0):  # systematic sampling
-                        batch = next(train_iter[inter_step % len(train_iter)])
-                    else:
+                    if args.sample_a_training_set:
                         batch = sample_a_training_set(train_iter, args.sample_prob)
+                    else:
+                        batch = merge_training_sets(train_iter)
 
                 # --- attention visualization --- #
                 if (check(args.att_plot_every, 1) and (inter_step == 0) and (args.local_rank == 0)):
                     model.module.attention_flag = True
 
-                # -- search optimal paths -- #
+                # -- search optimal paths (for training insertable transformer) -- #
                 if ((args.order == 'random') or (args.order == 'optimal')) and (iters >= args.esteps):
-                    DIV = args.inter_size * args.sub_inter_size
-
+                    
                     if args.search_with_dropout:
                         model.train()
                     else:
                         model.eval()  # searching path should turn-off drop-out ?? (less noise.)
-
 
                     #model.train()
                     with torch.no_grad():
@@ -215,32 +219,22 @@ def train_model(args, watcher, model, train, dev, save_path=None, maxsteps=None,
                         for t in infob_:
                             info[t] += [item(infob_[t])]
 
-                    model.train() # open drop-out
 
-                    for batch_ in split_batch(batch, args.sub_inter_size):
-                        mode = 'search_train' if args.order == 'search_optimal' else 'train'
-                        info_ = model(batch_, mode=mode, dataflow=['src', 'trg'], step=iters)
-
-                        info_['loss'] = info_['loss'] / DIV
-                        info_['loss'].backward()
-
-                        pairs.append(batch.dataset.task +  batch.message)
-                        for t in info_:
-                            info[t] += [item(info_[t])]
-                else:
-                    DIV = args.inter_size
-
-                    model.train() # open drop-out
+                # training with dropout
+                model.train() # open drop-out
+                DIV = args.inter_size * args.sub_inter_size
+                
+                for batch_ in split_batch(batch, args.sub_inter_size):
                     mode = 'search_train' if args.order == 'search_optimal' else 'train'
-                    
-                    info_ = model(batch, mode=mode, dataflow=['src', 'trg'], step=iters, lm_only=lm_only)
+                    info_ = model(batch_, mode=mode, dataflow=['src', 'trg'], step=iters, lm_only=lm_only)
+
                     info_['loss'] = info_['loss'] / DIV
                     info_['loss'].backward()
 
-                    pairs.append(batch.dataset.task +  batch.message)
+                    pairs.append(batch.task + batch.message)
                     for t in info_:
                         info[t] += [item(info_[t])]
-                
+                    
             # multiple steps, one update
             grad_norm = opt.clip_grad_norm(args.grad_clip)
             opt.step()
@@ -577,7 +571,7 @@ def train_2phases(args, watcher, model, train, dev, save_path=None, maxsteps=Non
                 info_['loss'] = info_['loss'] / args.inter_size 
                 info_['loss'].backward()
 
-                pairs.append(batch.dataset.task +  batch.message + '.' + block)
+                pairs.append(batch.task +  batch.message + '.' + block)
                 for t in info_:
                     info[t] += [item(info_[t])]
                 

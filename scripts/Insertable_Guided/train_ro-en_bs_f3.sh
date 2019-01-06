@@ -22,10 +22,13 @@ python -m torch.distributed.launch --nproc_per_node=${gpus} --master_port 23456\
                 --sub_inter_size 4 \
                 --inter_size 1 \
                 --label_smooth 0.1 \
+                --lr 0.0005 \
+                --weight_decay 0.0001 \
+                --drop_ratio 0.1 --attn_drop_ratio 0.1 \
                 --share_embeddings \
                 --tensorboard \
                 --cross_attn_fashion "forward" \
-                --load_from "12.31_09.10.03.l2r.wmt16_customize_ro_en_TransformerIns_rp_ins_wf_bpe_0.1_16000__iter=2000" \
+                --load_from "12.31_09.10.03.l2r.wmt16_customize_ro_en_TransformerIns_rp_ins_wf_bpe_0.1_16000__iter=6000" \
                 --never_load "pos_transform" "pos_attenion" \
                 --length_ratio 2 \
                 --beam_size 10 \
@@ -34,9 +37,10 @@ python -m torch.distributed.launch --nproc_per_node=${gpus} --master_port 23456\
                 --model TransformerIns \
                 --insertable --insert_mode word_first \
                 --order optimal --beta 8 \
-                --resampling --sample_order \
+                --search_with_dropout \
+                
                 # --debug --no_valid \
-                # --use_gumbel --search_with_dropout \
+                # --use_gumbel \
                 # --uniform_embedding_init \
                 # 
                 # --debug --no_valid

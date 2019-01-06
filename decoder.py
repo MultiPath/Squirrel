@@ -50,7 +50,8 @@ def valid_model(args, watcher, model, dev, dataflow=['src', 'trg'], print_out=Fa
     src_tokenizer = dechar if ((args.src == 'ja') or (args.src == 'zh')) else debpe
     src_segmenter = seg_kytea if (args.src == 'ja') else (lambda x: x)
     dev.noise_flow = dataflow[0]
-    
+    fh, output_handles = None, None
+
     for j, dev_batch in enumerate(dev):
 
         start_t = time.time()
@@ -66,6 +67,36 @@ def valid_model(args, watcher, model, dev, dataflow=['src', 'trg'], print_out=Fa
         # gather from all workers:
         if args.distributed:
             gather_dict(dev_outputs)
+
+        # output the sequences
+        if (decoding_path is not None) and (args.local_rank == 0):
+
+            output_flows = ['src', 'trg', 'dec']
+            if 'ori' in dev_outputs:
+                output_flows += ['ori']
+
+            if args.output_decoding_files:
+                if (output_handles is None):
+                    if not os.path.exists(decoding_path[:-4]):
+                        os.mkdir(decoding_path[:-4])
+                    if not os.path.exists(decoding_path[:-4] + '/' + dev.dataset.task):
+                        os.mkdir(decoding_path[:-4] + '/' + dev.dataset.task)
+                    data_name = args.test_set if args.decode_test else args.dev_set
+                    output_handles = [open(decoding_path[:-4] + '/' + dev.dataset.task + '/{}.{}'.format(data_name, s), 'w') for s in output_flows]
+            
+            else:
+                if fh is None:
+                    fh = open(decoding_path, 'w')
+
+            for i in range(len(dev_outputs['src'])):
+                for k, d in enumerate(output_flows):
+
+                    s = dev_outputs[d][i]
+                    if args.output_decoding_files:
+                        print(s, file=output_handles[k], flush=True)
+                    else:
+                        print('[{}]\t{}'.format(d, s), file=fh, flush=True)
+
 
         for key in dev_outputs:
             if isinstance(dev_outputs[key], list):
@@ -114,32 +145,6 @@ def valid_model(args, watcher, model, dev, dataflow=['src', 'trg'], print_out=Fa
     
     # record for tensorboard:
     outputs['tb_data'] += [('dev/{}/BLEU'.format(dev.dataset.task), outputs['corpus_bleu'])]
-
-    # output the sequences
-    if (decoding_path is not None) and (args.local_rank == 0):
-
-        with open(decoding_path, 'w') as fh:
-            output_flows = ['src', 'trg', 'dec']
-            if 'ori' in outputs:
-                output_flows += ['ori']
-
-            if args.output_decoding_files:
-                if not os.path.exists(decoding_path[:-4]):
-                    os.mkdir(decoding_path[:-4])
-                if not os.path.exists(decoding_path[:-4] + '/' + dev.dataset.task):
-                    os.mkdir(decoding_path[:-4] + '/' + dev.dataset.task)
-                output_handles = [open(decoding_path[:-4] + '/' + dev.dataset.task + '/dev.bpe.{}'.format(s), 'w') for s in output_flows]
-
-            for i in range(len(outputs['src'])):
-                for j, d in enumerate(output_flows):
-                    s = outputs[d][i]
-                    print('[{}]\t{}'.format(d, s), file=fh, flush=True)
-
-                    if args.output_decoding_files:
-                        print(s, file=output_handles[j])
-        
-
-
 
     # clean cached memory
     torch.cuda.empty_cache()

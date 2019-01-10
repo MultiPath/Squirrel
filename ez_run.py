@@ -286,7 +286,7 @@ hp_str = (  f".{args.dataset}_{args.params}_"
             f"{'lm{}_'.format(args.lm_steps) if args.lm_steps > 0 else ''}"
             f"{args.base}_"
             f"{args.label_smooth}_"
-            f"{args.inter_size*args.batch_size*args.world_size}_"
+            f"{args.inter_size*args.batch_size*args.world_size*len(args.src.split(','))}_"
             f"{'M{}'.format(args.multi_width) if args.multi_width > 1 else ''}"
         )
 

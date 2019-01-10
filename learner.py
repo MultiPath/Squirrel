@@ -261,9 +261,9 @@ def train_model(args, watcher, model, train, dev, save_path=None, maxsteps=None,
                     watcher.info("{}:\t{}".format('reorder', info['reorder'][s]))
                 watcher.info("--------" * 15)
 
-        info_str += '#token={}, #sentence={}, #maxtt={}, gn={:.4f}, speed={} t/s | {} | BEST={} | '.format(
+        info_str += '#token={}, #sentence={}, #maxtt={}, gn={:.4f}, speed={} t/s | BEST={} | '.format(
                     format(info['tokens'], 'k'), int(info['sents']), format(info['max_att'], 'm'), grad_norm,
-                    format(info['tokens'] / train_timer.elapsed_secs, 'k'), '/'.join(pairs), watcher.best_tracker.corpus_bleu)
+                    format(info['tokens'] / train_timer.elapsed_secs, 'k'), watcher.best_tracker.corpus_bleu)
 
         for keyword in info:
             if keyword[:2] == 'L@':

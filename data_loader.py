@@ -138,7 +138,6 @@ def fetch_batch(data, batch_size, world_size=1, reserve=False, maxlen=10000, max
     """Yield elements from data in chunks of batch_size.
     :: minibatch: a reference of list which the remaining of batches will always be there for fetching next time.
     """
-
     # --- dynamic batching function -- # 
     def dynamic_batching(new, i, tokens, maxatt):
         tokens = tokens + max(len(new.src), len(new.trg))
@@ -163,7 +162,7 @@ def fetch_batch(data, batch_size, world_size=1, reserve=False, maxlen=10000, max
         reserved_minibatch = []
 
     for it, ex in enumerate(data):
-        
+
         if max(len(ex.src), len(ex.trg)) > maxlen:
             continue
 
@@ -476,7 +475,7 @@ class ParallelDataset(datasets.TranslationDataset):
 
         for p in paths:
             if not os.path.exists(p):
-                return None
+                raise FileNotFoundError
 
         if lazy:  # using lazy dataloader -- cannot be used to construct the vocabulary -- 
             super(datasets.TranslationDataset, self).__init__(lazy_reader_shuffled(paths, fields, max_len, buffer=buffer), fields, **kwargs)
@@ -556,9 +555,9 @@ class LazyBucketIterator(data.BucketIterator):
         count = 0
         t0 = time.time()
         while True:
-            
             self.init_epoch()
             for idx, minibatch in enumerate(self.batches):
+                
                 count += 1
                 
                 # fast-forward if loaded from state
@@ -738,6 +737,7 @@ class MultiDataLoader(object):
                 exts=exts, fields=[('src', SRC), ('trg', TRG)],
                 buffer=16384 * args.world_size, task='{}-{}'.format(src, trg))
             logger.info('setup the dataset.')
+
 
             train, dev, test = None, None, None
             if train_data is not None:

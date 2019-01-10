@@ -24,11 +24,12 @@ python -m torch.distributed.launch --nproc_per_node=${gpus} --master_port=${port
                 --workspace_prefix "/checkpoint/jgu/space/${jbname}/" \
                 --params "t2t-base" \
                 --lm_steps 0 \
+                --maxlen 100 \
                 --eval_every 1000  \
-                --batch_size 900 \
-                --valid_batch_size 4800 \
+                --batch_size 300 \
+                --valid_batch_size 3000 \
                 --save_every 5000 \
-                --inter_size 2 \
+                --inter_size 1 --sub_inter_size 3 \
                 --label_smooth 0.1 \
                 --drop_ratio 0.1 \
                 --lr 0.0005 \
@@ -40,5 +41,6 @@ python -m torch.distributed.launch --nproc_per_node=${gpus} --master_port=${port
                 --lang_as_init_token \
                 --load_from 12.26_22.57.59.LM.es-de-fr-eval_t2t-base_de,en,fr,en,es,en_en,de,en,fr,en,es_Transformer_wf_lm300000_bpe_0.1_14400__iter=0 \
                 --seed ${seed} \
+
         
         

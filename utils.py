@@ -447,7 +447,7 @@ def gather_dict(info_dict):
     for w in info_dict:
         new_v = []
 
-        for v in all_gather_list(info_dict[w], 2 ** 19):
+        for v in all_gather_list(info_dict[w], 2 ** 20):
             if isinstance(v, list):
                 new_v += v
             else:

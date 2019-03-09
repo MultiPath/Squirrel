@@ -6,7 +6,6 @@ import pickle
 import spacy
 
 from collections import deque
-
 spacy.prefer_gpu()
 
 # helper functions for depdendency parsing
@@ -24,7 +23,6 @@ def recover_sents(data):
     return lines, outputs
 
 def dep2path(lines, outs):
-
     lines = list(lines.sents)
     reordered = []
     caches = deque()
@@ -39,10 +37,26 @@ def dep2path(lines, outs):
     reordered = [j for i in [outs[r] for r in reordered] for j in i]
     return reordered    
 
+def get_balanced_order(pos):
+    poss = deque()
+    poss.appendleft(pos)
+    outputs = []
+    while len(poss) > 0:
+        p = poss.pop()
+        L = len(p)
+        if L > 2:
+            outputs.append(p[L//2])
+            poss.appendleft(p[:L//2])
+            poss.appendleft(p[L//2+1:])
+        else:
+            outputs += p
+    return outputs
 
-CUTOFF = 85 # RO-EN dataset, for other dataset, this value may be different
+# CUTOFF = 85 # RO-EN dataset, for other dataset, this value may be different
+# CUTOFF = 545  # EN-TR
+CUTOFF = 81
 
-def reorder(filename, order='l2r'):
+def reorder(filename, order='l2r', language='en'):
 
     shutil.copy(filename + '.src', filename + '.{}.src'.format(order))
 
@@ -52,10 +66,10 @@ def reorder(filename, order='l2r'):
 
     if ('common' in order ) or ('rare' in order):
         vocab_index, vocab_freq = pickle.load(open(filename + '.trg.voc.pkl', 'rb'))
-        vocab_freq = {w[0]: w[1] for w in vocab_freq}
+        # vocab_freq = {w[0]: w[1] for w in vocab_freq}
 
     if order == 'dep':  # get the path following the default path of the depdendency tree (ROOT-LEAF, LEFT-RIGHT)
-        nlp = spacy.load('en')
+        nlp = spacy.load(language)
         fd = open(filename + '.{}.full'.format(order), 'w')
 
 
@@ -98,6 +112,11 @@ def reorder(filename, order='l2r'):
             words = ['<stop>'] + [words[t] for t in word_order]
             positions = [0, 5000] + [positions[t] for t in word_order] + [eos_pos]
 
+        elif order == 'balanced':
+            word_order = get_balanced_order(list(range(len(words))))
+            words = ['<stop>'] + [words[t] for t in word_order]
+            positions = [0, 5000] + [positions[t] for t in word_order] + [eos_pos]
+            
         elif order == 'dep':
 
             lines, outs = recover_sents(words)

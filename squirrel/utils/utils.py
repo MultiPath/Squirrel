@@ -17,11 +17,6 @@ from tensorboardX import SummaryWriter
 
 # matplotlib.use('Agg')
 
-COLORS = ['red', 'green', 'yellow', 'blue', 'white', 'magenta', 'cyan']
-INF = 1e10
-TINY = 1e-9
-BIG = 10000000
-
 params = {
     'legend.fontsize': 'x-large',
     'figure.figsize': (15, 5),

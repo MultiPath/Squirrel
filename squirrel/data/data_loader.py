@@ -5,15 +5,45 @@ import copy
 import logging
 import os
 from collections import Counter
+from concurrent import futures
 
 import torch
 from torchtext import vocab
 
 from squirrel.data.datasets import LazyBucketIterator, ParallelDataset
 from squirrel.data.field import Features, Symbols
+from squirrel.data.noise import get_noise_generator
 from squirrel.data.tokenization import get_tokenizer
 
 from . import register_dataloader
+
+
+class AsynchronousDataLoderWrapper(object):
+    def __init__(self, dataloader):
+        self.dataloader = dataloader
+        self.iterator = iter(dataloader)
+        self.pool = futures.ThreadPoolExecutor(2)
+        self.last_batch = self.pool.submit(self.get_next)
+
+    def __getattr__(self, attr):
+        try:
+            return getattr(self, attr)
+        except AttributeError:
+            try:
+                return getattr(self.dataloader, attr)
+            except AttributeError:
+                raise AttributeError('Error to find the attributes.')
+
+    def get_next(self):
+        return next(self.iterator)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        this_batch = self.last_batch.result()
+        self.last_batch = self.pool.submit(self.get_next)
+        return this_batch
 
 
 @register_dataloader('default')
@@ -186,7 +216,9 @@ class DataLoader(object):
                           task='nmt',
                           datasets='train',
                           fields=None,
-                          init_tokens=None):
+                          init_tokens=None,
+                          sort_key=None,
+                          fields_for_batchsize=None):
 
         if datasets == 'train':
             train_set, dev_set, test_set = self.args.train_set, None, None
@@ -197,6 +229,10 @@ class DataLoader(object):
         else:
             raise NotImplementedError('Unknown datasets')
 
+        if fields is None:
+            fields = [('src', self.SRC), ('trg', self.TRG)]
+        noise_generators = [a[1].noise_generator for a in fields]
+
         # --- setup dataset (no lazy mode when building the vocab) --- #
         train_data, dev_data, test_data = ParallelDataset.splits(
             path=data_path + '/',
@@ -205,29 +241,32 @@ class DataLoader(object):
             validation=dev_set,
             test=test_set,
             exts=suffixes,
-            fields=fields if fields is not None else [('src', self.SRC),
-                                                      ('trg', self.TRG)],
+            fields=fields,
             buffer=16384 * self.args.world_size,
-            task=task)
+            task=task,
+            noise_generators=noise_generators)
 
         train, dev, test = None, None, None
         if train_data is not None:
-            train = LazyBucketIterator(
-                train_data,
-                batch_size=self.args.batch_size,
-                device=self.args.device,
-                sort_key=None,
-                train=True,
-                repeat=None,
-                sort_within_batch=True,
-                distributed=self.args.distributed,
-                rank=self.args.local_rank,
-                world_size=self.args.world_size,
-                maxlen=self.args.maxlen,
-                maxatt_size=self.args.maxatt_size,
-                init_tokens=init_tokens)
+            train = AsynchronousDataLoderWrapper(
+                LazyBucketIterator(
+                    train_data,
+                    batch_size=self.args.batch_size,
+                    device=self.args.device,
+                    sort_key=sort_key,
+                    train=True,
+                    repeat=None,
+                    sort_within_batch=True,
+                    distributed=self.args.distributed,
+                    rank=self.args.local_rank,
+                    world_size=self.args.world_size,
+                    maxlen=self.args.maxlen,
+                    maxatt_size=self.args.maxatt_size,
+                    init_tokens=init_tokens,
+                    fields_for_batchsize=fields_for_batchsize))
 
         if dev_data is not None:
+            # dev = AsynchronousDataLoderWrapper(
             dev = LazyBucketIterator(
                 dev_data,
                 batch_size=self.args.valid_batch_size,
@@ -243,6 +282,7 @@ class DataLoader(object):
                 init_tokens=init_tokens)
 
         if test_data is not None:
+            # test = AsynchronousDataLoderWrapper(
             test = LazyBucketIterator(
                 test_data,
                 batch_size=self.args.valid_batch_size,
@@ -444,4 +484,103 @@ class OrderDataLoader(DataLoader):
             suffixes[:2],
             task='{}-{}'.format(src, trg),
             datasets='test')
+        self.train, self.dev, self.test = [train], [dev], [test]
+
+
+@register_dataloader('target_noise')
+class NoisyTargetDataLoder(DataLoader):
+    def __init__(self, args, logger=None, build_vocab=False, vocab_file=None):
+
+        self.args = args
+
+        if not (self.args.noise_dataflow == 'trg'
+                and self.args.noise_types is not None):
+            raise NotImplementedError('we need to set the noise types')
+
+        if logger is None:
+            logger = logging.getLogger()
+
+        logger.info("""
+            Use noisy-dataloader (target side):
+            Please not that vocabulary will be swapped if direction is reversed."""
+                    )
+
+        init, eos, pad, unk = '<init>', '<eos>', '<pad>', '<unk>'
+        TRG = self.prepare_field(args.base, init, eos, pad, unk)
+
+        if args.source_field == 'text':
+            if args.share_embeddings:
+                SRC = TRG
+            else:
+                SRC = self.prepare_field(args.base, init, eos, pad, unk)
+        elif args.source_field == 'image_feature':
+            assert not args.share_embeddings, 'image caption cannot share the same field.'
+            SRC = Features()
+
+        else:
+            raise NotImplementedError
+
+        # -- languages -- #
+        src, trg = args.src, args.trg
+        test_src, test_trg = args.test_src, args.test_trg
+        assert (test_src == src) and (
+            test_trg == trg), 'default only works for the same dataset.'
+
+        # ------------------------ Vocabulary ----------------------------- #
+        if self.args.base == 'byte':
+            byte_vocab = [init, eos, pad, unk
+                          ] + ["{0:x}".format(a) for a in range(256)]
+            byte_vocab = self.prepare_vocabulary(token_list=byte_vocab)[0]
+            SRC.vocab = byte_vocab
+            TRG.vocab = byte_vocab
+
+        else:
+
+            assert vocab_file is not None, "compute vocabulary manually first."
+            if not os.path.exists(vocab_file):
+                vocab_file = os.path.join(args.data_prefix, args.dataset,
+                                          vocab_file)
+                if not os.path.exists(vocab_file):
+                    raise FileNotFoundError(vocab_file)
+
+                src_vocab, trg_vocab = self.prepare_vocabulary(
+                    vocab_file=vocab_file)
+
+                SRC.vocab = src_vocab
+                TRG.vocab = trg_vocab
+
+        # ----------------- de-couple the fields -------------- #
+        SRC = copy.deepcopy(SRC)
+
+        # ------------------------ DataPath ------------------------------ #
+        data_path, reverse = self.find_data(src, trg)
+        suffixes = self.prepare_suffix(self.args.suffixes, reverse)
+
+        if reverse:
+            _temp = copy.deepcopy(SRC.vocab)
+            SRC.vocab = copy.deepcopy(TRG.vocab)
+            TRG.vocab = _temp
+
+        # ----------------- Noisy Dataloader (target side) ---- #
+        TRG.set_noise_generator(
+            get_noise_generator(
+                self.args.noise_types, {
+                    a[6:]: getattr(self.args, a)
+                    for a in self.args.__dict__ if a[:5] == 'noise'
+                }, self.args.output_suggested_edits))
+
+        args.__dict__.update({
+            'trg_vocab': len(TRG.vocab),
+            'src_vocab': len(SRC.vocab)
+        })
+
+        self.SRC, self.TRG = SRC, TRG
+
+        # --- build batch-iterator for Translation tasks. ---
+        train, dev, test = self.get_data_iterator(
+            data_path,
+            suffixes,
+            task='{}-{}'.format(src, trg),
+            datasets='all',
+            sort_key=lambda x: len(x.trg_n))
         self.train, self.dev, self.test = [train], [dev], [test]

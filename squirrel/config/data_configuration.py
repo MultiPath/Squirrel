@@ -3,14 +3,13 @@ from squirrel.config import register_config
 
 @register_config('data')
 def build_data_config(parser):
-    print(parser)
     parser.add_argument('--logfile', type=str, default=None)
 
     parser.add_argument(
         '--dataloader',
         type=str,
         default=None,
-        choices=['default', 'multi', 'order'])
+        choices=['default', 'multi', 'order', 'target_noise'])
 
     # data-field
     parser.add_argument(
@@ -94,17 +93,41 @@ def build_data_config(parser):
         help='if we have multiple training sets.')
 
     parser.add_argument(
-        '--remove_dec_eos',
+        '--remove_init_eos',
         action='store_true',
-        help='possibly remove <eos> tokens in the decoder')
-    parser.add_argument(
-        '--remove_enc_eos',
-        action='store_true',
-        help='possibly remove <eos> tokens in the encoder')
+        help='possibly remove <init>/<eos> tokens for encoder-decoder')
 
     parser.add_argument(
         '--load_lazy',
         action='store_true',
         help='load a lazy-mode dataset, not save everything in the mem')
+
+    return parser
+
+
+@register_config('data_noise')
+def build_noisy_dataloader_config(parser):
+
+    parser.add_argument(
+        '--noise_dataflow', type=str, default='trg', choices=['src', 'trg'])
+    parser.add_argument(
+        '--noise_types',
+        nargs='*',
+        default=None,
+        choices=[
+            'word_shuffle', 'word_dropout', 'word_blank',
+            'word_dropout_at_anywhere'
+        ],
+        help='use noise generator in the dataloader')
+
+    parser.add_argument('--noise_dropout_prob', type=float, default=0.0)
+    parser.add_argument('--noise_shuffle_distance', type=float, default=3)
+    parser.add_argument('--noise_blank_prob', type=float, default=0.0)
+    parser.add_argument('--noise_blank_word', type=str, default='<unk>')
+
+    parser.add_argument(
+        '--output_suggested_edits',
+        action='store_true',
+        help='output suggested edits')
 
     return parser

@@ -1,7 +1,12 @@
+import concurrent.futures
+import multiprocessing
 import pickle
+from typing import Any, Callable, List
 
+import pandas as pd
 import torch
 import torch.distributed as dist
+import tqdm
 
 
 # ===== util fucntions ===== #
@@ -85,3 +90,16 @@ def gather_dict(info_dict, max_size=2**20):
                 new_v.append(v)
 
         info_dict[w] = new_v
+
+
+# def row_apply(series: List[List[str]],
+#               func: Callable[[Any], Any]) -> List[Any]:
+#     return [func(row) for row in tqdm.tqdm(series)]
+
+
+def row_apply_multiprocessing(series: List[Any],
+                              func: Callable[[Any], Any]) -> List[Any]:
+    num_processes = int(multiprocessing.cpu_count() / 4)
+    with concurrent.futures.ProcessPoolExecutor(num_processes) as pool:
+        return list(pool.map(func, series, chunksize=1), total=len(series))
+    return [func(row) for row in tqdm.tqdm(series)]

@@ -3,8 +3,6 @@ from multiprocessing import Pool
 import numpy as np
 import torch
 from torchtext import data
-
-
 """
 Example (a colleciton of text is one)
 """
@@ -12,8 +10,14 @@ Example (a colleciton of text is one)
 
 class Example(data.Example):
     @classmethod
-    def fromlist(cls, data, fields, step=None):
+    def fromlist(cls, data, fields, step=None, noise_generators=None):
         ex = super().fromlist(data, fields)
+        if noise_generators is not None:
+            for i, (name, field) in enumerate(fields):
+                if noise_generators[i] is not None:
+                    setattr(ex, name + '_n', noise_generators[i](getattr(
+                        ex, name)))
+
         if step is not None:
             setattr(ex, 'id', step)
         return ex
@@ -25,11 +29,22 @@ Text Field
 
 
 class Symbols(data.Field):
-    def __init__(self, reverse_tokenize, additional_tokens=None, **kwargs):
+    def __init__(self,
+                 reverse_tokenize,
+                 additional_tokens=None,
+                 noise_gen=None,
+                 **kwargs):
         super().__init__(**kwargs)
         self.reverse_tokenizer = reverse_tokenize
         self.additional_tokens = additional_tokens if additional_tokens is not None else []
         self.name = 'symbols'
+        self.noise_generator = noise_gen
+
+    def set_noise_generator(self, noise_gen=None):
+        self.noise_generator = noise_gen
+
+    def apply_noise(self, batch):
+        return [self.noise_generator(ex) for ex in batch]
 
     def process(self, batch, device=None):
         padded = self.pad(batch)
@@ -94,6 +109,7 @@ class Features(data.Field):
         self.reverse_tokenizer = lambda x: x[0]
         self.tokenizer = lambda x: [x]
         self.data_dir = None
+        self.noise_generator = None
 
     def set_datapath(self, data_dir):
         self.data_dir = data_dir

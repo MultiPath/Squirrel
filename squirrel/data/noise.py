@@ -1,201 +1,95 @@
-# class Symbols(data.Field):
-#     def __init__(self,
-#                  reverse_tokenize,
-#                  shuffle=0,
-#                  dropout=0,
-#                  replace=0,
-#                  additional_tokens=None,
-#                  **kwargs):
-#         super().__init__(**kwargs)
-#         self.reverse_tokenizer = reverse_tokenize
-#         self.shuffle, self.dropout, self.replace = shuffle, dropout, replace
-#         self.additional_tokens = additional_tokens if additional_tokens is not None else []
-#         self.name = 'symbols'
+"""
+This file describes different noisy functions
+"""
+import numpy as np
 
-#     def build_vocab(self, *args, **kwargs):
-#         """Construct the Vocab object for this field from one or more datasets.
-#         Arguments:
-#             Positional arguments: Dataset objects or other iterable data
-#                 sources from which to construct the Vocab object that
-#                 represents the set of possible values for this field. If
-#                 a Dataset object is provided, all columns corresponding
-#                 to this field are used; individual columns can also be
-#                 provided directly.
-#             Remaining keyword arguments: Passed to the constructor of Vocab.
-#         """
-#         counter = Counter()
-#         sources = []
-#         for arg in args:
-#             if isinstance(arg, Dataset):
-#                 sources += [
-#                     getattr(arg, name) for name, field in arg.fields.items()
-#                     if field is self
-#                 ]
-#             else:
-#                 sources.append(arg)
-#         for data in sources:
-#             for x in data:
-#                 if not self.sequential:
-#                     x = [x]
-#                 try:
-#                     counter.update(x)
-#                 except TypeError:
-#                     counter.update(chain.from_iterable(x))
-#         specials = list(
-#             OrderedDict.fromkeys(tok for tok in [
-#                 self.unk_token, self.pad_token, self.init_token, self.eos_token
-#             ] + self.additional_tokens if tok is not None))
-#         self.vocab = self.vocab_cls(counter, specials=specials, **kwargs)
+_NOISE_GENERATORS = {}
 
-#     def word_shuffle(self, x):
-#         if self.shuffle == 0:
-#             return x
-#         return [
-#             x[i] for i in (np.random.uniform(0, self.shuffle, size=(len(x))) +
-#                            np.arange(len(x))).argsort()
-#         ]
 
-#     def word_dropout(self, x):
-#         if self.dropout == 0:
-#             return x
-#         return [
-#             xi for xi, di in zip(x, (
-#                 np.random.rand(len(x)) >= self.dropout).tolist()) if di == 1
-#         ]
+def register_noise_generator(name):
+    def register_noise_generator_fn(fn):
+        if name in _NOISE_GENERATORS:
+            raise ValueError('Cannot register duplicated generators')
+        if not callable(fn):
+            raise ValueError('Generator must be callable ({name})')
+        _NOISE_GENERATORS[name] = fn
+        return fn
 
-#     def word_blank(self, x, tok='<unk>'):
-#         if self.replace == 0:
-#             return x
-#         return [
-#             xi if di == 1 else tok for xi, di in zip(x, (
-#                 np.random.rand(len(x)) >= self.replace).tolist())
-#         ]
+    return register_noise_generator_fn
 
-#     def add_noise(self, x, noise_level=None):
-#         if noise_level is None:
-#             return x
 
-#         if noise_level == 'n1':
-#             c = np.random.choice(3)
-#         elif noise_level == 'n2':
-#             c = np.random.choice(4)
-#         elif noise_level == 'n3':
-#             c = 4
-#         else:
-#             raise NotImplementedError
+class merged_noisy_generator(object):
+    def __init__(self, generators, output_suggested_edits=False):
+        self.generators = generators
+        self.output_suggested_edits = output_suggested_edits
 
-#         if c == 0:
-#             return self.word_shuffle(x)
-#         elif c == 1:
-#             return self.word_dropout(x)
-#         elif c == 2:
-#             return self.word_blank(x, self.unk_token)
-#         elif c == 3:
-#             return x
-#         elif c == 4:
-#             return self.word_blank(
-#                 self.word_dropout(self.word_shuffle(x)), self.unk_token)
-#         else:
-#             raise NotImplementedError
+    def __call__(self, x):
+        for g in self.generators:
+            x = g(x)
+        return x
 
-#     def process(self, batch, device=None):
-#         padded = self.pad(batch)
-#         tensor = self.numericalize(padded, device=device)
-#         return tensor
 
-#     def extend_padding(self, batch, maxlen):
-#         new_batch = batch.new_zeros(batch.size(0), maxlen).fill_(
-#             self.vocab.stoi[self.pad_token])
-#         new_batch[:, :batch.size(1)] = batch
-#         return new_batch
+def get_noise_generator(names, conditions, output_suggested_edits=False):
+    return merged_noisy_generator(
+        [_NOISE_GENERATORS[name](**conditions) for name in names],
+        output_suggested_edits)
 
-#     def reverse(self,
-#                 batch,
-#                 width=1,
-#                 return_saved_time=False,
-#                 reverse_token=True):
-#         if not self.batch_first:
-#             batch.t_()
 
-#         with torch.cuda.device_of(batch):
-#             batch = batch.tolist()
+@register_noise_generator('word_shuffle')
+class word_shuffle(object):
+    def __init__(self, shuffle_distance=3, **kwargs):
+        self.shuffle_distance = shuffle_distance
 
-#         batch = [[self.vocab.itos[ind] for ind in ex]
-#                  for ex in batch]  # denumericalize
+    def __call__(self, x):
+        if self.shuffle_distance == 0:
+            return x
+        return [
+            x[i] for i in (
+                np.random.uniform(0, self.shuffle_distance, size=(len(x))) +
+                np.arange(len(x))).argsort()
+        ]
 
-#         def trim(s, t):
-#             sentence = []
-#             for w in s:
-#                 if w == t:
-#                     break
-#                 sentence.append(w)
-#             return sentence
 
-#         batch = [trim(ex, self.eos_token)
-#                  for ex in batch]  # trim past frst eos
+@register_noise_generator('word_dropout')
+class word_dropout(object):
+    def __init__(self, dropout_prob=0.0, **kwargs):
+        self.dropout_prob = dropout_prob
 
-#         def filter_special(tok):
-#             return tok not in (self.init_token, self.pad_token)
+    def __call__(self, x):
+        if self.dropout_prob == 0:
+            return x
+        return [
+            xi for xi, di in zip(x, (
+                np.random.rand(len(x)) >= self.dropout_prob).tolist())
+            if di == 1
+        ]
 
-#         def count(ex):
-#             n_step = 0
-#             n_pad = 0
-#             n_word = 0
 
-#             filtered = []
-#             decision = []
+@register_noise_generator('word_blank')
+class word_blank(object):
+    def __init__(self, blank_prob=0.0, blank_word='<unk>', **kwargs):
+        self.blank_prob = blank_prob
+        self.blank_word = blank_word
 
-#             for e in ex:
-#                 if e == self.init_token:
-#                     continue
+    def __call__(self, x):
+        if self.blank_prob == 0:
+            return x
+        return [
+            xi if di == 1 else self.blank_word
+            for xi, di in zip(x, (
+                np.random.rand(len(x)) >= self.blank_prob).tolist())
+        ]
 
-#                 if e == self.pad_token:
-#                     n_pad += 1
-#                     if n_word > 0:
-#                         n_step += 1
-#                         n_word = 0
 
-#                 else:
-#                     if n_word < (width - 1):
-#                         n_word += 1
+@register_noise_generator('word_dropout_at_anywhere')
+class word_dropout_at_anywhere(object):
+    def __init__(self, **kwargs):
+        pass
 
-#                     else:
-#                         n_word = 0
-#                         n_step += 1
-
-#                     if n_word == 1:
-#                         decision.append(0)
-#                     else:
-#                         decision.append(1)
-
-#                     filtered.append(e)
-
-#             saved_time = (n_step + (n_word == 0)) / (1 + len(filtered))
-#             accuracy = len(filtered) / (len(ex) + 1e-9)
-#             return filtered, saved_time, accuracy, decision
-
-#         if return_saved_time:
-#             batch_filtered, saved_time, accuracy, decisions = [], [], [], []
-#             for ex in batch:
-#                 b, s, a, d = count(ex)
-#                 batch_filtered.append(b)
-#                 saved_time.append(s)
-#                 accuracy.append(a)
-#                 decisions.append(d)
-
-#         else:
-#             batch_filtered = [list(filter(filter_special, ex)) for ex in batch]
-
-#         if not reverse_token:
-#             return batch_filtered
-
-#         output = [self.reverse_tokenizer(ex) for ex in batch_filtered]
-#         if return_saved_time:
-#             return output, saved_time, accuracy, decisions
-
-#         return output
-
-#     def reapply_noise(self, data, noise):
-#         batch = self.reverse(data, reverse_token=False)
-#         batch = [self.add_noise(ex, noise) for ex in batch]
-#         return self.process(batch, device=data.get_device())
+    def __call__(self, x):
+        return [
+            x[i] for i in np.sort(
+                np.random.permutation(len(x))
+                [:np.random.randint(0,
+                                    len(x) + 1)])
+        ]

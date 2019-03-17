@@ -35,6 +35,9 @@ class space_tokenizer(object):
             return self._tokenize(x)
 
     def reverse(self, x):
+        if len(x) == 0:
+            return ""
+
         if not isinstance(x[0], list):
             return self._reverse([x])[0]
         else:

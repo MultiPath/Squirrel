@@ -21,10 +21,6 @@ class Transformer(Seq2Seq):
         self.fields = {'src': src, 'trg': trg}
         self.args = args
 
-        self.attention_maps = None
-        self.attention_flag = False
-        self.visual_limit = 33
-
         self.encoder = Stack(
             src,
             args,
@@ -49,16 +45,6 @@ class Transformer(Seq2Seq):
             set(self.args.src.split(',') + self.args.trg.split(',')))
         for i, lang in enumerate(self.langs):
             self.langs[i] = '<' + lang + '>'
-
-    def trainable_parameters(self):
-        def get_params(modules):
-            return [
-                p for module in modules for p in module.parameters()
-                if p.requires_grad
-            ]
-
-        all_param = get_params([self])
-        return [all_param]
 
     def plot_attention(self, source_inputs, target_inputs, dataflow):
         src = [self.fields[dataflow[0]].init_token] + self.fields[
@@ -91,32 +77,18 @@ class Transformer(Seq2Seq):
                     self.attention_maps.append((name, fig))
 
     # All in All: forward function for training
-    def forward(self,
-                batch,
-                mode='train',
-                reverse=True,
-                dataflow=['src', 'trg'],
-                step=None):
+    def forward(self, batch, mode='train', dataflow=['src', 'trg'], step=None):
 
-        #if info is None:
         info = defaultdict(lambda: 0)
 
         source_inputs, source_outputs, source_masks, source_original, \
-        target_inputs, target_outputs, target_masks, target_original = self.prepare_data(batch, dataflow=dataflow)
+            target_inputs, target_outputs, target_masks, target_original = self.prepare_data(batch, dataflow=dataflow)
 
         info['sents'] = (target_inputs[:, 0] * 0 + 1).sum()
         info['tokens'] = (target_masks != 0).sum()
 
-        modes = mode.split(',')
-        if len(modes) == 1:
-            mode, task = modes[0], None
-        elif len(modes) == 2:
-            mode, task = modes
-        else:
-            raise NotImplementedError
-
         # encoding: if first dataflow is empty, then ignore the encoder.
-        if (task is None) or (task != 'lm_only'):
+        if dataflow[0] is not None:
             encoding_inputs = self.io_enc.i(
                 source_inputs, pos=(not self.relative_pos))
             encoding_outputs = self.encoder(encoding_inputs, source_masks)
@@ -145,10 +117,7 @@ class Transformer(Seq2Seq):
                 loss = self.io_dec.sent_cost(
                     target_outputs, target_masks, outputs=decoding_outputs[-1])
 
-            for w in loss:
-                info['L@' + w] = loss[w]
-                if w[0] != '#':
-                    info['loss'] = info['loss'] + loss[w]
+            info = self.merge_losses(info, [loss])
 
             # Source side Language Model (optional, only works for causal-encoder)
             if self.args.encoder_lm and self.args.causal_enc:
@@ -157,19 +126,14 @@ class Transformer(Seq2Seq):
                     source_masks,
                     outputs=encoding_outputs[-1],
                     name='LM')
-                for w in loss_lm:
-                    info['L@' + w] = loss_lm[w]
-                    if w[0] != '#':
-                        info['loss'] = info['loss'] + loss_lm[w]
+                info = self.merge_losses(info, [loss_lm])
 
             if self.attention_flag:
                 self.plot_attention(source_inputs, target_inputs, dataflow)
 
             if mode == 'valid':
-                info[
-                    'src'] = source_original  # [self.fields[dataflow[0]].reverse_tokenizer(x) for x in source_original]
-                info[
-                    'trg'] = target_original  # [self.fields[dataflow[1]].reverse_tokenizer(x) for x in target_original]
+                info['src'] = source_original
+                info['trg'] = target_original
 
         else:
             # Decoding (for evaluation)
@@ -190,22 +154,21 @@ class Transformer(Seq2Seq):
                         self.args.alpha,
                         field=dataflow[1])
 
-            if reverse:
-                # specially for multi_step decoding #
-                if self.args.multi_width > 1:
-                    translation_outputs, saved_time, pred_acc, decisions = self.fields[
-                        dataflow[1]].reverse(
-                            translation_outputs,
-                            width=self.args.multi_width,
-                            return_saved_time=True)
+            # specially for multi_step decoding #
+            if self.args.multi_width > 1:
+                translation_outputs, saved_time, pred_acc, decisions = self.fields[
+                    dataflow[1]].reverse(
+                        translation_outputs,
+                        width=self.args.multi_width,
+                        return_saved_time=True)
 
-                    info['saved_time'] = saved_time
-                    info['pred_acc'] = pred_acc
-                    info['decisions'] = decisions
+                info['saved_time'] = saved_time
+                info['pred_acc'] = pred_acc
+                info['decisions'] = decisions
 
-                else:
-                    translation_outputs = self.fields[dataflow[1]].reverse(
-                        translation_outputs)
+            else:
+                translation_outputs = self.fields[dataflow[1]].reverse(
+                    translation_outputs)
 
             info['src'] = source_original
             info['trg'] = target_original

@@ -10,6 +10,11 @@ from squirrel.decoder import valid_model, valid_model_ppl
 from squirrel.optimizer import Adam
 from squirrel.utils import Timer, format, gather_dict, item
 
+# class AsynchronousPreprocessing(object):
+#     def __init__(self, train, model):
+#         self.train_iter = [iter(t) for t in train]
+#         self.model = model
+
 
 def get_learning_rate(args, i):
     if not args.disable_lr_schedule:
@@ -282,8 +287,7 @@ def train_model(args,
                     if args.search_with_dropout:
                         model.train()
                     else:
-                        model.eval(
-                        )  # searching path should turn-off drop-out ?? (less noise.)
+                        model.eval()
 
                     with torch.no_grad():
                         infob_ = model(
@@ -300,9 +304,6 @@ def train_model(args,
 
                 for batch_ in split_batch(batch, args.sub_inter_size):
                     mode = 'search_train' if args.order == 'search_optimal' else 'train'
-                    if task is not None:
-                        mode = mode + ',' + task
-
                     info_ = model(
                         batch_, mode=mode, dataflow=['src', 'trg'], step=iters)
                     info_['loss'] = info_['loss'] / DIV
@@ -321,10 +322,7 @@ def train_model(args,
 
             for t in info:
                 try:
-                    if t == 'max_att':
-                        info[t] = max(info[t])
-                    else:
-                        info[t] = sum(info[t])
+                    info[t] = sum(info[t])
                 except TypeError:
                     continue
 
@@ -338,9 +336,15 @@ def train_model(args,
                                                   info['reorder'][s]))
                 watcher.info("--------" * 15)
 
-        info_str += '#token={}, #sentence={}, gn={:.4f}, speed={} t/s | BEST={} | '.format(
-            format(info['tokens'], 'k'), int(info['sents']), grad_norm,
-            format(info['tokens'] / train_timer.elapsed_secs, 'k'),
+        # basic infomation
+        info_str += '#sentence={}, #token={}, '.format(
+            int(info['sents']), format(info['tokens'], 'k'))
+        if 'full_tokens' in info:
+            info_str += '#token(F)={}, '.format(
+                format(info['full_tokens'], 'k'))
+
+        info_str += 'gn={:.4f}, speed={} t/s | BEST={} | '.format(
+            grad_norm, format(info['tokens'] / train_timer.elapsed_secs, 'k'),
             watcher.best_tracker.corpus_bleu)
 
         for keyword in info:

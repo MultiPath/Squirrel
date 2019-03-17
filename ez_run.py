@@ -5,8 +5,8 @@ import time
 import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 
-from squirrel.config import (get_config, setup_dataloader, setup_datapath,
-                             setup_pretrained_model)
+from squirrel.config import (get_config, setup_cuda, setup_dataloader,
+                             setup_datapath, setup_pretrained_model)
 from squirrel.data import get_dataloader
 from squirrel.decoder import valid_model, valid_model_ppl
 from squirrel.learner import train_model
@@ -17,6 +17,7 @@ from squirrel.utils import Watcher, count_parameters, setup_random_seed
 START_TIME = time.time()
 
 args = get_config("Transformer-Squirrel")
+args = setup_cuda(args)
 setup_random_seed(args.seed)
 setup_datapath(args)
 
@@ -29,7 +30,6 @@ watcher = Watcher(
 watcher.info('\n'.join([
     '{}:\t{}'.format(a, b)
     for a, b in sorted(args.__dict__.items(), key=lambda x: x[0])
-    if isinstance(b, str)
 ]))
 watcher.info('Starting with HPARAMS: {}'.format(args.hp_str))
 watcher.info("RANK:{}, WORLD_SIZE:{}, DEVICE-ID:{}, MASTER={}".format(

@@ -9,6 +9,8 @@ import numpy as np
 import torch
 from torchtext.data.batch import Batch
 
+# from squirrel.data.noise import merged_noisy_generator
+
 
 class DistributedBatch(Batch):
     def __init__(self,
@@ -16,13 +18,15 @@ class DistributedBatch(Batch):
                  dataset=None,
                  device=None,
                  world_size=1,
-                 local_rank=0):
+                 local_rank=0,
+                 train=True):
         """Create a Batch from a list of examples."""
 
         self.message = ''
         self.task = ''
         self.preprocessed = None
         self.weights = None
+        self.train = train
 
         if data is not None:
             big_batch_size = len(data)
@@ -48,10 +52,8 @@ class DistributedBatch(Batch):
             for (name, field) in dataset.fields.items():
                 if field is not None:
                     batch = [getattr(x, name) for x in data]
-
                     setattr(self, name + '_original', batch)
                     setattr(self, name, field.process(batch, device=device))
-
                     self.attributes += [name, name + '_original']
 
             if hasattr(data[0], 'id'):
@@ -62,6 +64,24 @@ class DistributedBatch(Batch):
                                  device=device))
 
                 self.attributes += ['id']
+
+    def __str__(self):
+        if not self.__dict__:
+            return 'Empty {} instance'.format(torch.typename(self))
+
+        fields_to_index = filter(lambda field: field is not None,
+                                 self.attributes)
+        var_strs = '\n'.join([
+            '\t[.' + name + ']' + ":" + _short_str(getattr(self, name))
+            for name in fields_to_index if hasattr(self, name)
+        ])
+        data_str = (' from {}'.format(self.dataset.name.upper())
+                    if hasattr(self.dataset, 'name')
+                    and isinstance(self.dataset.name, str) else '')
+
+        strt = '[{} of size {}{}]\n{}'.format(
+            torch.typename(self), self.batch_size, data_str, var_strs)
+        return '\n' + strt
 
 
 def fetch_batch(data,
@@ -189,6 +209,7 @@ def split_batch(batch, N):  # split a batch into N parts.
         for k in range(N):
             batch = DistributedBatch()
             batch.fields = backup_batch.fields
+            batch.attributes = backup_batch.attributes
 
             start_pos = k if additional_size > k else additional_size
             start_pos = start_pos + k * mini_batch_size
@@ -208,18 +229,9 @@ def split_batch(batch, N):  # split a batch into N parts.
             if backup_batch.weights is not None:
                 batch.weights = backup_batch.weights[start_pos:end_pos]
 
-            for field in backup_batch.fields:
+            for field in backup_batch.attributes:
                 setattr(batch, field,
                         getattr(backup_batch, field)[start_pos:end_pos])
-                if hasattr(backup_batch, field + '_original'):
-                    setattr(
-                        batch, field + '_original',
-                        getattr(backup_batch,
-                                field + '_original')[start_pos:end_pos])
-
-            if hasattr(backup_batch, 'id'):
-                setattr(batch, 'id',
-                        getattr(backup_batch, 'id')[start_pos:end_pos])
 
             batches.append(batch)
 
@@ -239,30 +251,61 @@ def merge_batches(batches):  # merge batches into a big batch
                 assert field in backup_batch.fields, "the same fields"
 
         batch.fields = batches[-1].fields
-        for field in batches[-1].fields:
-            max_len = max([
-                getattr(backup_batch, field).size(1)
-                for backup_batch in batches
-            ])
-            setattr(
-                batch, field,
-                torch.cat([
-                    backup_batch.dataset.fields[field].extend_padding(
-                        getattr(backup_batch, field), max_len)
-                    for backup_batch in batches
-                ], 0))
+        batch.attributes = batches[-1].attributes
 
-            if hasattr(batches[-1], field + '_original'):
-                setattr(batch, field + '_original', [
-                    i for t in getattr(backup_batch, field + '_original')
-                    for i in t
+        for field in batches[-1].attributes:
+
+            if isinstance(getattr(batches[-1], field), list):
+                setattr(batch, field, [
+                    t for backup_batch in batches
+                    for t in getattr(backup_batch, field)
                 ])
 
-        if hasattr(batches[-1], 'id'):
-            setattr(batch, 'id',
+            elif field == 'id':
+                setattr(
+                    batch, 'id',
                     torch.cat([backup_batch.id for backup_batch in batches]))
+
+            else:
+
+                max_len = max([
+                    getattr(backup_batch, field).size(1)
+                    for backup_batch in batches
+                ])
+
+                setattr(
+                    batch, field,
+                    torch.cat([
+                        backup_batch.dataset.fields[field].extend_padding(
+                            getattr(backup_batch, field), max_len)
+                        for backup_batch in batches
+                    ], 0))
 
         batch.batch_size = sum(
             [backup_batch.batch_size for backup_batch in batches])
         batch.task = '/'.join([backup_batch.task for backup_batch in batches])
         return batch
+
+
+def _short_str(tensor):
+    # unwrap variable to tensor
+    if not torch.is_tensor(tensor):
+        # (1) unpack variable
+        if hasattr(tensor, 'data'):
+            tensor = getattr(tensor, 'data')
+        # (2) handle include_lengths
+        elif isinstance(tensor, tuple):
+            return str(tuple(_short_str(t) for t in tensor))
+        # (3) fallback to default str
+        elif isinstance(tensor, list):
+            return str('list of size {}'.format(len(tensor)))
+        else:
+            return str(tensor)
+
+    # copied from torch _tensor_str
+    size_str = 'x'.join(str(size) for size in tensor.size())
+    device_str = '' if not tensor.is_cuda else \
+        ' (GPU {})'.format(tensor.get_device())
+    strt = '[{} of size {}{}]'.format(
+        torch.typename(tensor), size_str, device_str)
+    return strt

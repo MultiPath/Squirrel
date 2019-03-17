@@ -75,42 +75,6 @@ def setup_config(args):
         'all_langs': all_langs
     })
 
-    # cuda
-    args.device_id = args.local_rank
-    args.device = "cuda:{}".format(args.device_id)
-
-    if 'MASTER_PORT' in os.environ:
-        args.master_port = os.environ['MASTER_PORT']
-
-    # use SLURM: multi-node training --- # hacky
-    if 'SLURM_PROCID' in os.environ:
-        node_list = os.environ['SLURM_JOB_NODELIST']
-        hostnames = subprocess.check_output(
-            ['scontrol', 'show', 'hostnames', node_list]).split()
-
-        args.init_method = 'tcp://{host}:{port}'.format(
-            host=hostnames[0].decode('utf-8'), port=args.master_port)
-        args.local_rank = args.local_rank + int(
-            os.environ['SLURM_PROCID']) * int(os.environ['WORLD_SIZE'])
-        args.world_size = int(os.environ['WORLD_SIZE']) * len(hostnames)
-        args.distributed = True
-
-    else:
-        # single node training
-        if 'WORLD_SIZE' in os.environ:
-            args.world_size = int(os.environ['WORLD_SIZE'])
-            args.distributed = args.world_size > 1
-            args.init_method = 'tcp://localhost:{}'.format(args.master_port)
-
-    # setup multi-gpu
-    torch.cuda.set_device(args.device_id)
-    if args.distributed:
-        torch.distributed.init_process_group(
-            backend='nccl',
-            init_method=args.init_method,
-            world_size=args.world_size,
-            rank=args.local_rank)
-
     # set the model prefix
     running_time = strftime("%m.%d_%H.%M.%S.", gmtime())
     if args.prefix == '[time]':
@@ -163,22 +127,61 @@ def setup_config(args):
     model_name = os.path.join(args.workspace_prefix, 'models',
                               args.prefix + hp_str)
     args.__dict__.update({'model_name': model_name, 'hp_str': hp_str})
-
     # load arguments if provided
-    if args.json is not None:
-        saved_args = json.load(
-            open(os.path.join(args.workspace_prefix, 'settings', args.json)))
-        saved_args['local_rank'] = args.local_rank
-        saved_args['prefix'] = args.prefix
-        args.__dict__.update(saved_args)
+    # if args.json is not None:
+    #     saved_args = json.load(
+    #         open(os.path.join(args.workspace_prefix, 'settings', args.json)))
+    #     saved_args['local_rank'] = args.local_rank
+    #     saved_args['prefix'] = args.prefix
+    #     args.__dict__.update(saved_args)
+
+    # else:
+    #     if args.local_rank == 0:
+    #         with open(
+    #                 os.path.join(args.workspace_prefix, 'settings',
+    #                              args.prefix + hp_str + '.json'),
+    #                 'w') as outfile:
+    #             json.dump(vars(args), outfile)
+    return args
+
+
+def setup_cuda(args):
+
+    # cuda
+    args.device_id = args.local_rank
+    args.device = "cuda:{}".format(args.device_id)
+
+    if 'MASTER_PORT' in os.environ:
+        args.master_port = os.environ['MASTER_PORT']
+
+    # use SLURM: multi-node training --- # hacky
+    if 'SLURM_PROCID' in os.environ:
+        node_list = os.environ['SLURM_JOB_NODELIST']
+        hostnames = subprocess.check_output(
+            ['scontrol', 'show', 'hostnames', node_list]).split()
+
+        args.init_method = 'tcp://{host}:{port}'.format(
+            host=hostnames[0].decode('utf-8'), port=args.master_port)
+        args.local_rank = args.local_rank + int(
+            os.environ['SLURM_PROCID']) * int(os.environ['WORLD_SIZE'])
+        args.world_size = int(os.environ['WORLD_SIZE']) * len(hostnames)
+        args.distributed = True
 
     else:
-        if args.local_rank == 0:
-            with open(
-                    os.path.join(args.workspace_prefix, 'settings',
-                                 args.prefix + hp_str + '.json'),
-                    'w') as outfile:
-                json.dump(vars(args), outfile)
+        # single node training
+        if 'WORLD_SIZE' in os.environ:
+            args.world_size = int(os.environ['WORLD_SIZE'])
+            args.distributed = args.world_size > 1
+            args.init_method = 'tcp://localhost:{}'.format(args.master_port)
+
+    # setup multi-gpu
+    torch.cuda.set_device(args.device_id)
+    if args.distributed:
+        torch.distributed.init_process_group(
+            backend='nccl',
+            init_method=args.init_method,
+            world_size=args.world_size,
+            rank=args.local_rank)
 
     return args
 
@@ -191,6 +194,11 @@ def setup_dataloader(args):
             return 'multi'
         elif args.insertable:
             return 'order'
+        elif args.noise_types is not None:
+            if args.noise_dataflow == 'trg':
+                return 'target_noise'
+            else:
+                raise NotImplementedError
         else:
             return 'default'
 

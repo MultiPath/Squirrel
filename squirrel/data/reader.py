@@ -5,11 +5,7 @@ import numpy as np
 from squirrel.data.field import Example
 
 
-def lazy_reader_shuffled(
-        paths,
-        fields,
-        buffer=16384,
-):
+def lazy_reader_shuffled(paths, fields, buffer=16384, noise_generators=None):
     # -- infinite lazy dataloader --
     examples = []
     all_data = []
@@ -38,7 +34,8 @@ def lazy_reader_shuffled(
                         # examples = sorted(examples, key=lambda x: sum([len(xi.split()) for xi in x]) )
                         for it, example in enumerate(examples):
                             yield Example.fromlist(example, fields,
-                                                   it + out_step - buffer)
+                                                   it + out_step - buffer,
+                                                   noise_generators)
 
                         examples = []
         else:
@@ -50,13 +47,12 @@ def lazy_reader_shuffled(
                 examples.append(lines)
                 out_step += 1
 
-                if (out_step % buffer == 0) and (
-                        out_step >
-                        0):  # pre-reading the dataset, and cached...
+                if (out_step % buffer == 0) and (out_step > 0):
                     # examples = sorted(examples, key=lambda x: sum([len(xi.split()) for xi in x]) )
                     for it, example in enumerate(examples):
                         yield Example.fromlist(example, fields,
-                                               it + out_step - buffer)
+                                               it + out_step - buffer,
+                                               noise_generators)
 
                     examples = []
 

@@ -1,3 +1,4 @@
+import copy
 import os
 
 from torchtext import data, datasets
@@ -21,22 +22,31 @@ class ParallelDataset(datasets.TranslationDataset):
                  lazy=True,
                  buffer=16384,
                  task=None,
+                 noise_generators=None,
                  **kwargs):
 
-        assert len(exts) == len(fields), 'N parallel dataset must match'
+        # assert len(exts) == len(fields), 'N parallel dataset must match'
         self.N = len(fields)
         self.task = path.split('/')[-2] if task is None else task
         paths = tuple(os.path.expanduser(path + x) for x in exts)
 
         for p in paths:
             if not os.path.exists(p):
-                print(p)
-                raise FileNotFoundError
+                raise FileNotFoundError(p)
 
         if lazy:  # using lazy dataloader -- cannot be used to construct vocab --
+            new_fields = copy.deepcopy(fields)
+            if noise_generators is not None:
+                for i, (name, field) in enumerate(fields):
+                    if noise_generators[i] is not None:
+                        new_fields.append((name + '_n', field))
+
             super(datasets.TranslationDataset, self).__init__(
-                lazy_reader_shuffled(paths, fields, buffer=buffer), fields,
-                **kwargs)
+                lazy_reader_shuffled(
+                    paths,
+                    fields,
+                    buffer=buffer,
+                    noise_generators=noise_generators), new_fields, **kwargs)
         else:
             super(datasets.TranslationDataset, self).__init__(
                 full_reader(paths, fields), fields, **kwargs)
@@ -76,7 +86,8 @@ class LazyBucketIterator(data.BucketIterator):
                  world_size=1,
                  maxlen=None,
                  maxatt_size=None,
-                 init_tokens=None):
+                 init_tokens=None,
+                 fields_for_batchsize=None):
 
         super().__init__(
             dataset,
@@ -100,31 +111,10 @@ class LazyBucketIterator(data.BucketIterator):
         self.init_tokens = init_tokens
         self.task = dataset.task
         self.fields = dataset.fields.keys()
+        self.fields_for_batchsize = fields_for_batchsize \
+            if fields_for_batchsize is not None else self.fields
 
-    def create_batches(self):
-        if self.sort:
-            self.batches = fetch_batch(
-                self.data(),
-                self.batch_size,
-                self.world_size,
-                True,
-                maxlen=self.maxlen,
-                maxatt_size=self.maxatt_size,
-                fields=self.fields)
-        else:
-            self.batches = fetch_pool(
-                self.data(),
-                self.batch_size,
-                self.sort_key,
-                random_shuffler=self.random_shuffler,
-                world_size=self.world_size,
-                maxlen=self.maxlen,
-                maxatt_size=self.maxatt_size,
-                fields=self.fields)
-
-    # --- wrap the iterator ---
     def __iter__(self):
-
         count = 0
         while True:
             self.init_epoch()
@@ -147,7 +137,28 @@ class LazyBucketIterator(data.BucketIterator):
                             name].init_token = self.init_tokens[name]
 
                 yield DistributedBatch(minibatch, self.dataset, self.device,
-                                       self.world_size, self.rank)
+                                       self.world_size, self.rank, self.train)
 
             if not self.repeat:
                 return
+
+    def create_batches(self):
+        if self.sort:
+            self.batches = fetch_batch(
+                self.data(),
+                self.batch_size,
+                self.world_size,
+                True,
+                maxlen=self.maxlen,
+                maxatt_size=self.maxatt_size,
+                fields=self.fields_for_batchsize)
+        else:
+            self.batches = fetch_pool(
+                self.data(),
+                self.batch_size,
+                self.sort_key,
+                random_shuffler=self.random_shuffler,
+                world_size=self.world_size,
+                maxlen=self.maxlen,
+                maxatt_size=self.maxatt_size,
+                fields=self.fields_for_batchsize)

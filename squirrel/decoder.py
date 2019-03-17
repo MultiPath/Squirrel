@@ -25,6 +25,7 @@ def valid_model_ppl(args,
         mode = mode + ',' + task
 
     for j, dev_batch in enumerate(dev):
+
         dev_outputs = model(dev_batch, mode=mode, dataflow=dataflow)
 
         if hasattr(dev_batch, 'id'):
@@ -117,14 +118,15 @@ def valid_model(args,
         start_t = time.time()
 
         # decoding
-        dev_outputs = model(
-            dev_batch, mode='decoding', reverse=True, dataflow=dataflow)
+        dev_outputs = model(dev_batch, mode='decoding', dataflow=dataflow)
         if hasattr(dev_batch, 'id'):
             dev_outputs['id'] = dev_batch.id.cpu().tolist()
 
-        # compute sentence-level GLEU score
-        dev_outputs['sents'] = [dev_outputs['sents'].item()]
-        dev_outputs['tokens'] = [dev_outputs['tokens'].item()]
+        for w in dev_outputs:
+            try:
+                dev_outputs[w] = [dev_outputs[w].item()]
+            except Exception:
+                pass
 
         # gather from all workers:
         if args.distributed:

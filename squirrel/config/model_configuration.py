@@ -4,10 +4,7 @@ from squirrel.config import register_config
 @register_config('model_basic_transformer')
 def build_model_baisc_transformer_config(parser):
     parser.add_argument(
-        '--model',
-        type=str,
-        default='Transformer',
-        choices=['Transformer', 'TransformerIns'])  # current stage
+        '--model', type=str, default='Transformer')  # current stage
     parser.add_argument(
         '--base',
         type=str,
@@ -35,6 +32,11 @@ def build_model_baisc_transformer_config(parser):
         type=int,
         default=2048,
         help='used in feedforward network')
+    parser.add_argument(
+        '--d_embedding',
+        type=int,
+        default=512,
+        help='embedding size for input/output')
     parser.add_argument(
         '--warmup',
         type=int,
@@ -150,6 +152,24 @@ def build_model_multilingual_config(parser):
         default=0,
         help='force to use local attention for the first K layers.')
 
+    return parser
+
+
+@register_config('model_insertion_transformer')
+def build_model_insertion_transformer_config(parser):
+    parser.add_argument(
+        '--training_with_terminal',
+        action='store_true',
+        help='the model is trained to predict the <T> everywhere for empty.')
+    parser.add_argument(
+        '--parallel_decoding',
+        action='store_true',
+        help='use parallel decoding for Insertion Transformer')
+    parser.add_argument(
+        '--termination_penalty',
+        type=float,
+        default=0.0,
+        help='use penalty to prevent model to terminate too early.')
     return parser
 
 
